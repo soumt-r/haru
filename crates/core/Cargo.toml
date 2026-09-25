@@ -1,0 +1,9 @@
+[package]
+name = "haru-core"
+description = "Haru runtime core: values, modules, native calls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+haru-abi.workspace = true

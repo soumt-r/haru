@@ -1,0 +1,9 @@
+[package]
+name = "haru-sdk"
+description = "Write Haru modules in plain Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+haru-abi.workspace = true

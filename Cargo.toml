@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/abi", "crates/sdk", "crates/core", "crates/cli", "std", "examples/greet"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+haru-abi = { path = "crates/abi" }
+haru-sdk = { path = "crates/sdk" }
+haru-core = { path = "crates/core" }
+haru-std = { path = "std" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

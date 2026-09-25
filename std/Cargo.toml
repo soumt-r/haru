@@ -1,0 +1,9 @@
+[package]
+name = "haru-std"
+description = "Haru standard library, written with haru-sdk and linked into haru"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+haru-sdk.workspace = true

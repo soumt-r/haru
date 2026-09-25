@@ -1,0 +1,17 @@
+[package]
+name = "haru-cli"
+description = "The haru command"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "haru"
+path = "src/main.rs"
+
+[dependencies]
+haru-core.workspace = true
+haru-std.workspace = true
+
+[dev-dependencies]
+haru-example-greet = { path = "../../examples/greet" }
