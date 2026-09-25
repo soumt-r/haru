@@ -1,9 +1,13 @@
 //! Runtime errors carry a code and arguments, never text. Text is made at the
-//! edge, in the language of the program (the approach of Hana's `errs`,
-//! extended to modules: a module ships its own templates).
+//! edge, in the language of the program. The runtime's own codes and wording
+//! are Hana's (`catalog.rs`, generated from hana/errs); a module ships its own
+//! templates.
 
-use haru_abi::kind;
+use haru_abi::{kind, tag};
 
+use crate::catalog::{CATALOG, RUNTIME_LABEL};
+use crate::format::{go_i64, go_v_float, number};
+use crate::lang::{Lang, HARI, KANADE};
 use crate::modules::Runtime;
 use crate::value::Value;
 
@@ -11,6 +15,8 @@ use crate::value::Value;
 pub struct RuntimeError {
     /// The module that raised it, or `None` for the runtime's own errors.
     pub module: Option<usize>,
+    /// A Hana code (`TypeError.OperandTypeMismatch`), a module's code, or
+    /// one of the signals `break`/`return` that escaped to the top.
     pub code: String,
     pub args: Vec<Value>,
 }
@@ -25,7 +31,15 @@ impl RuntimeError {
         self
     }
 
-    /// The full code: `math.NotNumber` for a module, `ArgumentType` for the runtime.
+    pub fn str_arg(self, s: &str) -> RuntimeError {
+        self.arg(Value::str(s))
+    }
+
+    pub fn num_arg(self, n: f64) -> RuntimeError {
+        self.arg(Value::num(n))
+    }
+
+    /// The full code: `math.NotNumber` for a module, the code itself otherwise.
     pub fn qualified_code(&self, rt: &Runtime) -> String {
         match self.module {
             Some(m) => format!("{}.{}", rt.module_id(m), self.code),
@@ -33,36 +47,115 @@ impl RuntimeError {
         }
     }
 
-    /// The message in `lang` ("hari", "kanade"); English when nothing better exists.
+    /// The message as a caught error's text or the CLI's report shows it.
     pub fn message(&self, rt: &Runtime, lang: &str) -> String {
-        let template = self
-            .module
-            .and_then(|m| rt.message(m, &self.code, lang).or_else(|| rt.message(m, &self.code, "en")))
-            .or_else(|| core_message(&self.code, lang));
-        let args: Vec<String> = if self.module.is_none() && self.code == "ArgumentType" {
-            // {1} is a parameter kind: name it in the program's language.
-            self.args
+        self.localize(Some(rt), lang_named(lang))
+    }
+
+    pub fn localize(&self, rt: Option<&Runtime>, lang: &Lang) -> String {
+        if let Some(m) = self.module {
+            let rt = rt.expect("a module error needs its runtime");
+            let template = rt
+                .message(m, &self.code, lang.name)
+                .or_else(|| rt.message(m, &self.code, "en"))
+                .or_else(|| legacy_message(&self.code, lang.name));
+            let args: Vec<String> = self.args.iter().map(|a| crate::format::display(a, lang)).collect();
+            return match template {
+                Some(t) => fill(t, &args),
+                None => format!("{}.{}", rt.module_id(m), self.code),
+            };
+        }
+        if let Ok(i) = CATALOG.binary_search_by(|e| e.0.cmp(self.code.as_str())) {
+            let entry = CATALOG[i];
+            let template = match lang.locale {
+                1 => entry.2,
+                2 => entry.3,
+                _ => entry.1,
+            };
+            let kind = self.code.split('.').next().unwrap_or("");
+            return format!("{kind}: {}", go_format(template, &self.args, lang));
+        }
+        if let Some(t) = legacy_message(&self.code, lang.name) {
+            let args: Vec<String> = self
+                .args
                 .iter()
                 .enumerate()
-                .map(|(i, a)| match (i, a.as_num()) {
-                    (1, Some(k)) => kind_name(k as u32, lang).to_string(),
-                    _ => a.to_string(),
+                .map(|(i, a)| match (self.code.as_str(), i, a.as_num()) {
+                    ("ArgumentType", 1, Some(k)) => kind_name(k as u32, lang.name).to_string(),
+                    _ => crate::format::display(a, lang),
                 })
-                .collect()
-        } else {
-            self.args.iter().map(|a| a.to_string()).collect()
-        };
-        match template {
-            Some(t) => fill(t, &args),
-            None => {
-                let mut s = self.qualified_code(rt);
-                if !args.is_empty() {
-                    s.push_str(": ");
-                    s.push_str(&args.join(", "));
-                }
-                s
-            }
+                .collect();
+            return fill(t, &args);
         }
+        // `break`, `return`: what Hana's CLI prints for them.
+        self.code.clone()
+    }
+
+    /// The line the CLI prints for an uncaught error.
+    pub fn report(&self, rt: Option<&Runtime>, lang: &Lang) -> String {
+        let label = match lang.locale {
+            1 => RUNTIME_LABEL.1,
+            2 => RUNTIME_LABEL.2,
+            _ => RUNTIME_LABEL.0,
+        };
+        format!("{label}: {}", self.localize(rt, lang))
+    }
+}
+
+fn lang_named(name: &str) -> &'static Lang {
+    match name {
+        "kanade" => &KANADE,
+        _ => &HARI,
+    }
+}
+
+/// Renders a Go format template: `%s`, `%d`, `%v`, `%[n]s` and `%%`.
+pub fn go_format(template: &str, args: &[Value], lang: &Lang) -> String {
+    let mut out = String::new();
+    let mut next = 0;
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let mut index = None;
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            let mut n = String::new();
+            for d in chars.by_ref() {
+                if d == ']' {
+                    break;
+                }
+                n.push(d);
+            }
+            index = n.parse::<usize>().ok().map(|n| n - 1);
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some(verb) => {
+                let i = index.unwrap_or(next);
+                next = i + 1;
+                match args.get(i) {
+                    Some(a) => out.push_str(&go_verb(verb, a, lang)),
+                    None => out.push_str(&format!("%!{verb}(MISSING)")),
+                }
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+fn go_verb(verb: char, v: &Value, lang: &Lang) -> String {
+    match (verb, v.tag()) {
+        ('d', tag::NUM) => go_i64(v.as_num().unwrap()).to_string(),
+        ('v', tag::NUM) => go_v_float(v.as_num().unwrap()),
+        ('v', tag::BOOL) => v.as_bool().unwrap().to_string(),
+        ('v', tag::NULL) => "<nil>".to_string(),
+        (_, tag::STR) => v.as_str().unwrap().to_string(),
+        (_, tag::NUM) => number(v.as_num().unwrap()),
+        _ => crate::format::display(v, lang),
     }
 }
 
@@ -74,7 +167,8 @@ fn fill(template: &str, args: &[String]) -> String {
     out
 }
 
-fn core_message(code: &str, lang: &str) -> Option<&'static str> {
+/// Messages of the native-call checks (M0), in the module-template form.
+fn legacy_message(code: &str, lang: &str) -> Option<&'static str> {
     Some(match (code, lang) {
         ("ArgumentCount", "hari") => "인자가 {0}개 필요한데 {1}개가 들어왔어요.",
         ("ArgumentCount", "kanade") => "引数は{0}個必要ですが、{1}個渡されました。",

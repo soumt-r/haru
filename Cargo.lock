@@ -21,6 +21,7 @@ name = "haru-core"
 version = "0.0.1"
 dependencies = [
  "haru-abi",
+ "haru-syntax",
 ]
 
 [[package]]

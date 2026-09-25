@@ -3,10 +3,13 @@
 //!   haru version
 //!   haru modules [--lang hari|kanade]
 //!   haru call [--lang hari|kanade] <모듈> <함수> [인자...]
+//!   haru run [--time] <file>
+//!   haru dis <file>          (compiled code)
 //!   haru ast <file>          (syntax tree as JSON)
 //!   haru ast-check <dir>     (compare with Hana's trees from tools/astdump)
 
 mod ast;
+mod run;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -16,6 +19,13 @@ use haru_core::{Runtime, Value};
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let lang = take_flag(&mut args, "--lang").unwrap_or_else(|| "hari".to_string());
+    let time = match args.iter().position(|a| a == "--time") {
+        Some(i) => {
+            args.remove(i);
+            true
+        }
+        None => false,
+    };
 
     let mut rt = Runtime::new();
     for entry in haru_std::MODULES {
@@ -29,10 +39,12 @@ fn main() -> ExitCode {
         Some("version") => println!("haru {}", env!("CARGO_PKG_VERSION")),
         Some("modules") => list_modules(&rt, &lang),
         Some("call") if args.len() >= 3 => return call(&rt, &lang, &args[1], &args[2], &args[3..]),
+        Some("run") if args.len() == 2 => return run::run(Path::new(&args[1]), time),
+        Some("dis") if args.len() == 2 => return dis(Path::new(&args[1])),
         Some("ast") if args.len() == 2 => return ast::print(Path::new(&args[1])),
         Some("ast-check") if args.len() == 2 => return ast::check(Path::new(&args[1])),
         _ => {
-            eprintln!("usage: haru version | modules [--lang L] | call [--lang L] <module> <function> [args...] | ast <file> | ast-check <dir>");
+            eprintln!("usage: haru run <file> | version | modules [--lang L] | call [--lang L] <module> <function> [args...] | ast <file> | ast-check <dir>");
             return ExitCode::FAILURE;
         }
     }
@@ -77,6 +89,31 @@ fn call(rt: &Runtime, lang: &str, module: &str, func: &str, raw: &[String]) -> E
         Err(e) => {
             eprintln!("{}", e.message(rt, lang));
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Prints the compiled code of a program.
+fn dis(path: &Path) -> ExitCode {
+    let lang = haru_core::lang::for_path(path);
+    let Ok(source) = std::fs::read_to_string(path) else {
+        eprintln!("haru: cannot read {}", path.display());
+        return ExitCode::FAILURE;
+    };
+    let (program, _) = haru_syntax::parse(&source, lang.syntax);
+    match haru_core::compiler::compile(&program, lang) {
+        Ok(p) => {
+            for proto in &p.protos {
+                println!("== {} ({} registers)", proto.name, proto.nregs);
+                for (i, op) in proto.code.iter().enumerate() {
+                    println!("{i:4}  {op:?}");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(u) => {
+            eprintln!("haru: not supported yet: {}", u.0);
+            ExitCode::from(3)
         }
     }
 }

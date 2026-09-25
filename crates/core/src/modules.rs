@@ -145,7 +145,7 @@ impl Runtime {
 
     /// A function value that the program can store and pass on.
     pub fn function_value(&self, f: FnRef) -> Value {
-        Value::func(FuncObj { module: f.module, func: f.func })
+        Value::func(FuncObj::Native { module: f.module, func: f.func })
     }
 
     /// Calls a native function. The count and kinds of the arguments are
@@ -183,11 +183,12 @@ impl Runtime {
         }
     }
 
-    /// Calls any function value (only native functions exist so far).
+    /// Calls a function value from a native module's callback. Only native
+    /// functions can be called this way until modules run inside the VM (M3).
     pub fn call_value(&self, func: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
         match func.as_func() {
-            Some(f) => self.call(FnRef { module: f.module, func: f.func }, args),
-            None => Err(RuntimeError::core("NotCallable")),
+            Some(&FuncObj::Native { module, func }) => self.call(FnRef { module, func }, args),
+            _ => Err(RuntimeError::core("NotCallable")),
         }
     }
 
