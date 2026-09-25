@@ -3,7 +3,12 @@
 //!   haru version
 //!   haru modules [--lang hari|kanade]
 //!   haru call [--lang hari|kanade] <모듈> <함수> [인자...]
+//!   haru ast <file>          (syntax tree as JSON)
+//!   haru ast-check <dir>     (compare with Hana's trees from tools/astdump)
 
+mod ast;
+
+use std::path::Path;
 use std::process::ExitCode;
 
 use haru_core::{Runtime, Value};
@@ -24,8 +29,10 @@ fn main() -> ExitCode {
         Some("version") => println!("haru {}", env!("CARGO_PKG_VERSION")),
         Some("modules") => list_modules(&rt, &lang),
         Some("call") if args.len() >= 3 => return call(&rt, &lang, &args[1], &args[2], &args[3..]),
+        Some("ast") if args.len() == 2 => return ast::print(Path::new(&args[1])),
+        Some("ast-check") if args.len() == 2 => return ast::check(Path::new(&args[1])),
         _ => {
-            eprintln!("usage: haru version | modules [--lang L] | call [--lang L] <module> <function> [args...]");
+            eprintln!("usage: haru version | modules [--lang L] | call [--lang L] <module> <function> [args...] | ast <file> | ast-check <dir>");
             return ExitCode::FAILURE;
         }
     }

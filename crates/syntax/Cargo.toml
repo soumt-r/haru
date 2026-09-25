@@ -1,0 +1,6 @@
+[package]
+name = "haru-syntax"
+description = "Hari/Kanade lexer, parser and AST (the same grammar as Hana)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

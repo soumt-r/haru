@@ -13,6 +13,7 @@ dependencies = [
  "haru-core",
  "haru-example-greet",
  "haru-std",
+ "haru-syntax",
 ]
 
 [[package]]
@@ -42,3 +43,7 @@ version = "0.0.1"
 dependencies = [
  "haru-sdk",
 ]
+
+[[package]]
+name = "haru-syntax"
+version = "0.0.1"

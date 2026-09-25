@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 haru-core.workspace = true
+haru-syntax.workspace = true
 haru-std.workspace = true
 
 [dev-dependencies]

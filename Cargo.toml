@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/abi", "crates/sdk", "crates/core", "crates/cli", "std", "examples/greet"]
+members = ["crates/abi", "crates/sdk", "crates/syntax", "crates/core", "crates/cli", "std", "examples/greet"]
 
 [workspace.package]
 version = "0.0.1"
@@ -11,6 +11,7 @@ license = "MIT"
 haru-abi = { path = "crates/abi" }
 haru-sdk = { path = "crates/sdk" }
 haru-core = { path = "crates/core" }
+haru-syntax = { path = "crates/syntax" }
 haru-std = { path = "std" }
 
 [profile.release]

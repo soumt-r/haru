@@ -130,18 +130,20 @@ VM 코드는 VM 스레드에서만 돕니다. 네이티브의 다른 스레드(�
 haru/
   crates/abi    ─ #[repr(C)] 타입과 상수만. 의존성 0. ABI의 유일한 출처
   crates/sdk    ─ 패키지 작성자용 안전한 층 (Module 빌더, 인자 변환, export!)
+  crates/syntax ─ 렉서·파서·AST (Hana와 같은 문법, 의존성 0)
   crates/core   ─ 값, 모듈 레지스트리, HostApi 구현, (다음) 컴파일러·VM
   crates/cli    ─ `haru` 실행 파일
   std/          ─ SDK로 쓴 표준 모듈 (정적 링크)
   examples/greet─ cdylib 예제 패키지 (동적 로드 시험용)
+  tools/astdump ─ Hana의 파서로 트리를 뽑는 Go 도구 (문법 동일성 검사용)
 ```
 
-파서(`crates/syntax`)와 VM은 core가 커지면 떼어 냅니다.
+VM은 core가 커지면 떼어 냅니다.
 
 ## 7. 단계
 
 - **M0 (지금)**: 워크스페이스, ABI, SDK, 모듈 레지스트리, 정적·동적 모듈 호출을 테스트로 증명.
-- **M1**: 하리 렉서·파서 → AST. Hana의 파서와 같은 트리를 내는지 비교(Hana에 AST JSON 출력이 있으면 차등 시험).
+- **M1 (완료)**: 하리·카나데 렉서·파서 → AST. 정규식 없이 손으로 쓴 렉서가 Hana의 규칙 순서를 그대로 따르고, 파서는 Hana 파서의 동작(버릇 포함)을 옮긴 것입니다. `tools/parity.sh`가 모든 `.hr`/`.knd` 파일, 문서의 코드 블록, Hana 테스트 속 프로그램(약 1,000개)과 그 손상본(기본 20배)을 두 파서로 읽어 **트리와 구문 진단이 글자 하나까지 같은지** 확인합니다. Hana의 파서가 패닉하는 입력에서도 Haru는 패닉하지 않습니다(`crates/syntax/tests/robust.rs`).
 - **M2**: 이름 해석 + 레지스터 VM의 핵심(변수, 연산, 조건, 반복, 함수, 출력). Hana의 `bench/*.hr`로 속도 비교.
 - **M3**: 클래스·예외·모듈 임포트·타입 검사. `.hr` 예제를 Hana와 Haru에서 돌려 출력 비교(loh의 `check.sh` 방식).
 - **M4**: std 모듈 채우기, 패키지 매니저(`haru add/install`), `haru build --with`.
