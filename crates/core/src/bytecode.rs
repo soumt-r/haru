@@ -303,6 +303,9 @@ pub struct Proto {
     pub return_type: u32,
     pub loops: Vec<LoopRange>,
     pub handlers: Vec<Handler>,
+    /// What printing the function as a value shows (Hana's `String()` of
+    /// its declaration).
+    pub text: std::rc::Rc<str>,
 }
 
 /// A parsed type annotation: `숫자`, `(숫자)목록`, `(문자열, 숫자)사전`,

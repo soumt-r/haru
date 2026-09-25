@@ -18,7 +18,7 @@ use crate::bytecode::*;
 use crate::error::RuntimeError;
 use crate::format::{display, go_i64, go_int};
 use crate::lang::Lang;
-use crate::modules::{FnRef, Runtime};
+use crate::modules::{Caller, FnRef, Runtime};
 use crate::symbol;
 use crate::value::{FuncObj, Key, Value, CLASS};
 
@@ -120,6 +120,8 @@ enum Post {
     Equals { neg: bool },
     /// A module's top-level code: when it ends the module is loaded.
     ModuleInit(u32),
+    /// A function a native function called back: its result goes back to it.
+    Capture,
 }
 
 /// Hana's interpreter: whose classes, static variables and words code sees.
@@ -184,6 +186,10 @@ pub struct Vm<'p> {
     /// What each reflection site settled on.
     reflected: HashMap<u32, u32>,
     runtime: Option<&'p Runtime>,
+    /// While a native function calls back into the program: the frame count
+    /// at which that call is done (0 otherwise).
+    stop_at: usize,
+    captured: Option<Value>,
     length_word: u32,
     init_name: u32,
     pub output: Output,
@@ -194,6 +200,7 @@ pub struct Vm<'p> {
 
 impl<'p> Vm<'p> {
     pub fn new(prog: &'p Program) -> Vm<'p> {
+        crate::format::set_function_texts(prog.protos.iter().map(|p| p.text.clone()).collect());
         Vm {
             prog,
             lang: prog.lang,
@@ -215,6 +222,8 @@ impl<'p> Vm<'p> {
             },
             reflected: HashMap::new(),
             runtime: None,
+            stop_at: 0,
+            captured: None,
             length_word: symbol::intern(prog.lang.length_word),
             init_name: symbol::intern("__init__"),
             output: Output::Stdout(Vec::new()),
@@ -282,8 +291,8 @@ impl<'p> Vm<'p> {
             match self.exec() {
                 Ok(()) => break Ok(()),
                 Err(signal) => {
-                    if let Err(e) = self.unwind(signal) {
-                        break Err(e);
+                    if let Err(s) = self.unwind(signal) {
+                        break Err(signal_error(s));
                     }
                 }
             }
@@ -294,7 +303,7 @@ impl<'p> Vm<'p> {
 
     /// Hands a signal to the innermost handler or loop that takes it,
     /// leaving frames that have none. Fails when it reaches the top.
-    fn unwind(&mut self, mut signal: Signal) -> Result<(), RuntimeError> {
+    fn unwind(&mut self, mut signal: Signal) -> Result<(), Signal> {
         loop {
             let frame = self.frames.last_mut().unwrap();
             let proto = &self.prog.protos[frame.proto as usize];
@@ -331,6 +340,12 @@ impl<'p> Vm<'p> {
                 _ => {}
             }
             // Nothing in this frame takes it.
+            if frame.post == Post::Capture && !matches!(signal, Signal::Return(_)) {
+                // It leaves the function a native function called: back to that function.
+                let frame = self.frames.pop().unwrap();
+                self.stack.truncate(frame.base);
+                return Err(signal);
+            }
             if let Post::ModuleInit(m) = frame.post {
                 // The import fails with it; the module may be loaded again later.
                 self.module_state[m as usize] = ModState::Unloaded;
@@ -339,11 +354,7 @@ impl<'p> Vm<'p> {
                 continue;
             }
             if self.frames.len() == 1 {
-                return Err(match signal {
-                    Signal::Error(e) => e,
-                    Signal::Break => err("break"),
-                    Signal::Return(_) => err("return"),
-                });
+                return Err(signal);
             }
             match signal {
                 Signal::Return(v) => match self.finish_call(v, false) {
@@ -614,7 +625,13 @@ impl<'p> Vm<'p> {
                     return Err(err(UNSUPPORTED).str_arg("native module call").into());
                 };
                 let args: Vec<Value> = (0..argc as usize).map(|i| self.stack[arg_base + i].clone()).collect();
-                Ok(Some(rt.call(FnRef { module: m, func }, &args)?))
+                let caller = self.as_caller();
+                match rt.call_with(FnRef { module: m, func }, &args, Some(caller)) {
+                    Ok(v) => Ok(Some(v)),
+                    // A break that left a function the native function called.
+                    Err(e) if e.code == BREAK_THROUGH => Err(Signal::Break),
+                    Err(e) => Err(e.into()),
+                }
             }
             None => match f.as_str() {
                 // A name: what it means now (a built-in or function by that name).
@@ -673,6 +690,9 @@ impl<'p> Vm<'p> {
     fn exec(&mut self) -> Flow<()> {
         let prog = self.prog;
         'frames: loop {
+            if self.frames.len() <= self.stop_at {
+                return Ok(());
+            }
             let fi = self.frames.len() - 1;
             let frame = &self.frames[fi];
             let proto = &prog.protos[frame.proto as usize];
@@ -686,7 +706,7 @@ impl<'p> Vm<'p> {
             // and the stack holds every frame: no bounds check per access. The
             // stack only grows in a call, which leaves this loop ('frames), so
             // the pointer stays valid while this frame runs.
-            let regs: *mut Value = unsafe { self.stack.as_mut_ptr().add(base) };
+            let mut regs: *mut Value = unsafe { self.stack.as_mut_ptr().add(base) };
             macro_rules! reg {
                 ($r:expr) => {
                     *{
@@ -942,6 +962,8 @@ impl<'p> Vm<'p> {
                                 self.frames[fi].pc = pc;
                                 match tri!(self.call_value(&f, base + b as usize, argc, dst, proto.module)) {
                                     Some(v) => {
+                                        // A native function may have called back and grown the stack.
+                                        regs = unsafe { self.stack.as_mut_ptr().add(base) };
                                         reg!(dst) = v;
                                         self.depth -= 1;
                                     }
@@ -956,6 +978,8 @@ impl<'p> Vm<'p> {
                         self.frames[fi].pc = pc;
                         match tri!(self.call_value(&f, base + b as usize, argc, dst, proto.module)) {
                             Some(v) => {
+                                // A native function may have called back and grown the stack.
+                                regs = unsafe { self.stack.as_mut_ptr().add(base) };
                                 reg!(dst) = v;
                                 self.depth -= 1;
                             }
@@ -1711,6 +1735,13 @@ impl<'p> Vm<'p> {
                 self.module_state[m as usize] = ModState::Loaded;
                 return Ok(());
             }
+            Post::Capture => {
+                if proto.return_type != 0 {
+                    self.check_type(RETURN_TYPE, &proto.name, proto.return_type, &v)?;
+                }
+                self.captured = Some(v);
+                return Ok(());
+            }
             Post::Value => {
                 if proto.return_type != 0 {
                     self.check_type(RETURN_TYPE, &proto.name, proto.return_type, &v)?;
@@ -1874,6 +1905,76 @@ impl<'p> Vm<'p> {
             };
         }
         Err(err(INPUT_TYPE).str_arg(name))
+    }
+}
+
+/// Marks a break that left a function a native function called, so it goes
+/// on as a break once back in the program (Hana passes it through as an error).
+const BREAK_THROUGH: &str = "__break";
+
+/// What the program's run ends with when a signal reaches the top.
+fn signal_error(s: Signal) -> RuntimeError {
+    match s {
+        Signal::Error(e) => e,
+        Signal::Break => err("break"),
+        Signal::Return(_) => err("return"),
+    }
+}
+
+impl<'p> Vm<'p> {
+    fn as_caller(&mut self) -> *mut dyn Caller {
+        let p: *mut (dyn Caller + '_) = self;
+        // The pointer is used only while this call is running.
+        unsafe { std::mem::transmute::<*mut (dyn Caller + '_), *mut (dyn Caller + 'static)>(p) }
+    }
+}
+
+/// A native function calling a function of the program back (Hana's
+/// `CallFunction`): the function runs to its end, here.
+impl Caller for Vm<'_> {
+    fn call(&mut self, f: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+        match f.as_func() {
+            Some(&FuncObj::User(p)) => {
+                let arg_base = self.stack.len();
+                self.stack.extend(args.iter().cloned());
+                let saved = self.stop_at;
+                self.stop_at = self.frames.len();
+                let (this, ns) = (Value::UNDEF, self.ns);
+                let started = self.call_proto(p, arg_base, args.len() as u16, 0, this, NONE, Post::Capture, false);
+                let result = match started {
+                    Err(s) => Err(s),
+                    Ok(()) => loop {
+                        match self.exec() {
+                            Ok(()) => break Ok(self.captured.take().unwrap_or(Value::NULL)),
+                            // Failing as it ended (its return type): the frame is gone already.
+                            Err(signal) if self.frames.len() <= self.stop_at => break Err(signal),
+                            Err(signal) => {
+                                if let Err(s) = self.unwind(signal) {
+                                    break Err(s);
+                                }
+                            }
+                        }
+                    },
+                };
+                self.stop_at = saved;
+                self.stack.truncate(arg_base);
+                self.ns = ns;
+                self.lang = self.namespaces[ns as usize].lang;
+                result.map_err(|s| match s {
+                    Signal::Break => err(BREAK_THROUGH),
+                    other => signal_error(other),
+                })
+            }
+            Some(FuncObj::Builtin(b)) => builtins::call(*b, args, self.lang),
+            Some(&FuncObj::Native { module, func }) => match self.runtime {
+                Some(rt) => {
+                    let caller = self.as_caller();
+                    rt.call_with(FnRef { module, func }, args, Some(caller))
+                }
+                None => Err(err(NOT_CALLABLE)),
+            },
+            None => Err(err(NOT_CALLABLE)),
+        }
     }
 }
 

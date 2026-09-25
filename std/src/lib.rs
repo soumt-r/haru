@@ -6,17 +6,53 @@
 use haru_sdk::abi::EntryFn;
 use haru_sdk::prelude::*;
 
+mod csv;
+mod datetime;
+mod encoding;
+mod file;
+mod gosort;
+mod gourl;
+mod goregex;
 mod hana;
+mod http;
+mod json;
+mod list;
 mod math;
+mod net;
+mod path;
+mod random;
+mod regexp;
+mod regex_names;
+mod stats;
+mod text;
 pub mod names;
+
+pub use file::deny_files;
+pub use net::deny_net;
 
 use names::HANA_STD;
 
 /// Every standard module Haru has, in load order.
-pub const MODULES: &[EntryFn] = &[math::entry];
+pub const MODULES: &[EntryFn] = &[
+    math::entry,
+    text::entry,
+    list::entry,
+    json::entry,
+    csv::entry,
+    stats::entry,
+    path::entry,
+    encoding::entry,
+    encoding::hash_entry,
+    random::entry,
+    regexp::entry,
+    datetime::entry,
+    file::entry,
+    net::entry,
+    http::entry,
+];
 
 /// Ids of the modules in [`MODULES`] (complete: every function Hana has).
-const IMPLEMENTED: &[&str] = &["math"];
+const IMPLEMENTED: &[&str] = &["math", "text", "list", "json", "csv", "stats", "path", "encoding", "hash", "random", "regex", "datetime", "file", "socket", "http"];
 
 /// Hana packages that come with Hana (not standard modules, not here yet).
 const HANA_PACKAGES: &[&str] = &["timezone", "http_server"];

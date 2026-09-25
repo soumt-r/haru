@@ -6,6 +6,15 @@ use haru_abi::tag;
 use crate::lang::Lang;
 use crate::value::Value;
 
+thread_local! {
+    static FUNCTION_TEXT: std::cell::RefCell<Vec<std::rc::Rc<str>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What each function of the running program shows when printed (by index).
+pub fn set_function_texts(texts: Vec<std::rc::Rc<str>>) {
+    FUNCTION_TEXT.with(|t| *t.borrow_mut() = texts);
+}
+
 /// How deep a list may nest in its printed form (a list can contain itself).
 const MAX_DEPTH: usize = 100;
 
@@ -57,7 +66,12 @@ pub fn write_value(out: &mut String, v: &Value, lang: &Lang, depth: usize) {
             out.push_str(&entries.join(", "));
             out.push('}');
         }
-        tag::FUNC => out.push_str("<함수>"),
+        tag::FUNC => match v.as_func() {
+            Some(&crate::value::FuncObj::User(p)) => {
+                FUNCTION_TEXT.with(|t| out.push_str(t.borrow().get(p as usize).map_or("<함수>", |s| s)))
+            }
+            _ => out.push_str("<함수>"),
+        },
         tag::OBJECT => {
             let name = crate::symbol::name(v.as_object().unwrap().class);
             out.push_str(lang.object_format.0);

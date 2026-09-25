@@ -256,6 +256,20 @@ pub struct HostApi {
     ) -> Status,
     /// Raises the host's argument-type error for the 0-based parameter `index`.
     pub throw_type: unsafe extern "C" fn(ctx: *mut HostCtx, index: usize, expected: u32) -> Status,
+
+    /// Replaces the item at a 0-based `index`, taking over `item`'s
+    /// reference; false (and `item` dropped) when out of range.
+    pub list_set: unsafe extern "C" fn(list: RawValue, index: usize, item: RawValue) -> bool,
+
+    /// A new, empty dictionary (+1).
+    pub dict_new: unsafe extern "C" fn() -> RawValue,
+    pub dict_len: unsafe extern "C" fn(dict: RawValue) -> usize,
+    /// The value under `key` (borrowed) into `out` (+1); false when absent.
+    pub dict_get: unsafe extern "C" fn(dict: RawValue, key: RawValue, out: *mut RawValue) -> bool,
+    /// Sets `key` to `value`, taking over both references.
+    pub dict_set: unsafe extern "C" fn(dict: RawValue, key: RawValue, value: RawValue),
+    /// The keys as a new list (+1), in no particular order.
+    pub dict_keys: unsafe extern "C" fn(dict: RawValue) -> RawValue,
 }
 
 // Descriptors are built once and only read afterwards.

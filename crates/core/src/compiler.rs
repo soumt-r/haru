@@ -233,7 +233,7 @@ impl<'a> Compiler<'a> {
         let main = FnCompiler::new(self, false).compile_main(stmts);
         self.prog.protos[base as usize] = main;
         for (i, job) in jobs.iter().enumerate() {
-            let proto = match *job {
+            let mut proto = match *job {
                 Job::Function(f) => FnCompiler::new(self, false).compile_callable(
                     &f.name,
                     &f.params,
@@ -260,6 +260,9 @@ impl<'a> Compiler<'a> {
                 }
                 Job::Init(body) => FnCompiler::new(self, true).compile_field_init(body),
             };
+            if let Job::Function(f) | Job::Method(f) = *job {
+                proto.text = f.go_string().into();
+            }
             self.prog.protos[base as usize + i + 1] = proto;
         }
 
@@ -462,6 +465,7 @@ fn placeholder(name: &str, module: u32) -> Proto {
         return_type: 0,
         loops: Vec::new(),
         handlers: Vec::new(),
+        text: "".into(),
     }
 }
 
@@ -842,6 +846,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             return_type,
             loops: self.loop_ranges,
             handlers: self.handlers,
+            text: "".into(),
         }
     }
 

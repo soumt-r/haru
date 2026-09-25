@@ -3,6 +3,7 @@
 //! the messages are Hana's word for word.
 
 use haru_sdk::prelude::*;
+use haru_sdk::IntoRet;
 
 /// 2^53: past it a number stops holding every whole number.
 const MAX_SAFE_INTEGER: f64 = 9007199254740992.0;
@@ -49,4 +50,26 @@ pub fn finite(f: f64) -> Result<Value> {
         return Err(Error::new("ValueError.MathDomain"));
     }
     Ok(Value::num(clean(f)))
+}
+
+/// `args[i]` as a string.
+pub fn string(args: &[Value], i: usize) -> Result<Str> {
+    args[i].as_str().ok_or_else(|| Error::new("TypeError.NativeArgString").arg((i + 1) as f64))
+}
+
+/// `args[i]` as a list.
+pub fn list(args: &[Value], i: usize) -> Result<List> {
+    args[i].as_list().ok_or_else(|| Error::new("TypeError.NativeArgList").arg((i + 1) as f64))
+}
+
+/// The most characters (or items) pad, repeat and range may build.
+pub const MAX_RESULT: i64 = 1_000_000;
+
+/// A new list of the given items.
+pub fn new_list(items: impl IntoIterator<Item = Value>) -> Result<Value> {
+    let out = List::new();
+    for v in items {
+        out.push(v)?;
+    }
+    out.into_ret()
 }

@@ -26,6 +26,17 @@ fn main() -> ExitCode {
         }
         None => false,
     };
+    // Hana's `--allow-file=false` / `--allow-net=false` (both allowed by default).
+    for (flag, deny) in [("--allow-file", haru_std::deny_files as fn()), ("--allow-net", haru_std::deny_net)] {
+        match bool_flag(&mut args, flag) {
+            Some(Ok(false)) => deny(),
+            Some(Ok(true)) | None => {}
+            Some(Err(v)) => {
+                eprintln!("haru: invalid argument \"{v}\" for \"{flag}\" flag");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let mut rt = Runtime::new();
     for entry in haru_std::MODULES {
@@ -49,6 +60,19 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// A boolean flag the way Go's flag packages read one: `--flag` or
+/// `--flag=<strconv.ParseBool>`.
+fn bool_flag(args: &mut Vec<String>, flag: &str) -> Option<Result<bool, String>> {
+    let i = args.iter().position(|a| a == flag || a.starts_with(&format!("{flag}=")))?;
+    let arg = args.remove(i);
+    Some(match arg.split_once('=').map(|(_, v)| v) {
+        None => Ok(true),
+        Some("1" | "t" | "T" | "TRUE" | "true" | "True") => Ok(true),
+        Some("0" | "f" | "F" | "FALSE" | "false" | "False") => Ok(false),
+        Some(v) => Err(v.to_string()),
+    })
 }
 
 fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {

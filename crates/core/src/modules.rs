@@ -61,6 +61,12 @@ impl std::fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
+/// What runs the program's own functions when a native function calls them
+/// back (the VM implements it).
+pub trait Caller {
+    fn call(&mut self, f: &Value, args: &[Value]) -> Result<Value, RuntimeError>;
+}
+
 #[derive(Default)]
 pub struct Runtime {
     modules: Vec<LoadedModule>,
@@ -151,6 +157,11 @@ impl Runtime {
     /// Calls a native function. The count and kinds of the arguments are
     /// checked here, so modules never see mismatched values.
     pub fn call(&self, f: FnRef, args: &[Value]) -> Result<Value, RuntimeError> {
+        self.call_with(f, args, None)
+    }
+
+    /// Calls a native function whose callbacks into the program go to `caller`.
+    pub fn call_with(&self, f: FnRef, args: &[Value], caller: Option<*mut dyn Caller>) -> Result<Value, RuntimeError> {
         let func = &self.modules[f.module].functions[f.func];
         let rest = func.params.first() == Some(&kind::REST);
         if rest {
@@ -166,7 +177,7 @@ impl Runtime {
             }
         }
 
-        let mut ctx = CallCtx { rt: self, module: f.module, pending: None };
+        let mut ctx = CallCtx { rt: self, module: f.module, pending: None, caller };
         let mut out = RawValue::NULL;
         let desc = unsafe { &*func.desc };
         // `Value` is `repr(transparent)` over `RawValue`: the arguments go as they are.

@@ -31,7 +31,7 @@ mod module;
 pub use module::{FuncEntry, Module};
 
 pub mod prelude {
-    pub use crate::{Error, Func, List, Module, Result, Str, Value};
+    pub use crate::{Dict, Error, Func, List, Module, Result, Str, Value};
 }
 
 static HOST: AtomicPtr<HostApi> = AtomicPtr::new(std::ptr::null_mut());
@@ -146,6 +146,10 @@ impl Value {
         (self.0.tag == tag::LIST).then(|| List(self.clone()))
     }
 
+    pub fn as_dict(&self) -> Option<Dict> {
+        (self.0.tag == tag::DICT).then(|| Dict(self.clone()))
+    }
+
     pub fn tag(&self) -> u32 {
         self.0.tag
     }
@@ -214,6 +218,53 @@ impl List {
     pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
         (0..self.len()).filter_map(|i| self.get(i))
     }
+
+    /// Replaces the item at a 0-based index; false when out of range.
+    pub fn set(&self, index: usize, item: impl IntoRet) -> Result<bool> {
+        let v = item.into_ret()?;
+        Ok(unsafe { (host().list_set)(self.0 .0, index, v.into_raw()) })
+    }
+}
+
+/// A dictionary shared with the program. Keys compare as the program
+/// compares them (a number key is not the same as its text).
+#[derive(Clone)]
+pub struct Dict(Value);
+
+impl Dict {
+    pub fn new() -> Dict {
+        Dict(Value(unsafe { (host().dict_new)() }))
+    }
+
+    pub fn len(&self) -> usize {
+        unsafe { (host().dict_len)(self.0 .0) }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, key: &Value) -> Option<Value> {
+        let mut out = RawValue::NULL;
+        unsafe { (host().dict_get)(self.0 .0, key.0, &mut out) }.then(|| Value(out))
+    }
+
+    pub fn set(&self, key: impl IntoRet, value: impl IntoRet) -> Result<()> {
+        let (k, v) = (key.into_ret()?, value.into_ret()?);
+        unsafe { (host().dict_set)(self.0 .0, k.into_raw(), v.into_raw()) };
+        Ok(())
+    }
+
+    /// The keys, in no particular order.
+    pub fn keys(&self) -> List {
+        List(Value(unsafe { (host().dict_keys)(self.0 .0) }))
+    }
+}
+
+impl Default for Dict {
+    fn default() -> Dict {
+        Dict::new()
+    }
 }
 
 impl Default for List {
@@ -230,12 +281,20 @@ impl Func {
     /// Calls the function on the current thread. Only valid while the host is
     /// calling into this module.
     pub fn call(&self, args: &[Value]) -> Result<Value> {
+        self.0.call(args)
+    }
+}
+
+impl Value {
+    /// Calls the value as a function (the host fails with `NotCallable` when
+    /// it is not one). Only valid while the host is calling into this module.
+    pub fn call(&self, args: &[Value]) -> Result<Value> {
         let ctx = CTX.with(|c| c.get());
         assert!(!ctx.is_null(), "haru-sdk: Func::call outside of a native call");
         let mut out = RawValue::NULL;
         // `Value` is a transparent wrapper over `RawValue` in memory.
         let status = unsafe {
-            (host().call)(ctx, self.0 .0, args.as_ptr() as *const RawValue, args.len(), &mut out)
+            (host().call)(ctx, self.0, args.as_ptr() as *const RawValue, args.len(), &mut out)
         };
         if status == STATUS_OK {
             Ok(Value(out))
@@ -311,6 +370,13 @@ impl FromArg for List {
     }
 }
 
+impl FromArg for Dict {
+    const KIND: u32 = kind::DICT;
+    fn from_arg(raw: RawValue) -> Option<Dict> {
+        (raw.tag == tag::DICT).then(|| Dict(Value::borrowed(raw)))
+    }
+}
+
 impl FromArg for Func {
     const KIND: u32 = kind::FUNC;
     fn from_arg(raw: RawValue) -> Option<Func> {
@@ -373,6 +439,12 @@ impl IntoRet for Str {
 }
 
 impl IntoRet for List {
+    fn into_ret(self) -> Result<Value> {
+        Ok(self.0)
+    }
+}
+
+impl IntoRet for Dict {
     fn into_ret(self) -> Result<Value> {
         Ok(self.0)
     }

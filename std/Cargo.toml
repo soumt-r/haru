@@ -7,3 +7,10 @@ license.workspace = true
 
 [dependencies]
 haru-sdk.workspace = true
+sha2 = "0.10"
+fastrand = "2"
+getrandom = "0.3"
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-platform-verifier = "0.6"
