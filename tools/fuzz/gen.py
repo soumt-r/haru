@@ -253,15 +253,244 @@ class Gen:
         return "\n".join(out) + "\n"
 
 
+CLASSES = """[동물]을 설계하자:
+    '이름'을 [문자열]인 "없음"으로 정하자
+    '나이'를 [숫자]인 {age}으로 정하여 숨기자
+    '다리'를 4로 정하여 물려주자
+    '우리'의 '수'를 0으로 정하자
+    '별명'을 [문자열]로 정하자:
+        가져올 때:
+            ('나'의 '이름' + "이")를 돌려주자
+        정할 때 ('새값'):
+            '나'의 '이름'을 '새값'으로 정하자
+    처음 만들어질 때 ('새이름', '새나이' = 1) 다음과 같이 하자:
+        '나'의 '이름'을 '새이름'으로 정하자
+        '나이'를 '새나이'로 정하자
+        [동물]의 '수'에 1을 더하자
+    [문자열]을 돌려주는 <소개>를 만들자 ():
+        ('나'의 '이름' + "입니다")를 돌려주자
+    <나이먹기>를 만들자 ([숫자]인 '더'):
+        '나이'에 '더'를 더하자
+        '나이'를 돌려주자
+    <다리수>를 만들자 ():
+        '나'의 '다리'를 돌려주자
+    <기호 같다>를 만들자 ('다른'):
+        ('나'의 '이름' == '다른'의 '이름')를 돌려주자
+    [동물]을 돌려주는 '우리'의 <만들기>를 만들자 ('이름'):
+        새로운 [동물]('이름')을 돌려주자
+    <비밀>을 만들어 숨기자 ():
+        "비밀"을 돌려주자
+
+[개]는 [동물]을 바탕으로 하고 설계하자:
+    처음 만들어질 때 ('새이름') 다음과 같이 하자:
+        부모의 <처음 만들어질 때>('새이름', 3)을 실행하자
+    <소개>를 만들자 ():
+        (부모의 <소개>() + " 멍")을 돌려주자
+
+[내오류]는 [오류]를 바탕으로 하고 설계하자:
+    '코드'를 7로 정하자
+
+'동'을 [동물]인 새로운 [동물]("가나", 2)로 정하자
+'멍'을 새로운 [개]("바둑")로 정하자
+"""
+
+
+class OopGen(Gen):
+    """Programs with classes and error handling on top of Gen's statements."""
+
+    def obj(self):
+        return self.pick(["'동'", "'멍'", "새로운 [동물](\"새\")", "[동물]의 <만들기>(\"공장\")"] + (["'없는변수'", "3"] if self.bad() else []))
+
+    def stmt(self, ind):
+        pad = "    " * ind
+        k = self.r.randrange(30)
+        deep = self.depth < 3
+        if k < 16:
+            return Gen.stmt(self, ind)
+        if k == 16:
+            m = self.pick(["<소개>()", "<나이먹기>(1)", "<다리수>()", "<나이먹기>(\"한살\")", "<없는메서드>()"] + (["<비밀>()"] if self.bad() else []))
+            return f"{pad}({self.obj()}의 {m})를 출력하자"
+        if k == 17:
+            f = self.pick(["'이름'", "'별명'", "'다리'", "'없는필드'"] + (["'나이'"] if self.bad() else []))
+            return f"{pad}({self.obj()}의 {f})를 출력하자"
+        if k == 18:
+            v = self.pick(['"새이름"', "3"])
+            field = self.pick(["'이름'", "'별명'", "'새필드'"])
+            return f"{pad}'동'의 {field}를 {v}로 정하자"
+        if k == 19:
+            key = self.pick(['"키"', '"값"', '"새키"'])
+            return f"{pad}({DICT}의 {key})를 출력하자"
+        if k == 20 and deep:
+            cases = []
+            for _ in range(self.r.randrange(1, 3)):
+                vals = ", ".join(str(self.r.randrange(0, 5)) for _ in range(self.r.randrange(1, 3)))
+                body = self.block(ind + 2, 1)
+                if self.chance(0.3):
+                    body += f"\n{pad}        다음으로 이어가자"
+                cases.append(f"{pad}    {vals} 인 경우:\n{body}")
+            if self.chance(0.6):
+                cases.append(f"{pad}    나머지는:\n{self.block(ind + 2, 1)}")
+            return f"{pad}{self.pick(NUMS)}에 따라 나누자:\n" + "\n".join(cases)
+        if k == 21 and not self.in_func:
+            return f"{pad}{self.call_num(1)}를 실행하자"
+        if k == 22 and self.in_func:
+            return f"{pad}{self.num(1)}를 돌려주자"
+        if k == 23 and self.chance(0.1):
+            return f"{pad}{NUMLIST}의 <비우기>()를 실행하자"
+        return f"{pad}{self.any()}를 출력하자"
+
+    def functions(self):
+        self.in_func = True
+        out = [
+            f"[숫자]를 돌려주는 <두배>를 만들자 ([숫자]인 'x'):\n{self.fbody()}\n    ('x' * 2)를 돌려주자",
+            f"<합>을 만들자 ('x', 'y' = 10):\n{self.fbody()}\n    ('x' + 'y')를 돌려주자",
+            f"<세기>를 만들자 ([숫자]인 'n'):\n    '개수'를 0으로 정하자\n    1부터 'n'까지 반복하자 ('k'):\n        '개수'에 'k'를 더하자\n        만약 ('k' > 5) 라면:\n            반복을 끝내자\n    '개수'를 돌려주자",
+        ]
+        self.in_func = False
+        return out
+
+    def fbody(self):
+        saved = self.loopvars
+        self.loopvars = ["'x'"]
+        b = self.block(1, self.r.randrange(0, 3) or 1)
+        self.loopvars = saved
+        return b
+
+    def program(self):
+        out = self.functions()
+        out.append(f"{NUMLIST}를 [1, 2, 3]으로 정하자")
+        out.append(f"{MIXLIST}를 [\"가\", 참, 3]으로 정하자")
+        out.append(f"{DICT}를 {{\"키\": 1, \"값\": \"둘\"}}로 정하자")
+        out.append(f"{TEXT}를 \"안녕 하리\"로 정하자")
+        for v in NUMS:
+            out.append(f"{v}를 {self.r.randrange(0, 10)}로 정하자")
+        for _ in range(self.r.randrange(8, 20)):
+            out.append(self.stmt(0))
+        out.append(f"{NUMS[0]}를 출력하자\n{TEXT}를 출력하자\n{NUMLIST}를 출력하자\n{DICT}를 출력하자")
+        return "\n".join(out) + "\n"
+
+
+CLASSES = """[동물]을 설계하자:
+    '이름'을 [문자열]인 "없음"으로 정하자
+    '나이'를 [숫자]인 {age}으로 정하여 숨기자
+    '다리'를 4로 정하여 물려주자
+    '우리'의 '수'를 0으로 정하자
+    '별명'을 [문자열]로 정하자:
+        가져올 때:
+            ('나'의 '이름' + "이")를 돌려주자
+        정할 때 ('새값'):
+            '나'의 '이름'을 '새값'으로 정하자
+    처음 만들어질 때 ('새이름', '새나이' = 1) 다음과 같이 하자:
+        '나'의 '이름'을 '새이름'으로 정하자
+        '나이'를 '새나이'로 정하자
+        [동물]의 '수'에 1을 더하자
+    [문자열]을 돌려주는 <소개>를 만들자 ():
+        ('나'의 '이름' + "입니다")를 돌려주자
+    <나이먹기>를 만들자 ([숫자]인 '더'):
+        '나이'에 '더'를 더하자
+        '나이'를 돌려주자
+    <다리수>를 만들자 ():
+        '나'의 '다리'를 돌려주자
+    <기호 같다>를 만들자 ('다른'):
+        ('나'의 '이름' == '다른'의 '이름')를 돌려주자
+    [동물]을 돌려주는 '우리'의 <만들기>를 만들자 ('이름'):
+        새로운 [동물]('이름')을 돌려주자
+    <비밀>을 만들어 숨기자 ():
+        "비밀"을 돌려주자
+
+[개]는 [동물]을 바탕으로 하고 설계하자:
+    처음 만들어질 때 ('새이름') 다음과 같이 하자:
+        부모의 <처음 만들어질 때>('새이름', 3)을 실행하자
+    <소개>를 만들자 ():
+        (부모의 <소개>() + " 멍")을 돌려주자
+
+[내오류]는 [오류]를 바탕으로 하고 설계하자:
+    '코드'를 7로 정하자
+
+'동'을 [동물]인 새로운 [동물]("가나", 2)로 정하자
+'멍'을 새로운 [개]("바둑")로 정하자
+"""
+
+
+class OopGen(Gen):
+    """Programs with classes and error handling on top of Gen's statements."""
+
+    def obj(self):
+        return self.pick(["'동'", "'멍'", "새로운 [동물](\"새\")", "[동물]의 <만들기>(\"공장\")"] + (["'없는변수'", "3"] if self.bad() else []))
+
+    def stmt(self, ind):
+        pad = "    " * ind
+        k = self.r.randrange(30)
+        deep = self.depth < 3
+        if k < 16:
+            return Gen.stmt(self, ind)
+        if k == 16:
+            m = self.pick(["<소개>()", "<나이먹기>(1)", "<다리수>()", "<나이먹기>(\"한살\")", "<없는메서드>()"] + (["<비밀>()"] if self.bad() else []))
+            return f"{pad}({self.obj()}의 {m})를 출력하자"
+        if k == 17:
+            f = self.pick(["'이름'", "'별명'", "'다리'", "'없는필드'"] + (["'나이'"] if self.bad() else []))
+            return f"{pad}({self.obj()}의 {f})를 출력하자"
+        if k == 18:
+            v = self.pick(['"새이름"', "3"])
+            return f"{pad}'가'의 {self.pick(['이름', '별명', '새필드'])}를 {v}로 정하자".replace("의 이", "의 '이").replace("의 별", "의 '별").replace("의 새", "의 '새").replace("를 ", "'를 ", 1)
+        if k == 19:
+            return f"{pad}([동물]의 '수')를 출력하자"
+        if k == 20:
+            return f"{pad}({self.obj()} == {self.obj()})를 출력하자"
+        if k == 21:
+            return f"{pad}({self.obj()}가 {self.pick(['[동물]', '[개]', '[오류]'])}의 일종이다)를 출력하자"
+        if k == 22:
+            return f"{pad}{self.obj()}를 출력하자"
+        if k in (23, 24, 25) and deep:
+            what = self.pick([
+                "새로운 [오류](\"문제\")를 발생시키자",
+                "새로운 [내오류](\"내 문제\")를 발생시키자",
+                "\"글자\"를 발생시키자",
+                "(1 / 0)을 출력하자",
+                "'없는변수'를 출력하자",
+                "\"괜찮아\"를 출력하자",
+            ])
+            body = f"{pad}    {what}\n" + self.block(ind + 1, 1)
+            s = f"{pad}일단 해보자:\n{body}"
+            for _ in range(self.r.randrange(0, 3)):
+                t = self.pick(["오류가", "[내오류]가", "[오류]가", "[동물]이"])
+                s += f"\n{pad}{t} 발생했다면 ('e'):\n{pad}    ('e'의 '메시지')를 출력하자"
+                if self.chance(0.3):
+                    s += f"\n{pad}    'e'를 출력하자"
+            if self.chance(0.5) or "발생했다면" not in s:
+                s += f"\n{pad}마무리는 항상:\n{pad}    \"마무리\"를 출력하자"
+            return s
+        if k == 26:
+            if self.bad():
+                thrown = self.pick(['새로운 [오류]("밖")', '"밖에서"', '3'])
+                return f"{pad}{thrown}을 발생시키자"
+            return f"{pad}\"조용\"을 출력하자"
+        if k == 27 and deep:
+            self.loops += 1
+            s = f"{pad}1부터 3까지 반복하자 ('i'):\n{pad}    일단 해보자:\n{pad}        만약 ('i' == 2) 라면:\n{pad}            반복을 끝내자\n{pad}        'i'를 출력하자\n{pad}    마무리는 항상:\n{pad}        \"끝\"을 출력하자"
+            self.loops -= 1
+            return s
+        return f"{pad}({self.obj()}의 <소개>())를 출력하자"
+
+    def program(self):
+        base = Gen.program(self)
+        head = CLASSES.replace("{age}", str(self.r.randrange(0, 5)))
+        body = [self.stmt(0) for _ in range(self.r.randrange(6, 14))]
+        return head + base + "\n".join(body) + "\n"
+
+
 def main():
-    out, count = sys.argv[1], int(sys.argv[2])
-    seed = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-    chaos = float(sys.argv[4]) if len(sys.argv) > 4 else 0.015
+    args = [a for a in sys.argv[1:] if a != "--oop"]
+    oop = "--oop" in sys.argv
+    out, count = args[0], int(args[1])
+    seed = int(args[2]) if len(args) > 2 else 1
+    chaos = float(args[3]) if len(args) > 3 else 0.015
     os.makedirs(out, exist_ok=True)
     for i in range(count):
         rng = random.Random(seed * 100003 + i)
+        gen = OopGen(rng, chaos) if oop else Gen(rng, chaos)
         with open(os.path.join(out, f"f{i:05d}.hr"), "w", encoding="utf-8", newline="\n") as f:
-            f.write(Gen(rng, chaos).program())
+            f.write(gen.program())
 
 
 if __name__ == "__main__":

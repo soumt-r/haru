@@ -17,6 +17,10 @@ use haru_abi::{tag, RawValue};
 /// programs or modules.
 pub const UNDEF: u32 = u32::MAX;
 
+/// A class used as a value (`[점]`, `'우리'`): the payload is the class id.
+/// Not reference counted: classes live as long as the program.
+pub const CLASS: u32 = 20;
+
 pub struct StrObj {
     pub text: String,
 }
@@ -29,6 +33,13 @@ pub struct ListObj {
 /// strings and booleans by value, lists and objects by identity.
 pub struct DictObj {
     pub map: RefCell<HashMap<Key, Value>>,
+}
+
+/// An instance: its class and its properties (created by assignment, as in
+/// Hana, so not a fixed layout). Keys are symbols (`crate::symbol`).
+pub struct ObjObj {
+    pub class: u32,
+    pub props: RefCell<HashMap<u32, Value>>,
 }
 
 pub enum FuncObj {
@@ -75,6 +86,22 @@ impl Value {
 
     pub fn func(f: FuncObj) -> Value {
         Value::heap(tag::FUNC, Rc::new(f))
+    }
+
+    pub fn object(class: u32) -> Value {
+        Value::heap(tag::OBJECT, Rc::new(ObjObj { class, props: RefCell::new(HashMap::new()) }))
+    }
+
+    pub fn class(id: u32) -> Value {
+        Value(RawValue { tag: CLASS, pad: 0, payload: id as u64 })
+    }
+
+    pub fn as_class(&self) -> Option<u32> {
+        (self.0.tag == CLASS).then_some(self.0.payload as u32)
+    }
+
+    pub fn as_object(&self) -> Option<&ObjObj> {
+        (self.0.tag == tag::OBJECT).then(|| unsafe { &*(self.0.payload as *const ObjObj) })
     }
 
     fn heap<T>(tag: u32, obj: Rc<T>) -> Value {
@@ -191,6 +218,7 @@ pub(crate) unsafe fn retain(raw: RawValue) {
         tag::LIST => Rc::increment_strong_count(raw.payload as *const ListObj),
         tag::DICT => Rc::increment_strong_count(raw.payload as *const DictObj),
         tag::FUNC => Rc::increment_strong_count(raw.payload as *const FuncObj),
+        tag::OBJECT => Rc::increment_strong_count(raw.payload as *const ObjObj),
         _ => {}
     }
 }
@@ -203,6 +231,7 @@ pub(crate) unsafe fn release(raw: RawValue) {
         tag::LIST => Rc::decrement_strong_count(raw.payload as *const ListObj),
         tag::DICT => Rc::decrement_strong_count(raw.payload as *const DictObj),
         tag::FUNC => Rc::decrement_strong_count(raw.payload as *const FuncObj),
+        tag::OBJECT => Rc::decrement_strong_count(raw.payload as *const ObjObj),
         _ => {}
     }
 }

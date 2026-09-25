@@ -9,12 +9,13 @@
 //! can declare and gives each a slot, so a variable reference becomes the
 //! list of slots it may be in ([`Var`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use haru_syntax::ast::{self, Block, Expr, Stmt};
 
 use crate::bytecode::*;
 use crate::lang::Lang;
+use crate::symbol;
 use crate::value::{FuncObj, Value};
 
 /// A construct this version cannot run yet.
@@ -22,23 +23,25 @@ use crate::value::{FuncObj, Value};
 pub struct Unsupported(pub String);
 
 pub fn compile(program: &ast::Program, lang: &'static Lang) -> Result<Program, Unsupported> {
+    let error_class = builtin_error_class(lang);
     let mut c = Compiler {
         prog: Program {
             lang,
             protos: Vec::new(),
             consts: Vec::new(),
-            names: Vec::new(),
             vars: Vec::new(),
             types: vec![TypeSpec::parse("", lang)],
             globals: Vec::new(),
             global_names: Vec::new(),
             functions: Vec::new(),
+            classes: HashMap::new(),
+            interfaces: HashSet::new(),
         },
-        name_ids: HashMap::new(),
         type_ids: HashMap::new(),
         str_consts: HashMap::new(),
         globals: HashMap::new(),
         functions: HashMap::new(),
+        class_defs: HashMap::new(),
     };
     c.check_supported(&program.statements)?;
 
@@ -60,36 +63,192 @@ pub fn compile(program: &ast::Program, lang: &'static Lang) -> Result<Program, U
         }
     }
 
-    // Top-level functions: the first of each name (later ones are never found).
-    let mut decls = Vec::new();
-    for s in &program.statements {
-        if let Stmt::Function(f) = s {
-            if !c.functions.contains_key(&f.name) {
-                let proto = (decls.len() + 1) as u32;
-                c.functions.insert(f.name.clone(), proto);
-                c.prog.functions.push((f.name.clone(), proto));
-                decls.push(f);
+    // Classes and interfaces of the top level, the later of a name winning,
+    // after the built-in error class (which a program may replace).
+    let mut class_order: Vec<String> = Vec::new();
+    let mut defs: HashMap<String, &Stmt> = HashMap::new();
+    for s in std::iter::once(&error_class).chain(program.statements.iter()) {
+        match s {
+            Stmt::Class { name: Some(n), .. } => {
+                if defs.insert(n.name.clone(), s).is_none() {
+                    class_order.push(n.name.clone());
+                }
             }
+            Stmt::Interface { name: Some(n), .. } => {
+                c.prog.interfaces.insert(symbol::intern(&n.name));
+            }
+            _ => {}
         }
     }
 
-    c.prog.protos.push(placeholder("<main>"));
-    for f in &decls {
-        c.prog.protos.push(placeholder(&f.name));
+    // Top-level functions: the first of each name (later ones are never found).
+    let mut jobs: Vec<Job> = Vec::new();
+    for s in &program.statements {
+        if let Stmt::Function(f) = s {
+            if !c.functions.contains_key(&f.name) {
+                let proto = (jobs.len() + 1) as u32;
+                c.functions.insert(f.name.clone(), proto);
+                c.prog.functions.push((f.name.clone(), proto));
+                jobs.push(Job::Function(f));
+            }
+        }
     }
-    let main = FnCompiler::new(&mut c, None).compile_main(&program.statements);
+    // Every method, constructor, getter and setter of every class.
+    let mut class_protos: HashMap<String, ClassProtos> = HashMap::new();
+    for name in &class_order {
+        let Stmt::Class { body, .. } = defs[name] else { unreachable!() };
+        let mut cp = ClassProtos::default();
+        for s in body {
+            match s {
+                Stmt::Function(f) => {
+                    jobs.push(Job::Method(f));
+                    cp.methods.push((f.name.clone(), jobs.len() as u32, f.is_static, Access::parse(f.access)));
+                    if f.name == lang.equals_method && cp.equals.is_none() {
+                        jobs.push(Job::Equals(f));
+                        cp.equals = Some(jobs.len() as u32);
+                    }
+                }
+                Stmt::Constructor { params, body, .. } => {
+                    jobs.push(Job::Ctor(params, body));
+                    if cp.ctor.is_none() {
+                        cp.ctor = Some(jobs.len() as u32);
+                    }
+                }
+                Stmt::VarDecl(v) => {
+                    let name = v.name.clone().unwrap_or_default();
+                    let getter = v.getter.as_ref().map(|g| {
+                        jobs.push(Job::Getter(g));
+                        jobs.len() as u32
+                    });
+                    let setter = v.setter.as_ref().map(|st| {
+                        jobs.push(Job::Setter(st));
+                        jobs.len() as u32
+                    });
+                    let ty = if v.is_static { None } else { Some(v.type_ref.as_ref().map_or(0, |t| c.type_id(&t.name))) };
+                    cp.fields.push(FieldDecl { name, access: Access::parse(v.access), getter, setter, ty });
+                }
+                _ => {}
+            }
+        }
+        class_protos.insert(name.clone(), cp);
+    }
+    c.class_defs = defs;
+    c.build_classes(&class_order, &class_protos);
+
+    c.prog.protos.push(placeholder("<main>"));
+    for _ in &jobs {
+        c.prog.protos.push(placeholder(""));
+    }
+    let main = FnCompiler::new(&mut c, false).compile_main(&program.statements);
     c.prog.protos[0] = main;
-    for (i, f) in decls.iter().enumerate() {
-        let proto = FnCompiler::new(&mut c, Some(f)).compile_function(f);
+    for (i, job) in jobs.iter().enumerate() {
+        let proto = match *job {
+            Job::Function(f) => FnCompiler::new(&mut c, false).compile_callable(
+                &f.name,
+                &f.params,
+                &f.body.statements,
+                f.return_type.as_ref(),
+                false,
+            ),
+            Job::Method(f) => FnCompiler::new(&mut c, true).compile_callable(
+                &f.name,
+                &f.params,
+                &f.body.statements,
+                f.return_type.as_ref(),
+                false,
+            ),
+            Job::Equals(f) => FnCompiler::new(&mut c, true).compile_callable(&f.name, &f.params, &f.body.statements, None, true),
+            Job::Ctor(params, body) => {
+                FnCompiler::new(&mut c, true).compile_callable(lang.syntax.constructor_function_name, params, body, None, false)
+            }
+            Job::Getter(body) => FnCompiler::new(&mut c, true).compile_callable("", &[], body, None, false),
+            Job::Setter(st) => {
+                let params: Vec<ast::Param> =
+                    st.param.iter().map(|n| ast::Param { name: n.clone(), type_annotation: None, default: None }).collect();
+                FnCompiler::new(&mut c, true).compile_callable("", &params, &st.body, None, true)
+            }
+        };
         c.prog.protos[i + 1] = proto;
     }
     c.prog.global_names = c.globals.iter().map(|(n, s)| (n.clone(), s.loc_global())).collect();
     Ok(c.prog)
 }
 
+/// What gets compiled into a function body.
+enum Job<'a> {
+    Function(&'a ast::FuncDecl),
+    Method(&'a ast::FuncDecl),
+    /// A class's `<기호 같다>` for `==`: binds only the first argument.
+    Equals(&'a ast::FuncDecl),
+    Ctor(&'a [ast::Param], &'a [Stmt]),
+    Getter(&'a [Stmt]),
+    /// Binds only the new value (to the parameter, when it has one).
+    Setter(&'a ast::Setter),
+}
+
+/// The compiled parts of one class, in declaration order.
+#[derive(Default)]
+struct ClassProtos {
+    /// (name, proto, static, access)
+    methods: Vec<(String, u32, bool, Access)>,
+    ctor: Option<u32>,
+    equals: Option<u32>,
+    fields: Vec<FieldDecl>,
+}
+
+/// A field (or property) as its class declares it.
+struct FieldDecl {
+    name: String,
+    access: Access,
+    getter: Option<u32>,
+    setter: Option<u32>,
+    /// Declared type id (0: none); None for a static field.
+    ty: Option<u32>,
+}
+
+/// Hana's built-in `[오류]`: a `메시지` field and a constructor that sets it.
+fn builtin_error_class(lang: &Lang) -> Stmt {
+    let this_msg = Expr::Member {
+        object: Box::new(Expr::Identifier(lang.self_words[0].to_string())),
+        property: Box::new(Expr::Identifier(lang.error_message.to_string())),
+    };
+    Stmt::Class {
+        name: Some(ast::TypeRef { name: lang.error_class.to_string() }),
+        base: None,
+        interfaces: Vec::new(),
+        is_abstract: false,
+        body: vec![
+            Stmt::VarDecl(ast::VarDecl {
+                name: Some(lang.error_message.to_string()),
+                type_ref: None,
+                value: Some(Expr::Str(String::new())),
+                is_constant: false,
+                access: "public",
+                is_static: false,
+                getter: None,
+                setter: None,
+            }),
+            Stmt::Constructor {
+                id: lang.syntax.constructor_function_name.to_string(),
+                params: vec![ast::Param { name: lang.error_ctor_arg.to_string(), type_annotation: None, default: None }],
+                body: vec![Stmt::Assign { target: this_msg.clone(), value: Some(Expr::Identifier(lang.error_ctor_arg.to_string())) }],
+            },
+            Stmt::Function(ast::FuncDecl {
+                name: "__toString__".to_string(),
+                params: Vec::new(),
+                body: Block { statements: vec![Stmt::Return(Some(this_msg))] },
+                access: "public",
+                is_static: false,
+                return_type: None,
+            }),
+        ],
+    }
+}
+
 fn placeholder(name: &str) -> Proto {
     Proto {
         name: name.to_string(),
+        raw_params: false,
         code: Vec::new(),
         nregs: 0,
         params: Vec::new(),
@@ -103,29 +262,145 @@ impl Slot {
     fn loc_global(&self) -> u32 {
         match self.loc {
             Loc::Global(g) => g,
-            Loc::Reg(_) => unreachable!(),
+            _ => unreachable!(),
         }
     }
 }
 
-struct Compiler {
+struct Compiler<'a> {
     prog: Program,
-    name_ids: HashMap<String, u32>,
     type_ids: HashMap<String, u32>,
     str_consts: HashMap<String, u32>,
     globals: HashMap<String, Slot>,
     functions: HashMap<String, u32>,
+    /// Class declarations by name (the built-in error class included).
+    class_defs: HashMap<String, &'a Stmt>,
 }
 
-impl Compiler {
+impl<'a> Compiler<'a> {
     fn name(&mut self, s: &str) -> u32 {
-        if let Some(&i) = self.name_ids.get(s) {
-            return i;
+        symbol::intern(s)
+    }
+
+    /// The class and its ancestors that exist, then the first missing
+    /// parent's name if any (Hana still compares that name).
+    fn chain(&self, name: &str) -> (Vec<String>, Option<String>) {
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = name.to_string();
+        loop {
+            if out.contains(&cur) {
+                return (out, None); // a cycle: Hana would never finish
+            }
+            let Some(Stmt::Class { base, .. }) = self.class_defs.get(&cur).copied() else {
+                return (out, Some(cur));
+            };
+            out.push(cur);
+            match base {
+                Some(b) => cur = b.name.clone(),
+                None => return (out, None),
+            }
         }
-        let i = self.prog.names.len() as u32;
-        self.prog.names.push(s.to_string());
-        self.name_ids.insert(s.to_string(), i);
-        i
+    }
+
+    /// Resolves every class's lookups ahead (Hana's `classMember`,
+    /// `fieldAnnotation`, constructor search and subtype checks).
+    fn build_classes(&mut self, order: &[String], protos: &HashMap<String, ClassProtos>) {
+        for name in order {
+            let (chain, missing) = self.chain(name);
+            let Some(Stmt::Class { base, interfaces, is_abstract, .. }) = self.class_defs.get(name).copied() else {
+                continue;
+            };
+            let mut info = ClassInfo {
+                name: symbol::intern(name),
+                is_abstract: *is_abstract,
+                members: HashMap::new(),
+                field_types: HashMap::new(),
+                ctor: None,
+                statics: HashMap::new(),
+                equals: protos[name].equals,
+                lineage: Vec::new(),
+                supertypes: HashSet::new(),
+                super_start: base.as_ref().map(|b| self.class_defs.contains_key(&b.name).then(|| symbol::intern(&b.name))),
+            };
+            let mut field_seen: HashSet<u32> = HashSet::new();
+            let mut method_seen: HashSet<u32> = HashSet::new();
+            for class in &chain {
+                let cp = &protos[class];
+                for FieldDecl { name: fname, access, getter, setter, ty } in &cp.fields {
+                    let sym = symbol::intern(fname);
+                    if field_seen.insert(sym) {
+                        let m = info.members.entry(sym).or_default();
+                        m.field_access = *access;
+                        m.getter = *getter;
+                        m.setter = *setter;
+                    }
+                    if let Some(ty) = ty {
+                        info.field_types.entry(sym).or_insert(*ty);
+                    }
+                }
+                for (mname, proto, _, access) in &cp.methods {
+                    let sym = symbol::intern(mname);
+                    if method_seen.insert(sym) {
+                        let m = info.members.entry(sym).or_default();
+                        m.method = Some(*proto);
+                        m.method_access = *access;
+                    }
+                }
+                if info.ctor.is_none() {
+                    info.ctor = cp.ctor;
+                }
+                let sym = symbol::intern(class);
+                info.lineage.push(sym);
+                info.supertypes.insert(sym);
+                if let Some(Stmt::Class { interfaces, .. }) = self.class_defs.get(class).copied() {
+                    for i in interfaces {
+                        info.supertypes.insert(symbol::intern(&i.name));
+                    }
+                }
+            }
+            if let Some(m) = missing {
+                let sym = symbol::intern(&m);
+                info.lineage.push(sym);
+                info.supertypes.insert(sym);
+            }
+            let _ = interfaces;
+            for (mname, proto, is_static, _) in &protos[name].methods {
+                if *is_static {
+                    info.statics.entry(symbol::intern(mname)).or_insert(*proto);
+                }
+            }
+            self.prog.classes.insert(info.name, info);
+        }
+    }
+
+    /// Hana checks, before running, that each class has the methods its
+    /// interfaces require (its own body only).
+    fn interface_violation(&self, stmts: &[Stmt]) -> Option<(String, String, String)> {
+        let ifaces: HashMap<&str, &Vec<Stmt>> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Interface { name: Some(n), body } => Some((n.name.as_str(), body)),
+                _ => None,
+            })
+            .collect();
+        for s in stmts {
+            let Stmt::Class { name: Some(n), interfaces, body, .. } = s else { continue };
+            // A later declaration of the name replaces this one.
+            if !std::ptr::eq(self.class_defs.get(&n.name).copied().unwrap_or(s), s) {
+                continue;
+            }
+            for i in interfaces {
+                let Some(required) = ifaces.get(i.name.as_str()) else { continue };
+                for r in required.iter() {
+                    let Stmt::InterfaceMethod(m) = r else { continue };
+                    let has = body.iter().any(|b| matches!(b, Stmt::Function(f) if &f.name == m));
+                    if !has {
+                        return Some((n.name.clone(), i.name.clone(), m.clone()));
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn type_id(&mut self, text: &str) -> u32 {
@@ -178,18 +453,12 @@ impl Compiler {
         };
         walk_stmts(stmts, &mut |s| {
             note(match s {
-                Stmt::Class { .. } | Stmt::Interface { .. } | Stmt::Constructor { .. } => Some("classes"),
-                Stmt::InterfaceMethod(_) => Some("interfaces"),
                 Stmt::Import { .. } => Some("imports"),
-                Stmt::Try { .. } | Stmt::Throw(_) => Some("try/throw"),
-                Stmt::VarDecl(v) if v.is_static || v.getter.is_some() || v.setter.is_some() => Some("properties"),
                 _ => None,
             })
         }, &mut |e| {
             note(match e {
-                Expr::SelfRef | Expr::SuperRef | Expr::StaticRef | Expr::New { .. } => Some("classes"),
                 Expr::FunctionRef(n) if n.starts_with('\'') || n.starts_with('『') => Some("reflection"),
-                Expr::Binary { op, .. } if op == "instanceof" => Some("classes"),
                 _ => None,
             })
         });
@@ -368,10 +637,13 @@ struct Scope {
 
 struct LoopCtx {
     breaks: Vec<usize>,
+    /// `마무리는 항상` blocks open when the loop started: a break that has to
+    /// pass more of them goes as a signal, so they run.
+    finally_depth: u32,
 }
 
-struct FnCompiler<'c> {
-    c: &'c mut Compiler,
+struct FnCompiler<'c, 'a> {
+    c: &'c mut Compiler<'a>,
     code: Vec<Op>,
     next_reg: Reg,
     max_reg: Reg,
@@ -385,10 +657,16 @@ struct FnCompiler<'c> {
     /// Variable registers that certainly hold a value wherever their scope is
     /// visible: parameters (after the prologue), loop variables, items.
     definite: Vec<Reg>,
+    /// A method, constructor, getter or setter: the object's properties read
+    /// like variables (between the call's scope and the globals).
+    has_this: bool,
+    is_main: bool,
+    /// `마무리는 항상` blocks around the code being compiled.
+    finally_depth: u32,
 }
 
-impl<'c> FnCompiler<'c> {
-    fn new(c: &'c mut Compiler, _f: Option<&ast::FuncDecl>) -> FnCompiler<'c> {
+impl<'c, 'a> FnCompiler<'c, 'a> {
+    fn new(c: &'c mut Compiler<'a>, has_this: bool) -> FnCompiler<'c, 'a> {
         FnCompiler {
             c,
             code: Vec::new(),
@@ -400,12 +678,16 @@ impl<'c> FnCompiler<'c> {
             handlers: Vec::new(),
             open_calls: 0,
             definite: Vec::new(),
+            has_this,
+            is_main: false,
+            finally_depth: 0,
         }
     }
 
-    fn finish(self, name: &str, params: Vec<Param>, return_type: u32) -> Proto {
+    fn finish(self, name: &str, params: Vec<Param>, return_type: u32, raw_params: bool) -> Proto {
         Proto {
             name: name.to_string(),
+            raw_params,
             code: self.code,
             nregs: self.max_reg,
             params,
@@ -416,26 +698,86 @@ impl<'c> FnCompiler<'c> {
     }
 
     fn compile_main(mut self, stmts: &[Stmt]) -> Proto {
-        self.stmts(stmts);
+        self.is_main = true;
+        // Hana validates interfaces before running anything.
+        if let Some((class, iface, method)) = self.c.interface_violation(stmts) {
+            let k = self.c.str_const("InterfaceImplementationError.InterfaceNotImplemented");
+            let args = [class, iface, method].map(|a| self.c.str_const(&a));
+            self.emit(Op::Fail { k, args });
+        }
+        for s in stmts {
+            match s {
+                // A class's statement sets its static variables, in order.
+                Stmt::Class { name: Some(n), body, .. } => self.class_statics(&n.name, body),
+                _ => self.stmt(s),
+            }
+        }
         self.emit(Op::ReturnNull);
-        self.finish("<main>", Vec::new(), 0)
+        self.finish("<main>", Vec::new(), 0, false)
     }
 
-    fn compile_function(mut self, f: &ast::FuncDecl) -> Proto {
+    /// `'우리'의 '수'를 0으로 정하자` in a class body, run when the program
+    /// reaches the class (in the top level's scope).
+    fn class_statics(&mut self, class: &str, body: &[Stmt]) {
+        let class = self.c.name(class);
+        for s in body {
+            let mark = self.next_reg;
+            match s {
+                Stmt::VarDecl(v) if v.is_static => {
+                    let r = self.alloc();
+                    match &v.value {
+                        Some(e) => self.expr_to(e, r),
+                        None => {
+                            self.emit(Op::LoadNull { dst: r });
+                        }
+                    }
+                    let name = self.c.name(v.name.as_deref().unwrap_or(""));
+                    self.emit(Op::SetStatic { class, name, src: r });
+                }
+                Stmt::Assign { target: Expr::Member { object, property }, value } => {
+                    let plural = matches!(&**object, Expr::Identifier(o) if self.c.prog.lang.plural_self_words.contains(&o.as_str()));
+                    if let (true, Expr::Identifier(p)) = (plural, &**property) {
+                        let r = self.alloc();
+                        match value {
+                            Some(e) => self.expr_to(e, r),
+                            None => {
+                                self.emit(Op::LoadNull { dst: r });
+                            }
+                        }
+                        let name = self.c.name(p);
+                        self.emit(Op::SetStatic { class, name, src: r });
+                    }
+                }
+                _ => {}
+            }
+            self.next_reg = mark;
+        }
+    }
+
+    /// A function, method, constructor, getter or setter body. `raw` binds
+    /// only the first argument, without checks (setters, `<기호 같다>`).
+    fn compile_callable(
+        mut self,
+        name: &str,
+        params_ast: &[ast::Param],
+        body: &[Stmt],
+        return_type: Option<&ast::TypeRef>,
+        raw: bool,
+    ) -> Proto {
         // Parameters take the first registers: arguments arrive there.
         let mut scope = Scope { names: HashMap::new() };
         let mut params = Vec::new();
-        let first_regs: Vec<Reg> = f.params.iter().map(|_| self.alloc()).collect();
-        for (i, p) in f.params.iter().enumerate() {
-            let ty = p.type_annotation.as_ref().map_or(0, |t| self.c.type_id(&t.name));
+        let first_regs: Vec<Reg> = params_ast.iter().map(|_| self.alloc()).collect();
+        for (i, p) in params_ast.iter().enumerate() {
+            let ty = if raw { 0 } else { p.type_annotation.as_ref().map_or(0, |t| self.c.type_id(&t.name)) };
             let meta = (ty != 0).then(|| self.alloc());
             let slot = Slot { loc: Loc::Reg(first_regs[i]), meta: meta.map(Loc::Reg) };
             scope.names.insert(p.name.clone(), slot);
             params.push(Param { name: self.c.name(&p.name), slot: first_regs[i], meta, ty });
         }
         // A repeated parameter name is one variable: the later parameter's.
-        for (name, flags) in declared_names(&f.body.statements) {
-            match scope.names.get_mut(&name) {
+        for (n, flags) in declared_names(body) {
+            match scope.names.get_mut(&n) {
                 Some(slot) => {
                     if flags && slot.meta.is_none() {
                         slot.meta = Some(Loc::Reg(self.alloc()));
@@ -444,54 +786,54 @@ impl<'c> FnCompiler<'c> {
                 None => {
                     let loc = Loc::Reg(self.alloc());
                     let meta = flags.then(|| Loc::Reg(self.alloc()));
-                    scope.names.insert(name, Slot { loc, meta });
+                    scope.names.insert(n, Slot { loc, meta });
                 }
             }
         }
         // Parameter metas must point at the scope's final slots.
-        for p in params.iter_mut() {
-            let name = self.c.prog.names[p.name as usize].clone();
-            let slot = scope.names[&name];
+        for (p, ast_p) in params.iter_mut().zip(params_ast) {
+            let slot = scope.names[&ast_p.name];
             p.meta = slot.meta.map(|m| match m {
                 Loc::Reg(r) => r,
-                Loc::Global(_) => unreachable!(),
+                _ => unreachable!(),
             });
         }
         self.scopes.push(scope);
 
-        // Missing arguments: defaults (evaluated in the call's scope) or an error.
-        for (i, p) in f.params.iter().enumerate() {
-            let at = self.emit(Op::ArgGiven { index: i as u16, skip: 0 });
-            match &p.default {
-                Some(d) => {
-                    let mark = self.next_reg;
-                    let r = self.alloc();
-                    self.expr_to(d, r);
-                    self.emit(Op::BindParam { index: i as u16, src: r });
-                    self.next_reg = mark;
+        if !raw {
+            // Missing arguments: defaults (evaluated in the call's scope) or an error.
+            for (i, p) in params_ast.iter().enumerate() {
+                let at = self.emit(Op::ArgGiven { index: i as u16, skip: 0 });
+                match &p.default {
+                    Some(d) => {
+                        let mark = self.next_reg;
+                        let r = self.alloc();
+                        self.expr_to(d, r);
+                        self.emit(Op::BindParam { index: i as u16, src: r });
+                        self.next_reg = mark;
+                    }
+                    None => {
+                        self.emit(Op::MissingArg { index: i as u16 });
+                    }
                 }
-                None => {
-                    self.emit(Op::MissingArg { index: i as u16 });
+                let here = self.here();
+                self.patch_jump(at, here);
+            }
+            // A parameter's slot is defined from here on, unless another
+            // name's declaration shares it (a repeated parameter name).
+            for (p, ast_p) in params.iter().zip(params_ast) {
+                if let Some(Slot { loc: Loc::Reg(r), .. }) = self.scopes[0].names.get(&ast_p.name).copied() {
+                    if r == p.slot {
+                        self.definite.push(r);
+                    }
                 }
             }
-            let here = self.here();
-            self.patch_jump(at, here);
         }
 
-        // A parameter's slot is defined from here on, unless another name's
-        // declaration shares it (a repeated parameter name).
-        for p in &params {
-            let name = &self.c.prog.names[p.name as usize];
-            if let Some(Slot { loc: Loc::Reg(r), .. }) = self.scopes[0].names.get(name.as_str()).copied() {
-                if r == p.slot {
-                    self.definite.push(r);
-                }
-            }
-        }
-        self.stmts(&f.body.statements);
+        self.stmts(body);
         self.emit(Op::ReturnNull);
-        let return_type = f.return_type.as_ref().map_or(0, |t| self.c.type_id(&t.name));
-        self.finish(&f.name, params, return_type)
+        let return_type = return_type.map_or(0, |t| self.c.type_id(&t.name));
+        self.finish(name, params, return_type, raw)
     }
 
     // ---- registers and code
@@ -532,6 +874,9 @@ impl<'c> FnCompiler<'c> {
     /// The slots `name` may be in from here, innermost first.
     fn var(&mut self, name: &str) -> u32 {
         let mut slots: Vec<Slot> = self.scopes.iter().rev().filter_map(|s| s.names.get(name).copied()).collect();
+        if self.has_this {
+            slots.push(Slot { loc: Loc::This(self.c.name(name)), meta: None });
+        }
         if let Some(g) = self.c.globals.get(name) {
             slots.push(*g);
         }
@@ -544,10 +889,8 @@ impl<'c> FnCompiler<'c> {
         let var = self.var(name);
         let v = &self.c.prog.vars[var as usize];
         let op = match v.slots.as_slice() {
-            [s] => match s.loc {
-                Loc::Reg(slot) => Op::GetReg { dst, slot, name: v.name },
-                Loc::Global(slot) => Op::GetGlobal { dst, slot, name: v.name },
-            },
+            [Slot { loc: Loc::Reg(slot), .. }] => Op::GetReg { dst, slot: *slot, name: v.name },
+            [Slot { loc: Loc::Global(slot), .. }] => Op::GetGlobal { dst, slot: *slot, name: v.name },
             _ => Op::GetVar { dst, var },
         };
         self.emit(op);
@@ -589,7 +932,7 @@ impl<'c> FnCompiler<'c> {
     fn slot_reg(&self, name: &str) -> Reg {
         match self.scopes.last().unwrap().names[name].loc {
             Loc::Reg(r) => r,
-            Loc::Global(_) => unreachable!(),
+            _ => unreachable!(),
         }
     }
 
@@ -604,6 +947,18 @@ impl<'c> FnCompiler<'c> {
     fn stmt(&mut self, s: &Stmt) {
         let mark = self.next_reg;
         match s {
+            // `'우리'의 '수'를 ...로 정하자`: a static of the running method's class.
+            Stmt::VarDecl(v) if v.is_static => {
+                let r = self.alloc();
+                match &v.value {
+                    Some(e) => self.expr_to(e, r),
+                    None => {
+                        self.emit(Op::LoadNull { dst: r });
+                    }
+                }
+                let name = self.c.name(v.name.as_deref().unwrap_or(""));
+                self.emit(Op::SetStatic { class: NONE, name, src: r });
+            }
             Stmt::VarDecl(v) => {
                 let name = v.name.as_deref().unwrap_or("");
                 let r = self.alloc();
@@ -665,17 +1020,31 @@ impl<'c> FnCompiler<'c> {
                         self.emit(Op::LoadNull { dst: r });
                     }
                 }
-                self.emit(Op::Return { src: r });
+                // At the top level, or where `마무리는 항상` must run first, the
+                // return travels as a signal.
+                if self.is_main || self.finally_depth > 0 {
+                    self.emit(Op::ReturnSignal { src: r });
+                } else {
+                    self.emit(Op::Return { src: r });
+                }
             }
-            Stmt::Break => match self.loops.last_mut() {
-                Some(_) => {
+            Stmt::Break => match self.loops.last() {
+                Some(l) if l.finally_depth == self.finally_depth => {
                     let at = self.emit(Op::Jump { to: 0 });
                     self.loops.last_mut().unwrap().breaks.push(at);
                 }
-                None => {
+                _ => {
                     self.emit(Op::Break);
                 }
             },
+            Stmt::Throw(e) => {
+                let r = self.alloc();
+                self.expr_to(e, r);
+                self.emit(Op::Throw { src: r });
+            }
+            Stmt::Try { block, handlers, finalizer } => self.try_stmt(block, handlers, finalizer.as_ref()),
+            // Declarations Hana does not run where they stand.
+            Stmt::Class { .. } | Stmt::Interface { .. } | Stmt::Constructor { .. } | Stmt::InterfaceMethod(_) => {}
             Stmt::ForRange { start, end, loop_var, body } => self.for_range(start, end, loop_var, body),
             Stmt::ForEach { list, body } => self.for_each(list, body),
             Stmt::While { condition, body } => self.while_loop(condition, body),
@@ -686,7 +1055,18 @@ impl<'c> FnCompiler<'c> {
                 self.emit(Op::ListCheck { list, target: target_var });
                 let val = self.alloc();
                 self.expr_to(value, val);
-                self.emit(Op::ListPush { list, val, front: *position == "front", target: target_var });
+                let front = *position == "front";
+                self.emit(Op::ListPush { list, val, front, target: target_var });
+                // A list in an object's field: Hana evaluates the object again
+                // and checks the field's declared type.
+                if let Expr::Member { object, property } = target {
+                    if let Expr::Identifier(p) = &**property {
+                        let obj = self.alloc();
+                        self.expr_to(object, obj);
+                        let name = self.c.name(p);
+                        self.emit(Op::CheckFieldPush { list, obj, name, front });
+                    }
+                }
             }
             Stmt::ListPop { target, position } => {
                 let list = self.alloc();
@@ -719,11 +1099,14 @@ impl<'c> FnCompiler<'c> {
         if let [Slot { loc, meta: None }] = v.slots.as_slice() {
             if ty == 0 && !konst {
                 let op = match *loc {
-                    Loc::Reg(slot) => Op::SetReg { slot, src },
-                    Loc::Global(slot) => Op::SetGlobal { slot, src },
+                    Loc::Reg(slot) => Some(Op::SetReg { slot, src }),
+                    Loc::Global(slot) => Some(Op::SetGlobal { slot, src }),
+                    Loc::This(_) => None,
                 };
-                self.emit(op);
-                return;
+                if let Some(op) = op {
+                    self.emit(op);
+                    return;
+                }
             }
         }
         self.emit(Op::Decl { var, src, ty, konst });
@@ -759,20 +1142,21 @@ impl<'c> FnCompiler<'c> {
             Expr::Member { object, property } => {
                 let obj = self.alloc();
                 self.expr_to(object, obj);
-                let set = self.emit(Op::SetMember { obj, skip: 0 });
-                let key = self.alloc();
                 let name = match &**property {
                     Expr::Identifier(n) => self.c.name(n),
                     _ => NONE,
                 };
+                let set = self.emit(Op::SetMember { obj, val, name, skip: 0 });
+                let key = self.alloc();
                 let start = self.here();
                 self.expr_to(property, key);
                 let end = self.here();
                 self.emit(Op::SetIndex { obj, key, val });
                 let done = self.emit(Op::Jump { to: 0 });
                 let target = self.here();
-                let fail = self.emit(Op::SetIndexFail { obj, val, name, skip: 0 });
-                self.handlers.push(Handler { start, end, target, open_calls: self.open_calls });
+                let key = self.handlers.len() as u32;
+                let fail = self.emit(Op::SetIndexFail { obj, val, name, key, skip: 0 });
+                self.handlers.push(Handler { start, end, target, open_calls: self.open_calls, kind: HandlerKind::Protect });
                 let here = self.here();
                 self.patch_jump(set, here);
                 self.patch_jump(done, here);
@@ -842,8 +1226,69 @@ impl<'c> FnCompiler<'c> {
         }
     }
 
+    /// `일단 해보자`: the block, handlers chosen by the thrown value's class,
+    /// and a `마무리는 항상` that runs on every way out.
+    fn try_stmt(&mut self, block: &Block, handlers: &[ast::CatchClause], finalizer: Option<&Block>) {
+        if finalizer.is_some() {
+            self.finally_depth += 1;
+        }
+        let start = self.here();
+        self.stmts(&block.statements);
+        let block_end = self.here();
+        let mut to_finally = vec![self.emit(Op::Jump { to: 0 })];
+        if !handlers.is_empty() {
+            let key = self.handlers.len() as u32;
+            let dispatch = self.here();
+            self.handlers.push(Handler { start, end: block_end, target: dispatch, open_calls: self.open_calls, kind: HandlerKind::Catch });
+            let mut entries = Vec::new();
+            for h in handlers {
+                entries.push(match &h.type_ref {
+                    None => self.emit(Op::Jump { to: 0 }),
+                    Some(t) => {
+                        let class = self.c.name(&t.name);
+                        self.emit(Op::CatchIs { key, class, to: 0 })
+                    }
+                });
+            }
+            // No handler fits: raise it again (inside the finally's range).
+            self.emit(Op::Rethrow { key });
+            for (h, entry) in handlers.iter().zip(entries) {
+                let here = self.here();
+                match &mut self.code[entry] {
+                    Op::CatchIs { to, .. } | Op::Jump { to } => *to = here,
+                    _ => unreachable!(),
+                }
+                let (from, _) = self.open_scope(&[h.param.as_str()], &h.body.statements);
+                let slot = self.slot_reg(&h.param);
+                self.emit(Op::CatchBind { key, slot });
+                self.stmts(&h.body.statements);
+                self.close_scope(from);
+                to_finally.push(self.emit(Op::Jump { to: 0 }));
+            }
+        }
+        let handlers_end = self.here();
+        if finalizer.is_some() {
+            self.finally_depth -= 1;
+        }
+        let normal = self.here();
+        for j in to_finally {
+            self.patch_jump(j, normal);
+        }
+        if let Some(f) = finalizer {
+            self.stmts(&f.statements);
+            let done = self.emit(Op::Jump { to: 0 });
+            let key = self.handlers.len() as u32;
+            let target = self.here();
+            self.handlers.push(Handler { start, end: handlers_end, target, open_calls: self.open_calls, kind: HandlerKind::Finally });
+            self.stmts(&f.statements);
+            self.emit(Op::Rethrow { key });
+            let end = self.here();
+            self.patch_jump(done, end);
+        }
+    }
+
     fn loop_body(&mut self, body: &Block, top: u32) -> Vec<usize> {
-        self.loops.push(LoopCtx { breaks: Vec::new() });
+        self.loops.push(LoopCtx { breaks: Vec::new(), finally_depth: self.finally_depth });
         self.stmts(&body.statements);
         self.emit(Op::Jump { to: top });
         self.loops.pop().unwrap().breaks
@@ -949,12 +1394,28 @@ impl<'c> FnCompiler<'c> {
             Expr::Null => {
                 self.emit(Op::LoadNull { dst });
             }
-            Expr::Identifier(n) => self.get_var(n, dst),
-            // A type used as a value: its name (classes come later).
-            Expr::TypeRef(t) => {
-                let k = self.c.str_const(&t.name);
-                self.emit(Op::LoadK { dst, k });
+            Expr::Identifier(n) if self.c.prog.lang.self_words.contains(&n.as_str()) => {
+                let var = self.var(n);
+                self.emit(Op::SelfOr { dst, var });
             }
+            Expr::Identifier(n) if self.c.prog.lang.plural_self_words.contains(&n.as_str()) => {
+                let var = self.var(n);
+                self.emit(Op::StaticOr { dst, var });
+            }
+            Expr::Identifier(n) => self.get_var(n, dst),
+            Expr::SelfRef => {
+                self.emit(Op::GetThis { dst });
+            }
+            Expr::StaticRef => {
+                self.emit(Op::GetStatic { dst });
+            }
+            // A type used as a value: a variable of that name, the class, or the name.
+            Expr::TypeRef(t) => {
+                let var = self.var(&t.name);
+                let name = self.c.name(&t.name);
+                self.emit(Op::TypeValue { dst, var, name });
+            }
+            Expr::New { class, args } => self.new_object(class.as_ref(), args, dst),
             Expr::FunctionRef(n) => {
                 let var = self.var(n);
                 let name = self.c.name(n);
@@ -1008,6 +1469,11 @@ impl<'c> FnCompiler<'c> {
 
     fn binary(&mut self, left: &Expr, op: &str, right: &Expr, dst: Reg) {
         let a = self.operand(left);
+        if op == "instanceof" {
+            let b = self.operand(right);
+            self.emit(Op::InstanceOf { dst, a, b });
+            return;
+        }
         let bin = |op| Some(op);
         let arith = match op {
             "+" => bin(BinOp::Add),
@@ -1072,10 +1538,18 @@ impl<'c> FnCompiler<'c> {
     }
 
     fn member(&mut self, object: &Expr, property: &Expr, dst: Reg) {
+        if matches!(object, Expr::SuperRef) {
+            // `부모의` names only methods; a method as a value comes later.
+            self.emit(Op::SuperPrep { method: matches!(property, Expr::FunctionRef(_)) });
+            self.unsupported("method value");
+            return;
+        }
         let obj = self.alloc();
         self.expr_to(object, obj);
         let name = match property {
             Expr::Identifier(n) => self.c.name(n),
+            // A class's static read by a number names it as Go's `%g` would.
+            Expr::Number(n) => self.c.name(&crate::format::go_v_float(*n)),
             Expr::FunctionRef(_) => {
                 // A bound method as a value (not called): later.
                 self.unsupported("method value");
@@ -1091,8 +1565,9 @@ impl<'c> FnCompiler<'c> {
         self.emit(Op::Index { dst, obj, key });
         let done = self.emit(Op::Jump { to: 0 });
         let target = self.here();
-        self.emit(Op::IndexFail { obj });
-        self.handlers.push(Handler { start, end, target, open_calls: self.open_calls });
+        let key = self.handlers.len() as u32;
+        self.emit(Op::IndexFail { obj, key });
+        self.handlers.push(Handler { start, end, target, open_calls: self.open_calls, kind: HandlerKind::Protect });
         let here = self.here();
         self.patch_jump(pre, here);
         self.patch_jump(done, here);
@@ -1114,15 +1589,29 @@ impl<'c> FnCompiler<'c> {
         match callee {
             Expr::FunctionRef(name) => self.call_named(name, args, dst),
             // `TYPE의 〈함수〉()` where TYPE is not a class: a plain call.
-            Expr::Member { object, property } if matches!(&**object, Expr::TypeRef(_)) && matches!(&**property, Expr::FunctionRef(_)) => {
+            Expr::Member { object, property }
+                if matches!(&**object, Expr::TypeRef(t) if !self.c.class_defs.contains_key(&t.name))
+                    && matches!(&**property, Expr::FunctionRef(_)) =>
+            {
                 let Expr::FunctionRef(name) = &**property else { unreachable!() };
                 self.call_named(name, args, dst);
+            }
+            // `부모의 <메서드>()`: the method as the parent class has it.
+            Expr::Member { object, property } if matches!(&**object, Expr::SuperRef) => {
+                let method = matches!(&**property, Expr::FunctionRef(_));
+                self.emit(Op::SuperPrep { method });
+                if let Expr::FunctionRef(name) = &**property {
+                    let name = self.c.name(name);
+                    let base = self.args(args);
+                    self.emit(Op::CallSuper { dst, name, base, argc });
+                }
             }
             Expr::Member { object, property } if matches!(&**property, Expr::FunctionRef(_)) => {
                 let Expr::FunctionRef(name) = &**property else { unreachable!() };
                 let obj = self.alloc();
                 self.expr_to(object, obj);
                 let name = self.c.name(name);
+                self.emit(Op::MethodPrep { obj, name });
                 let target = self.target_var(object);
                 let base = self.args(args);
                 self.emit(Op::CallMethod { dst, obj, name, target, base, argc });
@@ -1132,6 +1621,60 @@ impl<'c> FnCompiler<'c> {
                 self.expr_to(other, callee);
                 let base = self.args(args);
                 self.emit(Op::CallValue { dst, callee, base, argc });
+            }
+        }
+        self.open_calls -= 1;
+    }
+
+    /// `새로운 [클래스](...)`: the object, its class's own field initializers
+    /// (evaluated here, in the caller's scope, as Hana does), then the
+    /// constructor with the arguments; without a constructor the arguments
+    /// are not evaluated.
+    fn new_object(&mut self, class: Option<&ast::TypeRef>, args: &[Expr], dst: Reg) {
+        self.emit(Op::Enter);
+        self.open_calls += 1;
+        let name = class.map_or("", |t| t.name.as_str()).to_string();
+        let sym = self.c.name(&name);
+        self.emit(Op::NewObj { dst, class: sym });
+        if let Some(Stmt::Class { body, .. }) = self.c.class_defs.get(&name).copied() {
+            for s in body {
+                let mark = self.next_reg;
+                match s {
+                    Stmt::VarDecl(v) if !v.is_static => {
+                        let r = self.alloc();
+                        match &v.value {
+                            Some(e) => self.expr_to(e, r),
+                            None => {
+                                self.emit(Op::LoadNull { dst: r });
+                            }
+                        }
+                        let fname = self.c.name(v.name.as_deref().unwrap_or(""));
+                        let ty = v.type_ref.as_ref().map_or(0, |t| self.c.type_id(&t.name));
+                        self.emit(Op::InitField { obj: dst, name: fname, src: r, ty });
+                    }
+                    Stmt::Assign { target: Expr::Identifier(n), value } => {
+                        let r = self.alloc();
+                        match value {
+                            Some(e) => self.expr_to(e, r),
+                            None => {
+                                self.emit(Op::LoadNull { dst: r });
+                            }
+                        }
+                        let fname = self.c.name(n);
+                        self.emit(Op::InitField { obj: dst, name: fname, src: r, ty: 0 });
+                    }
+                    _ => {}
+                }
+                self.next_reg = mark;
+            }
+        }
+        match self.c.prog.classes.get(&sym).and_then(|c| c.ctor) {
+            Some(proto) => {
+                let base = self.args(args);
+                self.emit(Op::CallCtor { obj: dst, proto, class: sym, base, argc: args.len() as u16 });
+            }
+            None => {
+                self.emit(Op::Leave);
             }
         }
         self.open_calls -= 1;

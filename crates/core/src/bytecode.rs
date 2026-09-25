@@ -3,6 +3,8 @@
 //! Every variable is resolved at compile time to the slots it can live in
 //! (see [`Var`]); nothing is looked up by name while running.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::lang::Lang;
 use crate::value::Value;
 
@@ -14,6 +16,9 @@ pub type Reg = u16;
 pub enum Loc {
     Reg(Reg),
     Global(u32),
+    /// A property of the running method's object (Hana's `Environment.this`):
+    /// inside a method, the object's properties read like variables.
+    This(u32),
 }
 
 /// A variable slot and, when some declaration of it carries a type or is a
@@ -165,17 +170,20 @@ pub enum Op {
     Member { dst: Reg, obj: Reg, name: u32, skip: u32 },
     Index { dst: Reg, obj: Reg, key: Reg },
     /// Where a failed key computation lands (a list or string reports its own error).
-    IndexFail { obj: Reg },
+    IndexFail { obj: Reg, key: u32 },
     /// A member write, first half: strings refuse, other values ignore it.
-    SetMember { obj: Reg, skip: u32 },
+    SetMember { obj: Reg, val: Reg, name: u32, skip: u32 },
     SetIndex { obj: Reg, key: Reg, val: Reg },
     /// Where a failed key computation of a write lands: a dictionary takes
     /// the property's name (`name`) as the key, anything else ignores it.
-    SetIndexFail { obj: Reg, val: Reg, name: u32, skip: u32 },
+    SetIndexFail { obj: Reg, val: Reg, name: u32, key: u32, skip: u32 },
     /// Before a push/pop: the target must be a list and not a constant.
     ListCheck { list: Reg, target: u32 },
     ListPush { list: Reg, val: Reg, front: bool, target: u32 },
     ListPop { dst: Reg, list: Reg, front: bool },
+    /// After a push onto `obj`'s field `name`: the new element must fit the
+    /// field's declared type, else it is taken back off.
+    CheckFieldPush { list: Reg, obj: Reg, name: u32, front: bool },
 
     /// A value as text (template parts).
     Format { dst: Reg, src: Reg },
@@ -184,6 +192,48 @@ pub enum Op {
     FuncRef { dst: Reg, name: u32, var: u32 },
     /// Something this version cannot run yet (named by constant `k`).
     Unsupported { k: u32 },
+    /// Raises the error code in constant `k` with string constants as arguments.
+    Fail { k: u32, args: [u32; 3] },
+
+    // ---- classes (names are symbols)
+    /// `새로운 [클래스]`: a new object, after checking the class can be made.
+    NewObj { dst: Reg, class: u32 },
+    /// A field initializer of the class being made.
+    InitField { obj: Reg, name: u32, src: Reg, ty: u32 },
+    /// Runs a constructor on `obj` (its result is dropped).
+    CallCtor { obj: Reg, proto: u32, class: u32, base: Reg, argc: u16 },
+    /// Ends a `새로운` without a constructor (the call nesting count).
+    Leave,
+    /// `나`: the running method's object.
+    GetThis { dst: Reg },
+    /// `'나'`: the object when in a method, else a variable of that name.
+    SelfOr { dst: Reg, var: u32 },
+    /// `우리`: the running method's class.
+    GetStatic { dst: Reg },
+    /// `'우리'`: that class when in a method, else a variable of that name.
+    StaticOr { dst: Reg, var: u32 },
+    /// `[이름]` as a value: a variable of that name, a class, or the name.
+    TypeValue { dst: Reg, var: u32, name: u32 },
+    InstanceOf { dst: Reg, a: Reg, b: Reg },
+    /// Before a method call's arguments: the checks Hana makes when it
+    /// evaluates the callee (access, a static method's existence, the type).
+    MethodPrep { obj: Reg, name: u32 },
+    /// `부모의 ...` needs a method's object and a method name.
+    SuperPrep { method: bool },
+    CallSuper { dst: Reg, name: u32, base: Reg, argc: u16 },
+    /// A static variable of `class` (NONE: the running method's class).
+    SetStatic { class: u32, name: u32, src: Reg },
+
+    // ---- errors
+    Throw { src: Reg },
+    /// Jumps when the error held for handler `key` is an object of `class`.
+    CatchIs { key: u32, class: u32, to: u32 },
+    /// Puts the error held for `key` into a variable, as an error object.
+    CatchBind { key: u32, slot: Reg },
+    /// Raises again what handler `key` holds.
+    Rethrow { key: u32 },
+    /// A `돌려주자` that must pass `마무리는 항상` blocks (or is at the top level).
+    ReturnSignal { src: Reg },
 }
 
 /// A loop's code range; a break arriving there leaves to `exit`.
@@ -194,7 +244,9 @@ pub struct LoopRange {
     pub exit: u32,
 }
 
-/// Code whose errors are caught: `start..end` jumps to `target`.
+/// Code whose errors (and, by kind, breaks and returns) are caught:
+/// `start..end` jumps to `target`, which finds what was caught under the
+/// handler's index.
 #[derive(Clone, Copy, Debug)]
 pub struct Handler {
     pub start: u32,
@@ -202,6 +254,17 @@ pub struct Handler {
     pub target: u32,
     /// Call expressions open around the range (to restore the nesting count).
     pub open_calls: u32,
+    pub kind: HandlerKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandlerKind {
+    /// A member key being computed: errors and breaks (Hana swallows both).
+    Protect,
+    /// `오류가 발생했다면`: errors only.
+    Catch,
+    /// `마무리는 항상`: errors, breaks and returns.
+    Finally,
 }
 
 #[derive(Clone, Debug)]
@@ -215,6 +278,8 @@ pub struct Param {
 
 pub struct Proto {
     pub name: String,
+    /// Binds only the first argument, without checks (`<기호 같다>` as `==`).
+    pub raw_params: bool,
     pub code: Vec<Op>,
     pub nregs: Reg,
     pub params: Vec<Param>,
@@ -245,7 +310,8 @@ pub enum TypeKind {
     List(Option<Box<TypeKind>>),
     /// Key and value types; `(숫자)사전` constrains only values.
     Dict(Option<(Box<TypeKind>, Box<TypeKind>)>),
-    Class(String),
+    /// A class or interface, by symbol.
+    Class(u32),
 }
 
 impl TypeSpec {
@@ -279,9 +345,66 @@ impl TypeKind {
             n if n == l.type_null => TypeKind::Null,
             n if n == l.type_list => TypeKind::List(None),
             n if n == l.type_dict => TypeKind::Dict(None),
-            n => TypeKind::Class(n.to_string()),
+            n => TypeKind::Class(crate::symbol::intern(n)),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    Public,
+    Private,
+    Protected,
+}
+
+impl Access {
+    pub fn parse(s: &str) -> Access {
+        match s {
+            "private" => Access::Private,
+            "protected" => Access::Protected,
+            _ => Access::Public,
+        }
+    }
+}
+
+/// A name looked up on a class (Hana's `classMember`): the field and the
+/// method of that name, each from the first class of the chain declaring it.
+#[derive(Clone, Copy, Debug)]
+pub struct Member {
+    pub field_access: Access,
+    pub getter: Option<u32>,
+    /// The setter's body, taking the new value as its only argument.
+    pub setter: Option<u32>,
+    pub method: Option<u32>,
+    pub method_access: Access,
+}
+
+impl Default for Member {
+    fn default() -> Member {
+        Member { field_access: Access::Public, getter: None, setter: None, method: None, method_access: Access::Public }
+    }
+}
+
+pub struct ClassInfo {
+    pub name: u32,
+    pub is_abstract: bool,
+    pub members: HashMap<u32, Member>,
+    /// Declared type of a field (first non-static declaration of the chain).
+    pub field_types: HashMap<u32, u32>,
+    /// The constructor (first of the chain).
+    pub ctor: Option<u32>,
+    /// Static methods of the class itself.
+    pub statics: HashMap<u32, u32>,
+    /// `<기호 같다>` of the class itself, compiled for `==`.
+    pub equals: Option<u32>,
+    /// The class and its ancestors (instanceof, catch types).
+    pub lineage: Vec<u32>,
+    /// Types a value of this class passes as (ancestors and every interface
+    /// they declare).
+    pub supertypes: HashSet<u32>,
+    /// Where `부모의` starts: None without a parent (the class itself), Some(None)
+    /// when the parent is not a class.
+    pub super_start: Option<Option<u32>>,
 }
 
 pub struct Program {
@@ -289,7 +412,6 @@ pub struct Program {
     /// `protos[0]` is the program's top level.
     pub protos: Vec<Proto>,
     pub consts: Vec<Value>,
-    pub names: Vec<String>,
     pub vars: Vec<Var>,
     /// `types[0]` is unused (0 means "no type").
     pub types: Vec<TypeSpec>,
@@ -299,4 +421,6 @@ pub struct Program {
     pub global_names: Vec<(String, u32)>,
     /// Top-level functions by name.
     pub functions: Vec<(String, u32)>,
+    pub classes: HashMap<u32, ClassInfo>,
+    pub interfaces: HashSet<u32>,
 }

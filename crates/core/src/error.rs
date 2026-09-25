@@ -26,6 +26,15 @@ impl RuntimeError {
         RuntimeError { module: None, code: code.to_string(), args: Vec::new() }
     }
 
+    /// `발생시키자`: a value the program threw.
+    pub fn thrown(v: Value) -> RuntimeError {
+        RuntimeError { module: None, code: THROWN.to_string(), args: vec![v] }
+    }
+
+    pub fn thrown_value(&self) -> Option<&Value> {
+        (self.module.is_none() && self.code == THROWN).then(|| &self.args[0])
+    }
+
     pub fn arg(mut self, v: Value) -> RuntimeError {
         self.args.push(v);
         self
@@ -53,6 +62,18 @@ impl RuntimeError {
     }
 
     pub fn localize(&self, rt: Option<&Runtime>, lang: &Lang) -> String {
+        // Hana's ThrownError.Error(): an object's 메시지 (or メッセージ), else Go's %v.
+        if let Some(v) = self.thrown_value() {
+            if let Some(o) = v.as_object() {
+                let props = o.props.borrow();
+                for key in ["메시지", "メッセージ"] {
+                    if let Some(s) = props.get(&crate::symbol::intern(key)).and_then(|m| m.as_str()) {
+                        return s.to_string();
+                    }
+                }
+            }
+            return go_v(v);
+        }
         if let Some(m) = self.module {
             let rt = rt.expect("a module error needs its runtime");
             let template = rt
@@ -106,6 +127,33 @@ fn lang_named(name: &str) -> &'static Lang {
     match name {
         "kanade" => &KANADE,
         _ => &HARI,
+    }
+}
+
+/// Marks a thrown value (not a Hana code: it never reaches a catalog).
+const THROWN: &str = "Thrown";
+
+/// Go's `%v` of a value as Hana holds it (for thrown values that are not
+/// error objects).
+pub fn go_v(v: &Value) -> String {
+    match v.tag() {
+        tag::NULL => "<nil>".to_string(),
+        tag::BOOL => v.as_bool().unwrap().to_string(),
+        tag::NUM => go_v_float(v.as_num().unwrap()),
+        tag::STR => v.as_str().unwrap().to_string(),
+        tag::LIST => {
+            let items: Vec<String> = v.as_list().unwrap().items.borrow().iter().map(go_v).collect();
+            format!("&{{[{}]}}", items.join(" "))
+        }
+        tag::DICT => {
+            let mut items: Vec<String> =
+                v.as_dict().unwrap().map.borrow().iter().map(|(k, e)| format!("{}:{}", go_v(&k.0), go_v(e))).collect();
+            items.sort();
+            format!("map[{}]", items.join(" "))
+        }
+        tag::OBJECT => format!("&{{{} map[] <nil>}}", crate::symbol::name(v.as_object().unwrap().class)),
+        crate::value::CLASS => format!("&{{{}}}", crate::symbol::name(v.as_class().unwrap())),
+        _ => "?".to_string(),
     }
 }
 

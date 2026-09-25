@@ -35,6 +35,12 @@ pub struct Lang {
     pub string_split: &'static str,
     pub string_contains: &'static str,
     pub var_quote: (&'static str, &'static str),
+    /// `<기호 같다>`: a class's `==`.
+    pub equals_method: &'static str,
+    /// The built-in error class, its message field and constructor argument.
+    pub error_class: &'static str,
+    pub error_message: &'static str,
+    pub error_ctor_arg: &'static str,
 }
 
 pub static HARI: Lang = Lang {
@@ -64,6 +70,10 @@ pub static HARI: Lang = Lang {
     string_split: "분리하기",
     string_contains: "포함확인",
     var_quote: ("'", "'"),
+    equals_method: "기호 같다",
+    error_class: "오류",
+    error_message: "메시지",
+    error_ctor_arg: "초기메시지",
 };
 
 pub static KANADE: Lang = Lang {
@@ -93,6 +103,10 @@ pub static KANADE: Lang = Lang {
     string_split: "分割",
     string_contains: "含むか確認",
     var_quote: ("『", "』"),
+    equals_method: "記号 同じだ",
+    error_class: "エラー",
+    error_message: "メッセージ",
+    error_ctor_arg: "初期メッセージ",
 };
 
 /// The language of a source file, by extension.

@@ -13,6 +13,7 @@ pub mod format;
 mod host;
 pub mod lang;
 mod modules;
+pub mod symbol;
 pub mod value;
 pub mod vm;
 

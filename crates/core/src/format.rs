@@ -58,6 +58,18 @@ pub fn write_value(out: &mut String, v: &Value, lang: &Lang, depth: usize) {
             out.push('}');
         }
         tag::FUNC => out.push_str("<함수>"),
+        tag::OBJECT => {
+            let name = crate::symbol::name(v.as_object().unwrap().class);
+            out.push_str(lang.object_format.0);
+            out.push_str(name);
+            out.push_str(lang.object_format.1);
+        }
+        // Go's `%v` of Hana's *ClassReference.
+        crate::value::CLASS => {
+            out.push_str("&{");
+            out.push_str(crate::symbol::name(v.as_class().unwrap()));
+            out.push('}');
+        }
         _ => out.push('?'),
     }
 }
