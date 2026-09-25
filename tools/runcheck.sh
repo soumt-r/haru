@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs every program of an astdump corpus with `hana run` and `haru run` and
+# Runs every program of a corpus (astdump's files, or modcorpus's folders
+# with a main.hr/main.knd each) with `hana run` and `haru run` and
 # compares what they print (stdout, stderr) and their exit status.
 #
 #   tools/runcheck.sh <hana binary> <haru binary> <corpus dir> [jobs]
@@ -29,7 +30,7 @@ check() {
 }
 export -f check
 
-ls "$dir"/*.hr "$dir"/*.knd 2>/dev/null |
+ls "$dir"/*.hr "$dir"/*.knd "$dir"/*/main.hr "$dir"/*/main.knd 2>/dev/null |
     xargs -P "$jobs" -I{} bash -c 'check "$@"' _ {} "$hana" "$haru" > "$dir/runcheck.txt"
 
 pass=$(grep -c '^PASS' "$dir/runcheck.txt")

@@ -55,6 +55,9 @@ pub mod kind {
     pub const LIST: u32 = 4;
     pub const DICT: u32 = 5;
     pub const FUNC: u32 = 6;
+    /// As the only parameter: any number of arguments of any kind, which the
+    /// function checks itself (the standard library, to report Hana's errors).
+    pub const REST: u32 = 99;
 
     /// Whether a value with `tag` is accepted by a parameter of `kind`.
     #[inline]

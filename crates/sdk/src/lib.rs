@@ -145,6 +145,10 @@ impl Value {
     pub fn as_list(&self) -> Option<List> {
         (self.0.tag == tag::LIST).then(|| List(self.clone()))
     }
+
+    pub fn tag(&self) -> u32 {
+        self.0.tag
+    }
 }
 
 impl Clone for Value {
@@ -480,6 +484,34 @@ unsafe extern "C" fn shim<H: Handler<A>, A>(
         Ok(Err(Fail::Type(index, want))) => (host.throw_type)(ctx, index, want),
         Ok(Err(Fail::Error(Error(ErrorKind::Pending)))) => STATUS_ERROR,
         Ok(Err(Fail::Error(Error(ErrorKind::Code { code, args })))) => {
+            (host.throw)(ctx, abi::Str::new(&code), args.as_ptr() as *const RawValue, args.len())
+        }
+        Err(_) => (host.throw)(ctx, abi::Str::new("Panic"), std::ptr::null(), 0),
+    }
+}
+
+/// The C entry of a [`Module::raw`] function (`userdata` is the fn pointer).
+pub(crate) unsafe extern "C" fn raw_shim(
+    userdata: *const c_void,
+    ctx: *mut HostCtx,
+    args: *const RawValue,
+    argc: usize,
+    out: *mut RawValue,
+) -> Status {
+    let f: fn(&[Value]) -> Result<Value> = std::mem::transmute(userdata);
+    // `Value` is a transparent wrapper over `RawValue`; the slice is borrowed.
+    let args: &[Value] = if argc == 0 { &[] } else { std::slice::from_raw_parts(args as *const Value, argc) };
+    let prev = CTX.with(|c| c.replace(ctx));
+    let result = catch_unwind(AssertUnwindSafe(|| f(args)));
+    CTX.with(|c| c.set(prev));
+    let host = host();
+    match result {
+        Ok(Ok(v)) => {
+            *out = v.into_raw();
+            STATUS_OK
+        }
+        Ok(Err(Error(ErrorKind::Pending))) => STATUS_ERROR,
+        Ok(Err(Error(ErrorKind::Code { code, args }))) => {
             (host.throw)(ctx, abi::Str::new(&code), args.as_ptr() as *const RawValue, args.len())
         }
         Err(_) => (host.throw)(ctx, abi::Str::new("Panic"), std::ptr::null(), 0),

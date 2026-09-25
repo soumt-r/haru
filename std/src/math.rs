@@ -1,41 +1,118 @@
-//! [수학] / 【数学】 (ids and names follow Hana's `std/std.go`).
+//! [수학] / 【数学】, as Hana implements it (`std/stdimpl/mathstats.go`).
 
 use haru_sdk::prelude::*;
+
+use crate::hana::{between, clean, exactly, finite, integer, number};
 
 haru_sdk::entry!(pub(crate) fn entry = "math", build);
 
 fn build(m: &mut Module) {
-    m.name("hari", "수학").name("kanade", "数学");
+    crate::describe(m, "math", &[
+        ("math.ceil", ceil),
+        ("math.floor", floor),
+        ("math.sqrt", |a| one(a, f64::sqrt)),
+        ("math.pow", pow),
+        ("math.abs", |a| one(a, f64::abs)),
+        ("math.round", round),
+        ("math.sin", |a| one(a, f64::sin)),
+        ("math.cos", |a| one(a, f64::cos)),
+        ("math.tan", |a| one(a, f64::tan)),
+        ("math.log", log),
+        ("math.pi", pi),
+        ("math.gcd", gcd),
+        ("math.factorial", factorial),
+    ]);
+}
 
-    m.func("ceil", f64::ceil).name("hari", "올림").name("kanade", "切り上げ");
-    m.func("floor", f64::floor).name("hari", "버림").name("kanade", "切り捨て");
-    m.func("abs", f64::abs).name("hari", "절댓값").name("kanade", "絶対値");
-    m.func("round", f64::round).name("hari", "반올림").name("kanade", "四捨五入");
-    m.func("pow", f64::powf).name("hari", "거듭제곱").name("kanade", "べき乗");
-    m.func("pi", || std::f64::consts::PI).name("hari", "파이").name("kanade", "円周率");
+/// Hana's `numberFunc`: `NotANumber` for anything else, and the result as it
+/// comes (-0 stays -0).
+fn number_func(args: &[Value], f: fn(f64) -> f64) -> Result<Value> {
+    exactly(args, 1)?;
+    match args[0].as_num() {
+        Some(n) => Ok(Value::num(f(n))),
+        None => Err(Error::new("TypeError.NotANumber")),
+    }
+}
 
-    m.func("sqrt", |x: f64| -> Result<f64> {
-        if x < 0.0 {
-            return Err(Error::new("NegativeRoot").arg(x));
+fn ceil(args: &[Value]) -> Result<Value> {
+    number_func(args, f64::ceil)
+}
+
+fn floor(args: &[Value]) -> Result<Value> {
+    number_func(args, f64::floor)
+}
+
+/// Hana's `one`: a function of one number that may leave its domain.
+fn one(args: &[Value], f: fn(f64) -> f64) -> Result<Value> {
+    exactly(args, 1)?;
+    finite(f(number(args, 0)?))
+}
+
+fn pow(args: &[Value]) -> Result<Value> {
+    exactly(args, 2)?;
+    let (base, exp) = (number(args, 0)?, number(args, 1)?);
+    finite(base.powf(exp))
+}
+
+/// Half away from zero, to a whole number or to 0..15 digits.
+fn round(args: &[Value]) -> Result<Value> {
+    between(args, 1, 2)?;
+    let x = number(args, 0)?;
+    let mut digits = 0;
+    if args.len() == 2 {
+        digits = integer(args, 1)?;
+        if !(0..=15).contains(&digits) {
+            return Err(Error::new("TypeError.NativeArgInteger").arg(2.0));
         }
-        Ok(x.sqrt())
-    })
-    .name("hari", "제곱근")
-    .name("kanade", "平方根");
+    }
+    let mut scale = 1.0;
+    for _ in 0..digits {
+        scale *= 10.0;
+    }
+    finite((x * scale).round() / scale)
+}
 
-    m.func("factorial", |n: f64| -> Result<f64> {
-        if n < 0.0 || n.fract() != 0.0 {
-            return Err(Error::new("FactorialDomain").arg(n));
-        }
-        Ok((1..=n as u64).fold(1.0, |acc, k| acc * k as f64))
-    })
-    .name("hari", "팩토리얼")
-    .name("kanade", "階乗");
+/// The natural logarithm, or the logarithm in a base.
+fn log(args: &[Value]) -> Result<Value> {
+    between(args, 1, 2)?;
+    let x = number(args, 0)?;
+    if x <= 0.0 {
+        return Err(Error::new("ValueError.MathDomain"));
+    }
+    if args.len() == 1 {
+        return finite(x.ln());
+    }
+    let base = number(args, 1)?;
+    if base <= 0.0 || base == 1.0 {
+        return Err(Error::new("ValueError.MathDomain"));
+    }
+    finite(x.ln() / base.ln())
+}
 
-    m.message("NegativeRoot", "hari", "음수 {0}의 제곱근은 구할 수 없어요.")
-        .message("NegativeRoot", "kanade", "負の数{0}の平方根は求められません。")
-        .message("NegativeRoot", "en", "no square root of negative {0}")
-        .message("FactorialDomain", "hari", "팩토리얼은 0 이상의 정수만 돼요: {0}")
-        .message("FactorialDomain", "kanade", "階乗は0以上の整数だけです: {0}")
-        .message("FactorialDomain", "en", "factorial needs a non-negative integer: {0}");
+fn pi(args: &[Value]) -> Result<Value> {
+    exactly(args, 0)?;
+    Ok(Value::num(std::f64::consts::PI))
+}
+
+fn gcd(args: &[Value]) -> Result<Value> {
+    exactly(args, 2)?;
+    let (mut a, mut b) = (integer(args, 0)?.abs(), integer(args, 1)?.abs());
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    Ok(Value::num(clean(a as f64)))
+}
+
+/// n! for whole n from 0 up to 170 (the last one a number holds).
+fn factorial(args: &[Value]) -> Result<Value> {
+    exactly(args, 1)?;
+    let n = integer(args, 0)?;
+    if !(0..=170).contains(&n) {
+        return Err(Error::new("ValueError.MathDomain"));
+    }
+    let mut result = 1.0;
+    for i in 2..=n {
+        result *= i as f64;
+    }
+    Ok(Value::num(result))
 }

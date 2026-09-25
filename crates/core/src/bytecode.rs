@@ -234,6 +234,21 @@ pub enum Op {
     Rethrow { key: u32 },
     /// A `돌려주자` that must pass `마무리는 항상` blocks (or is at the top level).
     ReturnSignal { src: Reg },
+
+    // ---- modules
+    /// Runs a `가져오자` (see [`ImportInfo`]): loads the module once, then
+    /// binds the names here.
+    Import { import: u32 },
+    /// `새로운` for a class the compiling module does not declare: its field
+    /// initializers, then its constructor, as found when it runs.
+    InitFieldsDyn { obj: Reg },
+    CallCtorDyn { obj: Reg, base: Reg, argc: u16 },
+    /// `<'변수'>`: the function name a variable holds, decided once per site
+    /// (Hana rewrites the call site the first time).
+    Reflect { dst: Reg, site: u32, var: u32, quoted: u32 },
+    /// A method call whose name is in a register (reflection).
+    CallMethodDyn { dst: Reg, obj: Reg, name: Reg, base: Reg, argc: u16 },
+    MethodPrepDyn { obj: Reg, name: Reg },
 }
 
 /// A loop's code range; a break arriving there leaves to `exit`.
@@ -278,6 +293,8 @@ pub struct Param {
 
 pub struct Proto {
     pub name: String,
+    /// The module whose code this is.
+    pub module: u32,
     /// Binds only the first argument, without checks (`<기호 같다>` as `==`).
     pub raw_params: bool,
     pub code: Vec<Op>,
@@ -397,6 +414,8 @@ pub struct ClassInfo {
     pub statics: HashMap<u32, u32>,
     /// `<기호 같다>` of the class itself, compiled for `==`.
     pub equals: Option<u32>,
+    /// Its own field initializers as a body (see `Op::InitFieldsDyn`).
+    pub init: u32,
     /// The class and its ancestors (instanceof, catch types).
     pub lineage: Vec<u32>,
     /// Types a value of this class passes as (ancestors and every interface
@@ -408,19 +427,64 @@ pub struct ClassInfo {
 }
 
 pub struct Program {
+    /// The language of the program's own file.
     pub lang: &'static Lang,
-    /// `protos[0]` is the program's top level.
     pub protos: Vec<Proto>,
     pub consts: Vec<Value>,
     pub vars: Vec<Var>,
     /// `types[0]` is unused (0 means "no type").
     pub types: Vec<TypeSpec>,
-    /// Initial values of the globals (built-ins are defined; the rest undefined).
+    /// Initial values of the globals of every module (built-ins are defined;
+    /// the rest undefined).
     pub globals: Vec<Value>,
-    /// Global variables by name, for names only known at run time.
-    pub global_names: Vec<(String, u32)>,
-    /// Top-level functions by name.
-    pub functions: Vec<(String, u32)>,
-    pub classes: HashMap<u32, ClassInfo>,
+    /// `modules[0]` is the program itself; the rest are the files it imports.
+    pub modules: Vec<ModuleInfo>,
+    /// Every class declaration of every module (a class's id is its index).
+    pub classes: Vec<ClassInfo>,
+    pub imports: Vec<ImportInfo>,
+}
+
+/// A source file: the program or a file it imports. Each runs in its own
+/// namespace (Hana's sub-interpreter): its own globals, functions and classes.
+pub struct ModuleInfo {
+    /// `file:<path as written>` (Hana's cache key), or `<main>`.
+    pub key: String,
+    pub lang: &'static Lang,
+    /// Its top-level code.
+    pub main: u32,
+    /// Its global variables by name, and the range of global slots it owns.
+    pub globals: HashMap<String, u32>,
+    pub global_range: (u32, u32),
+    /// Its top-level functions: the first of each name (for calls), and all
+    /// in order (for `전부`, where a later one of a name wins).
+    pub functions: HashMap<String, u32>,
+    pub all_functions: Vec<(String, u32)>,
+    /// Its classes (name symbol -> class id) and interfaces.
+    pub classes: HashMap<u32, u32>,
     pub interfaces: HashSet<u32>,
+    /// The name of its language's built-in error class.
+    pub error_class: u32,
+}
+
+pub enum ImportKind {
+    /// A file module.
+    File(u32),
+    /// A standard module by its name in the importer's language.
+    Std(String),
+    /// An import that fails when it runs (a missing or unreadable file...).
+    Fail { code: String, args: Vec<String> },
+}
+
+/// One `가져오자` statement.
+pub struct ImportInfo {
+    pub kind: ImportKind,
+    /// The module as written (for messages).
+    pub source: String,
+    pub all: bool,
+    /// (name in the module, name here, where it goes here).
+    pub items: Vec<(String, String, Loc)>,
+    /// Where the names `전부` brings go here.
+    pub all_slots: HashMap<String, Loc>,
+    /// Classes the statement renames (their conflicts are not errors).
+    pub aliased: HashSet<u32>,
 }

@@ -101,7 +101,7 @@ fn dis(path: &Path) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let (program, _) = haru_syntax::parse(&source, lang.syntax);
-    match haru_core::compiler::compile(&program, lang) {
+    match haru_core::compiler::compile(&program, lang, &haru_std::lookup) {
         Ok(p) => {
             for proto in &p.protos {
                 println!("== {} ({} registers)", proto.name, proto.nregs);

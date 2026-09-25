@@ -41,6 +41,8 @@ pub struct Lang {
     pub error_class: &'static str,
     pub error_message: &'static str,
     pub error_ctor_arg: &'static str,
+    /// Imports of names with this prefix bind a package's native library.
+    pub native_prefix: &'static str,
 }
 
 pub static HARI: Lang = Lang {
@@ -74,6 +76,7 @@ pub static HARI: Lang = Lang {
     error_class: "오류",
     error_message: "메시지",
     error_ctor_arg: "초기메시지",
+    native_prefix: "네이티브_",
 };
 
 pub static KANADE: Lang = Lang {
@@ -107,6 +110,7 @@ pub static KANADE: Lang = Lang {
     error_class: "エラー",
     error_message: "メッセージ",
     error_ctor_arg: "初期メッセージ",
+    native_prefix: "ネイティブ_",
 };
 
 /// The language of a source file, by extension.

@@ -84,8 +84,10 @@ unsafe extern "C" fn call(
 unsafe extern "C" fn throw(c: *mut HostCtx, code: Str, args: *const RawValue, argc: usize) -> Status {
     let c = ctx(c);
     let args = if argc == 0 { &[][..] } else { std::slice::from_raw_parts(args, argc) };
+    // A code of Hana's catalog is the runtime's own error, worded as Hana words it.
+    let hana = crate::catalog::CATALOG.binary_search_by(|e| e.0.cmp(code.as_str())).is_ok();
     c.pending = Some(RuntimeError {
-        module: Some(c.module),
+        module: if hana { None } else { Some(c.module) },
         code: code.as_str().to_string(),
         args: args.iter().map(|&a| Value::from_borrowed(a)).collect(),
     });

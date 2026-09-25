@@ -33,26 +33,29 @@ fn std_math_is_found_by_name_in_each_language() {
 }
 
 #[test]
-fn module_errors_come_out_in_the_program_language() {
+fn standard_errors_are_hanas_in_the_program_language() {
     let rt = std_runtime();
     let sqrt = func(&rt, "hari", "수학", "제곱근");
     let err = rt.call(sqrt, &[Value::num(-4.0)]).unwrap_err();
-    assert_eq!(err.qualified_code(&rt), "math.NegativeRoot");
-    assert_eq!(err.message(&rt, "hari"), "음수 -4의 제곱근은 구할 수 없어요.");
-    assert_eq!(err.message(&rt, "kanade"), "負の数-4の平方根は求められません。");
+    assert_eq!(err.qualified_code(&rt), "ValueError.MathDomain");
+    assert_eq!(err.message(&rt, "hari"), "ValueError: 이 값으로는 계산할 수 없어요.");
+    let ceil = func(&rt, "hari", "수학", "올림");
+    let err = rt.call(ceil, &[]).unwrap_err();
+    assert_eq!(err.message(&rt, "hari"), "ArgumentError: 인자가 1개 필요해요.");
 }
 
 #[test]
-fn the_host_checks_argument_count_and_kinds() {
-    let rt = std_runtime();
-    let ceil = func(&rt, "hari", "수학", "올림");
+fn the_host_checks_typed_functions_arguments() {
+    let mut rt = std_runtime();
+    rt.load_static(greet::haru_entry).unwrap();
+    let hello = func(&rt, "hari", "인사", "인사말");
 
-    let err = rt.call(ceil, &[]).unwrap_err();
+    let err = rt.call(hello, &[]).unwrap_err();
     assert_eq!(err.message(&rt, "hari"), "인자가 1개 필요한데 0개가 들어왔어요.");
 
-    let err = rt.call(ceil, &[Value::str("3")]).unwrap_err();
-    assert_eq!(err.message(&rt, "hari"), "1번째 인자는 [숫자]이어야 해요.");
-    assert_eq!(err.message(&rt, "kanade"), "1番目の引数は【数】でなければなりません。");
+    let err = rt.call(hello, &[Value::num(3.0)]).unwrap_err();
+    assert_eq!(err.message(&rt, "hari"), "1번째 인자는 [문자열]이어야 해요.");
+    assert_eq!(err.message(&rt, "kanade"), "1番目の引数は【文字列】でなければなりません。");
 }
 
 fn check_greet(rt: &Runtime) {
@@ -81,7 +84,7 @@ fn check_greet(rt: &Runtime) {
 
     // An error inside the callback passes through the module unchanged.
     let err = rt.call(apply_twice, &[factorial, Value::num(-1.0)]).unwrap_err();
-    assert_eq!(err.qualified_code(rt), "math.FactorialDomain");
+    assert_eq!(err.qualified_code(rt), "ValueError.MathDomain");
 }
 
 #[test]

@@ -152,13 +152,16 @@ impl Runtime {
     /// checked here, so modules never see mismatched values.
     pub fn call(&self, f: FnRef, args: &[Value]) -> Result<Value, RuntimeError> {
         let func = &self.modules[f.module].functions[f.func];
-        if args.len() < func.required || args.len() > func.params.len() {
+        let rest = func.params.first() == Some(&kind::REST);
+        if rest {
+            // The function checks its arguments itself.
+        } else if args.len() < func.required || args.len() > func.params.len() {
             return Err(RuntimeError::core("ArgumentCount")
                 .arg(Value::num(func.params.len() as f64))
                 .arg(Value::num(args.len() as f64)));
         }
         for (i, (arg, &want)) in args.iter().zip(&func.params).enumerate() {
-            if !kind::accepts(want, arg.tag()) {
+            if !rest && !kind::accepts(want, arg.tag()) {
                 return Err(type_error(i, want));
             }
         }

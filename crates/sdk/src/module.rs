@@ -48,6 +48,20 @@ impl Module {
         self.funcs.last_mut().unwrap()
     }
 
+    /// Adds a function that takes its arguments as they come, any number and
+    /// kind, and checks them itself (to report errors exactly as it wants).
+    pub fn raw(&mut self, id: &str, f: fn(&[crate::Value]) -> crate::Result<crate::Value>) -> &mut FuncEntry {
+        self.funcs.push(FuncEntry {
+            id: id.to_string(),
+            names: Vec::new(),
+            required: 0,
+            kinds: vec![abi::kind::REST],
+            func: crate::raw_shim,
+            userdata: f as *const c_void,
+        });
+        self.funcs.last_mut().unwrap()
+    }
+
     /// The message for one of this module's error codes in a language.
     pub fn message(&mut self, code: &str, lang: &str, template: &str) -> &mut Module {
         self.messages.push((code.to_string(), lang.to_string(), template.to_string()));

@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use haru_core::vm::{codes, Vm};
-use haru_core::{compiler, lang, syntax_report};
+use haru_core::{compiler, lang, syntax_report, Runtime};
 
 pub fn run(path: &Path, time: bool) -> ExitCode {
     let lang = lang::for_path(path);
@@ -30,7 +30,11 @@ pub fn run(path: &Path, time: bool) -> ExitCode {
         }
         return ExitCode::FAILURE;
     }
-    let compiled = match compiler::compile(&program, lang) {
+    let mut rt = Runtime::new();
+    for entry in haru_std::MODULES {
+        rt.load_static(*entry).expect("the standard library loads");
+    }
+    let compiled = match compiler::compile(&program, lang, &haru_std::lookup) {
         Ok(c) => c,
         Err(u) => {
             eprintln!("haru: not supported yet: {}", u.0);
@@ -39,7 +43,7 @@ pub fn run(path: &Path, time: bool) -> ExitCode {
     };
     let compiled_at = Instant::now();
 
-    let mut vm = Vm::new(&compiled);
+    let mut vm = Vm::new(&compiled).with_runtime(&rt);
     let stdin = std::io::stdin();
     vm.read_line = Box::new(move || {
         let mut line = String::new();
@@ -58,7 +62,7 @@ pub fn run(path: &Path, time: bool) -> ExitCode {
             return ExitCode::from(3);
         }
         Err(e) => {
-            eprintln!("{}", e.report(None, lang));
+            eprintln!("{}", e.report(Some(&rt), lang));
             ExitCode::FAILURE
         }
     };

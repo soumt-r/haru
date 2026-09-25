@@ -8,7 +8,7 @@
 //! loop that takes them, leaving frames that have none (Hana lets a break in
 //! a function end the caller's loop).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 use haru_abi::tag;
@@ -18,6 +18,7 @@ use crate::bytecode::*;
 use crate::error::RuntimeError;
 use crate::format::{display, go_i64, go_int};
 use crate::lang::Lang;
+use crate::modules::{FnRef, Runtime};
 use crate::symbol;
 use crate::value::{FuncObj, Key, Value, CLASS};
 
@@ -76,6 +77,10 @@ pub mod codes {
     pub const PRIVATE_FIELD: &str = "AccessViolationError.PrivateFieldAccess";
     pub const PROTECTED_METHOD: &str = "AccessViolationError.ProtectedMethodAccess";
     pub const PROTECTED_FIELD: &str = "AccessViolationError.ProtectedFieldAccess";
+    pub const IMPORT_TARGET: &str = "ImportError.ImportTargetNotFound";
+    pub const IMPORT_PACKAGE: &str = "ImportError.ImportPackageNotFound";
+    pub const CLASS_CONFLICT: &str = "ImportError.ImportClassConflict";
+    pub const CLASS_CONFLICT_OWN: &str = "ImportError.ImportClassConflictOwn";
 
     /// Not Hana's: a construct this version cannot run yet.
     pub const UNSUPPORTED: &str = "Unsupported";
@@ -113,6 +118,27 @@ enum Post {
     Discard,
     /// `<기호 같다>` for `==` (or `!=`, negated).
     Equals { neg: bool },
+    /// A module's top-level code: when it ends the module is loaded.
+    ModuleInit(u32),
+}
+
+/// Hana's interpreter: whose classes, static variables and words code sees.
+/// The program has one; each imported module gets one when it loads. Calls
+/// run in the caller's; a module's top-level code runs in the module's.
+struct Namespace {
+    lang: &'static Lang,
+    classes: HashMap<u32, u32>,
+    interfaces: HashSet<u32>,
+    /// Which module a class name was brought from (for conflicts).
+    owners: HashMap<u32, String>,
+    statics: HashMap<(u32, u32), Value>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModState {
+    Unloaded,
+    Loading,
+    Loaded,
 }
 
 struct Frame {
@@ -131,6 +157,8 @@ struct Frame {
     this: Value,
     /// The class `우리` means (NONE outside methods).
     self_class: u32,
+    /// The namespace the code runs in.
+    ns: u32,
     /// What handlers of this frame caught, by handler index.
     pending: Vec<(u32, Signal)>,
 }
@@ -148,10 +176,14 @@ pub struct Vm<'p> {
     stack: Vec<Value>,
     frames: Vec<Frame>,
     depth: u32,
-    /// Static variables: (class, name).
-    statics: HashMap<(u32, u32), Value>,
-    global_by_name: HashMap<&'p str, u32>,
-    function_by_name: HashMap<&'p str, u32>,
+    namespaces: Vec<Namespace>,
+    /// The running frame's namespace (kept in step with the frame).
+    ns: u32,
+    module_ns: Vec<Option<u32>>,
+    module_state: Vec<ModState>,
+    /// What each reflection site settled on.
+    reflected: HashMap<u32, u32>,
+    runtime: Option<&'p Runtime>,
     length_word: u32,
     init_name: u32,
     pub output: Output,
@@ -169,15 +201,32 @@ impl<'p> Vm<'p> {
             stack: Vec::with_capacity(1024),
             frames: Vec::new(),
             depth: 0,
-            statics: HashMap::new(),
-            global_by_name: prog.global_names.iter().map(|(n, g)| (n.as_str(), *g)).collect(),
-            function_by_name: prog.functions.iter().map(|(n, p)| (n.as_str(), *p)).collect(),
+            namespaces: vec![Namespace::of(&prog.modules[0])],
+            ns: 0,
+            module_ns: {
+                let mut v = vec![None; prog.modules.len()];
+                v[0] = Some(0);
+                v
+            },
+            module_state: {
+                let mut v = vec![ModState::Unloaded; prog.modules.len()];
+                v[0] = ModState::Loading;
+                v
+            },
+            reflected: HashMap::new(),
+            runtime: None,
             length_word: symbol::intern(prog.lang.length_word),
             init_name: symbol::intern("__init__"),
             output: Output::Stdout(Vec::new()),
             last_flush: std::time::Instant::now(),
             read_line: Box::new(|| None),
         }
+    }
+
+    /// The registry of native modules (the standard library) imports use.
+    pub fn with_runtime(mut self, rt: &'p Runtime) -> Vm<'p> {
+        self.runtime = Some(rt);
+        self
     }
 
     pub fn flush(&mut self) {
@@ -213,7 +262,7 @@ impl<'p> Vm<'p> {
 
     /// Runs the program to its end.
     pub fn run(&mut self) -> Result<(), RuntimeError> {
-        let main = &self.prog.protos[0];
+        let main = &self.prog.protos[self.prog.modules[0].main as usize];
         self.stack.resize(main.nregs as usize, Value::UNDEF);
         self.frames.push(Frame {
             proto: 0,
@@ -226,6 +275,7 @@ impl<'p> Vm<'p> {
             post: Post::Value,
             this: Value::UNDEF,
             self_class: NONE,
+            ns: 0,
             pending: Vec::new(),
         });
         let result = loop {
@@ -281,6 +331,13 @@ impl<'p> Vm<'p> {
                 _ => {}
             }
             // Nothing in this frame takes it.
+            if let Post::ModuleInit(m) = frame.post {
+                // The import fails with it; the module may be loaded again later.
+                self.module_state[m as usize] = ModState::Unloaded;
+                let frame = self.frames.pop().unwrap();
+                self.stack.truncate(frame.base);
+                continue;
+            }
             if self.frames.len() == 1 {
                 return Err(match signal {
                     Signal::Error(e) => e,
@@ -349,7 +406,7 @@ impl<'p> Vm<'p> {
 
     /// A name that is no variable: the class of that name, or an error.
     fn missing(&self, name: u32) -> Flow<Value> {
-        if self.prog.classes.contains_key(&name) {
+        if self.has_class(name) {
             return Ok(Value::class(name));
         }
         Err(err(VARIABLE_NOT_FOUND).str_arg(self.name(name)).into())
@@ -376,8 +433,14 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The class a name means in the running namespace.
     fn class(&self, sym: u32) -> Option<&'p ClassInfo> {
-        self.prog.classes.get(&sym)
+        let prog = self.prog;
+        self.namespaces[self.ns as usize].classes.get(&sym).map(|&id| &prog.classes[id as usize])
+    }
+
+    fn has_class(&self, sym: u32) -> bool {
+        self.namespaces[self.ns as usize].classes.contains_key(&sym)
     }
 
     /// `정하자` (Hana's `assignVariable`).
@@ -503,7 +566,8 @@ impl<'p> Vm<'p> {
                 self.stack[base + p.slot as usize] = std::mem::replace(&mut self.stack[arg_base], Value::UNDEF);
             }
             let depth = self.depth;
-            self.frames.push(Frame { proto: proto_id, pc: 0, base, argc, depth, counted, ret, post, this, self_class, pending: Vec::new() });
+            let ns = self.ns;
+            self.frames.push(Frame { proto: proto_id, pc: 0, base, argc, depth, counted, ret, post, this, self_class, ns, pending: Vec::new() });
             return Ok(());
         }
         if argc as usize > nparams {
@@ -524,7 +588,8 @@ impl<'p> Vm<'p> {
             }
         }
         let depth = self.depth;
-        self.frames.push(Frame { proto: proto_id, pc: 0, base, argc, depth, counted, ret, post, this, self_class, pending: Vec::new() });
+        let ns = self.ns;
+            self.frames.push(Frame { proto: proto_id, pc: 0, base, argc, depth, counted, ret, post, this, self_class, ns, pending: Vec::new() });
         Ok(())
     }
 
@@ -534,7 +599,7 @@ impl<'p> Vm<'p> {
 
     /// Calls a function value. `Ok(Some(v))` for an immediate result;
     /// `Ok(None)` when a frame was pushed.
-    fn call_value(&mut self, f: &Value, arg_base: usize, argc: u16, ret: Reg) -> Flow<Option<Value>> {
+    fn call_value(&mut self, f: &Value, arg_base: usize, argc: u16, ret: Reg, module: u32) -> Flow<Option<Value>> {
         match f.as_func() {
             Some(FuncObj::User(p)) => {
                 self.call_plain(*p, arg_base, argc, ret)?;
@@ -544,18 +609,25 @@ impl<'p> Vm<'p> {
                 let args: Vec<Value> = (0..argc as usize).map(|i| self.stack[arg_base + i].clone()).collect();
                 Ok(Some(builtins::call(*b, &args, self.lang)?))
             }
-            Some(FuncObj::Native { .. }) => Err(err(UNSUPPORTED).str_arg("native module call").into()),
+            Some(&FuncObj::Native { module: m, func }) => {
+                let Some(rt) = self.runtime else {
+                    return Err(err(UNSUPPORTED).str_arg("native module call").into());
+                };
+                let args: Vec<Value> = (0..argc as usize).map(|i| self.stack[arg_base + i].clone()).collect();
+                Ok(Some(rt.call(FnRef { module: m, func }, &args)?))
+            }
             None => match f.as_str() {
                 // A name: what it means now (a built-in or function by that name).
                 Some(name) => {
                     let name = name.to_string();
-                    if let Some(&g) = self.global_by_name.get(name.as_str()) {
+                    let info = &self.prog.modules[module as usize];
+                    if let Some(&g) = info.globals.get(name.as_str()) {
                         let v = self.globals[g as usize].clone();
-                        if matches!(v.as_func(), Some(FuncObj::Builtin(_) | FuncObj::User(_))) {
-                            return self.call_value(&v, arg_base, argc, ret);
+                        if matches!(v.as_func(), Some(FuncObj::Builtin(_) | FuncObj::User(_) | FuncObj::Native { .. })) {
+                            return self.call_value(&v, arg_base, argc, ret, module);
                         }
                     }
-                    if let Some(&p) = self.function_by_name.get(name.as_str()) {
+                    if let Some(p) = self.function_named(module, &name) {
                         self.call_plain(p, arg_base, argc, ret)?;
                         return Ok(None);
                     }
@@ -564,6 +636,12 @@ impl<'p> Vm<'p> {
                 None => Err(err(NOT_CALLABLE).into()),
             },
         }
+    }
+
+    /// A top-level function by name: the running module's, else the program's.
+    fn function_named(&self, module: u32, name: &str) -> Option<u32> {
+        let prog = self.prog;
+        prog.modules[module as usize].functions.get(name).or_else(|| prog.modules[0].functions.get(name)).copied()
     }
 
     /// Hana's access check (`errs.AccessViolation`): a private member only
@@ -598,6 +676,8 @@ impl<'p> Vm<'p> {
             let fi = self.frames.len() - 1;
             let frame = &self.frames[fi];
             let proto = &prog.protos[frame.proto as usize];
+            self.ns = frame.ns;
+            self.lang = self.namespaces[frame.ns as usize].lang;
             let code = &proto.code[..];
             let base = frame.base;
             let mut pc = frame.pc;
@@ -858,9 +938,9 @@ impl<'p> Vm<'p> {
                             self.find(&prog.vars[var as usize], fi).map(|s| self.get(s.loc, fi))
                         };
                         match f {
-                            Some(f) if matches!(f.as_func(), Some(FuncObj::Builtin(_) | FuncObj::User(_))) => {
+                            Some(f) if matches!(f.as_func(), Some(FuncObj::Builtin(_) | FuncObj::User(_) | FuncObj::Native { .. })) => {
                                 self.frames[fi].pc = pc;
-                                match tri!(self.call_value(&f, base + b as usize, argc, dst)) {
+                                match tri!(self.call_value(&f, base + b as usize, argc, dst, proto.module)) {
                                     Some(v) => {
                                         reg!(dst) = v;
                                         self.depth -= 1;
@@ -874,7 +954,7 @@ impl<'p> Vm<'p> {
                     Op::CallValue { dst, callee, base: b, argc } => {
                         let f = reg!(callee).clone();
                         self.frames[fi].pc = pc;
-                        match tri!(self.call_value(&f, base + b as usize, argc, dst)) {
+                        match tri!(self.call_value(&f, base + b as usize, argc, dst, proto.module)) {
                             Some(v) => {
                                 reg!(dst) = v;
                                 self.depth -= 1;
@@ -1050,7 +1130,7 @@ impl<'p> Vm<'p> {
                             }
                             CLASS => {
                                 let class = o.as_class().unwrap();
-                                match self.statics.get(&(class, name)) {
+                                match self.namespaces[self.ns as usize].statics.get(&(class, name)) {
                                     Some(v) => reg!(dst) = v.clone(),
                                     None => fail!(err(STATIC_MEMBER_NOT_FOUND).str_arg(self.name(name))),
                                 }
@@ -1097,7 +1177,7 @@ impl<'p> Vm<'p> {
                             }
                             CLASS => {
                                 if name != NONE {
-                                    self.statics.insert((o.as_class().unwrap(), name), reg!(val).clone());
+                                    self.namespaces[self.ns as usize].statics.insert((o.as_class().unwrap(), name), reg!(val).clone());
                                 }
                                 pc = skip as usize;
                             }
@@ -1199,7 +1279,7 @@ impl<'p> Vm<'p> {
                     }
                     Op::FuncRef { dst, name, var } => {
                         let n = self.name(name);
-                        let v = if let Some(&p) = self.function_by_name.get(n) {
+                        let v = if let Some(p) = self.function_named(proto.module, n) {
                             Value::func(FuncObj::User(p))
                         } else {
                             match self.find(&prog.vars[var as usize], fi).map(|s| self.get(s.loc, fi)) {
@@ -1223,7 +1303,7 @@ impl<'p> Vm<'p> {
                     Op::NewObj { dst, class } => match self.class(class) {
                         Some(c) if c.is_abstract => fail!(err(INSTANTIATE_ABSTRACT).str_arg(self.name(class))),
                         Some(_) => reg!(dst) = Value::object(class),
-                        None if prog.interfaces.contains(&class) => {
+                        None if self.namespaces[self.ns as usize].interfaces.contains(&class) => {
                             fail!(err(INSTANTIATE_INTERFACE).str_arg(self.name(class)))
                         }
                         None => fail!(err(CLASS_NOT_FOUND).str_arg(self.name(class))),
@@ -1264,7 +1344,7 @@ impl<'p> Vm<'p> {
                     Op::TypeValue { dst, var, name } => {
                         let v = match self.find(&prog.vars[var as usize], fi) {
                             Some(s) => self.get(s.loc, fi),
-                            None if self.prog.classes.contains_key(&name) => Value::class(name),
+                            None if self.has_class(name) => Value::class(name),
                             None => Value::str(self.name(name)),
                         };
                         reg!(dst) = v;
@@ -1282,7 +1362,119 @@ impl<'p> Vm<'p> {
                         let class = if class == NONE { self.frames[fi].self_class } else { class };
                         if class != NONE {
                             let v = std::mem::replace(&mut reg!(src), Value::UNDEF);
-                            self.statics.insert((class, name), v);
+                            self.namespaces[self.ns as usize].statics.insert((class, name), v);
+                        }
+                    }
+
+                    // ---- modules
+                    Op::Import { import } => {
+                        let info = &prog.imports[import as usize];
+                        match &info.kind {
+                            ImportKind::Fail { code, args } => {
+                                let mut e = err(code);
+                                for a in args {
+                                    e = e.str_arg(a);
+                                }
+                                fail!(e);
+                            }
+                            &ImportKind::File(m) => {
+                                if self.module_state[m as usize] == ModState::Unloaded {
+                                    // Run the module's top level, then come back here to bind.
+                                    let ns = self.load_namespace(m);
+                                    enter!(pc - 1, self.push_module(m, ns));
+                                }
+                                tri!(self.bind_file(info, m, fi));
+                            }
+                            ImportKind::Std(name) => tri!(self.bind_std(info, name, fi)),
+                        }
+                    }
+                    Op::InitFieldsDyn { obj } => {
+                        let o = reg!(obj).clone();
+                        if let Some(object) = o.as_object() {
+                            if let Some(c) = self.class(object.class) {
+                                let class = object.class;
+                                enter!(pc, self.call_proto(c.init, 0, 0, obj, o, class, Post::Discard, false));
+                            }
+                        }
+                    }
+                    Op::CallCtorDyn { obj, base: b, argc } => {
+                        let o = reg!(obj).clone();
+                        let class = o.as_object().map_or(NONE, |x| x.class);
+                        match self.class(class).and_then(|c| c.ctor) {
+                            Some(p) => enter!(pc, self.call_proto(p, base + b as usize, argc, obj, o, class, Post::Discard, true)),
+                            None => self.depth -= 1,
+                        }
+                    }
+                    Op::Reflect { dst, site, var, quoted } => {
+                        let resolve = site & (1 << 31) == 0;
+                        let name = match self.reflected.get(&site) {
+                            Some(&n) => n,
+                            // Hana rewrites the call site once the variable holds a text.
+                            None => match self.find(&prog.vars[var as usize], fi).map(|s| self.get(s.loc, fi)) {
+                                Some(v) if v.as_str().is_some() => {
+                                    let n = symbol::intern(v.as_str().unwrap());
+                                    self.reflected.insert(site, n);
+                                    n
+                                }
+                                _ => quoted,
+                            },
+                        };
+                        let text = self.name(name);
+                        reg!(dst) = if !resolve {
+                            Value::str(text)
+                        } else if let Some(p) = self.function_named(proto.module, text) {
+                            Value::func(FuncObj::User(p))
+                        } else {
+                            Value::str(text)
+                        };
+                    }
+                    Op::MethodPrepDyn { obj, name } => {
+                        let n = symbol::intern(reg!(name).as_str().unwrap_or(""));
+                        let o = reg!(obj).clone();
+                        match o.tag() {
+                            tag::OBJECT => {
+                                let m = self.member_of(o.as_object().unwrap().class, n);
+                                tri!(self.check_access(fi, &o, m.method_access, true, n));
+                            }
+                            CLASS => {
+                                let class = o.as_class().unwrap();
+                                if !self.class(class).is_some_and(|c| c.statics.contains_key(&n)) {
+                                    fail!(err(STATIC_MEMBER_NOT_FOUND).str_arg(self.name(n)));
+                                }
+                            }
+                            tag::STR | tag::LIST => {}
+                            tag::DICT => fail!(err(UNSUPPORTED).str_arg("dictionary method")),
+                            _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(type_name_of(&o))),
+                        }
+                    }
+                    Op::CallMethodDyn { dst, obj, name, base: b, argc } => {
+                        let n = symbol::intern(reg!(name).as_str().unwrap_or(""));
+                        let o = reg!(obj).clone();
+                        match o.tag() {
+                            tag::OBJECT => {
+                                let class = o.as_object().unwrap().class;
+                                let p = if n == self.init_name { self.class(class).and_then(|c| c.ctor) } else { self.member_of(class, n).method };
+                                match p {
+                                    Some(p) => enter!(pc, self.call_proto(p, base + b as usize, argc, dst, o, class, Post::Value, true)),
+                                    None => fail!(err(METHOD_NOT_FOUND).str_arg(self.name(n))),
+                                }
+                            }
+                            CLASS => {
+                                let class = o.as_class().unwrap();
+                                match self.class(class).and_then(|c| c.statics.get(&n).copied()) {
+                                    Some(p) => enter!(
+                                        pc,
+                                        self.call_proto(p, base + b as usize, argc, dst, Value::UNDEF, class, Post::Value, true)
+                                    ),
+                                    None => fail!(err(STATIC_METHOD_NOT_FOUND).str_arg(self.name(n))),
+                                }
+                            }
+                            _ => {
+                                let args: Vec<Value> = (0..argc as usize).map(|i| reg!(b as usize + i).clone()).collect();
+                                let v = tri!(self.call_method(&o, self.name(n), NONE, fi, &args));
+                                reg!(dst) = v;
+                                self.depth -= 1;
+                            }
                         }
                     }
 
@@ -1313,6 +1505,168 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+    }
+
+    /// A module's namespace, made fresh when it loads (Hana starts a new
+    /// sub-interpreter each time a failed module is imported again).
+    fn load_namespace(&mut self, m: u32) -> u32 {
+        let prog = self.prog;
+        let info = &prog.modules[m as usize];
+        let (a, b) = info.global_range;
+        for g in a..b {
+            self.globals[g as usize] = prog.globals[g as usize].clone();
+        }
+        let ns = self.namespaces.len() as u32;
+        self.namespaces.push(Namespace::of(info));
+        self.module_ns[m as usize] = Some(ns);
+        ns
+    }
+
+    /// Starts a module's top-level code (the caller's pc is already saved).
+    fn push_module(&mut self, m: u32, ns: u32) -> Flow<()> {
+        self.module_state[m as usize] = ModState::Loading;
+        let proto = self.prog.modules[m as usize].main;
+        let base = self.stack.len();
+        self.stack.resize(base + self.prog.protos[proto as usize].nregs as usize, Value::UNDEF);
+        let depth = self.depth;
+        self.frames.push(Frame {
+            proto,
+            pc: 0,
+            base,
+            argc: 0,
+            depth,
+            counted: false,
+            ret: 0,
+            post: Post::ModuleInit(m),
+            this: Value::UNDEF,
+            self_class: NONE,
+            ns,
+            pending: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Hana's `bringModuleTypes`: the module's classes and interfaces become
+    /// known here under their own names; a name here that came from elsewhere
+    /// is a conflict unless the statement renames that class.
+    fn bring_types(&mut self, info: &ImportInfo, module_ns: u32) -> Result<(), RuntimeError> {
+        let here = self.ns as usize;
+        let there = module_ns as usize;
+        let skip = [symbol::intern(self.namespaces[there].lang.error_class), symbol::intern(self.namespaces[here].lang.error_class)];
+        let mut classes: Vec<(u32, u32)> = self.namespaces[there].classes.iter().map(|(n, id)| (*n, *id)).collect();
+        classes.sort_by_key(|(n, _)| self.name(*n));
+        for (name, id) in classes {
+            if skip.contains(&name) {
+                continue;
+            }
+            let mine = self.namespaces[there].owners.get(&name).cloned().unwrap_or_else(|| info.source.clone());
+            if self.namespaces[here].classes.contains_key(&name) {
+                let theirs = self.namespaces[here].owners.get(&name).cloned().unwrap_or_default();
+                if theirs != mine && !info.aliased.contains(&name) {
+                    return Err(conflict(&info.source, self.name(name), &theirs));
+                }
+                continue;
+            }
+            self.namespaces[here].classes.insert(name, id);
+            self.namespaces[here].owners.insert(name, mine);
+        }
+        let mut ifaces: Vec<u32> = self.namespaces[there].interfaces.iter().copied().collect();
+        ifaces.sort_by_key(|n| self.name(*n));
+        for name in ifaces {
+            let mine = self.namespaces[there].owners.get(&name).cloned().unwrap_or_else(|| info.source.clone());
+            if self.namespaces[here].interfaces.contains(&name) {
+                let theirs = self.namespaces[here].owners.get(&name).cloned().unwrap_or_default();
+                if theirs != mine && !info.aliased.contains(&name) {
+                    return Err(conflict(&info.source, self.name(name), &theirs));
+                }
+                continue;
+            }
+            self.namespaces[here].interfaces.insert(name);
+            self.namespaces[here].owners.insert(name, mine);
+        }
+        Ok(())
+    }
+
+    /// Binds what an import of a file module asks for (Hana's `bindImports`).
+    fn bind_file(&mut self, info: &ImportInfo, m: u32, fi: usize) -> Result<(), RuntimeError> {
+        let prog = self.prog;
+        let module = &prog.modules[m as usize];
+        let there = self.module_ns[m as usize].unwrap();
+        self.bring_types(info, there)?;
+        let here = self.ns as usize;
+        if info.all {
+            for (name, proto) in &module.all_functions {
+                self.store(info.all_slots[name], fi, Value::func(FuncObj::User(*proto)));
+            }
+            for (name, id) in self.namespaces[there as usize].classes.clone() {
+                if module.classes.contains_key(&name) {
+                    self.namespaces[here].classes.insert(name, id);
+                }
+            }
+            for name in module.interfaces.clone() {
+                self.namespaces[here].interfaces.insert(name);
+            }
+        }
+        for (target, bind, slot) in &info.items {
+            let target_sym = symbol::intern(target);
+            let bind_sym = symbol::intern(bind);
+            // A variable of the module (a built-in, an import of its own, ...).
+            if let Some(&g) = module.globals.get(target) {
+                let v = self.globals[g as usize].clone();
+                if !v.is_undef() {
+                    self.store(*slot, fi, v);
+                    continue;
+                }
+            }
+            // A class: known here under the name the statement gives it.
+            if let Some(&id) = self.namespaces[there as usize].classes.get(&target_sym) {
+                let mine = self.namespaces[there as usize].owners.get(&target_sym).cloned().unwrap_or_else(|| info.source.clone());
+                if self.namespaces[here].classes.contains_key(&bind_sym) {
+                    let theirs = self.namespaces[here].owners.get(&bind_sym).cloned().unwrap_or_default();
+                    if theirs != mine {
+                        return Err(conflict(&info.source, bind, &theirs));
+                    }
+                }
+                self.namespaces[here].classes.insert(bind_sym, id);
+                self.namespaces[here].owners.insert(bind_sym, mine);
+                continue;
+            }
+            if self.namespaces[there as usize].interfaces.contains(&target_sym) {
+                self.namespaces[here].interfaces.insert(bind_sym);
+                continue;
+            }
+            if let Some(&p) = module.functions.get(target) {
+                self.store(*slot, fi, Value::func(FuncObj::User(p)));
+                continue;
+            }
+            return Err(err(IMPORT_TARGET).str_arg(&info.source).str_arg(target));
+        }
+        Ok(())
+    }
+
+    /// Binds functions of a standard module (Hana's core native modules).
+    fn bind_std(&mut self, info: &ImportInfo, name: &str, fi: usize) -> Result<(), RuntimeError> {
+        let lang = self.lang.name;
+        let Some(rt) = self.runtime else {
+            return Err(err(IMPORT_PACKAGE).str_arg(name));
+        };
+        let Some(m) = rt.module(lang, name) else {
+            return Err(err(IMPORT_PACKAGE).str_arg(name));
+        };
+        if info.all {
+            for (fname, slot) in &info.all_slots {
+                if let Some(f) = rt.function(m, lang, fname) {
+                    self.store(*slot, fi, rt.function_value(f));
+                }
+            }
+        }
+        for (target, _, slot) in &info.items {
+            match rt.function(m, lang, target) {
+                Some(f) => self.store(*slot, fi, rt.function_value(f)),
+                None => return Err(err(IMPORT_TARGET).str_arg(name).str_arg(target)),
+            }
+        }
+        Ok(())
     }
 
     fn take_pending(&mut self, fi: usize, key: u32) -> Signal {
@@ -1353,6 +1707,10 @@ impl<'p> Vm<'p> {
         let proto = &self.prog.protos[frame.proto as usize];
         let result = match frame.post {
             Post::Discard => return Ok(()),
+            Post::ModuleInit(m) => {
+                self.module_state[m as usize] = ModState::Loaded;
+                return Ok(());
+            }
             Post::Value => {
                 if proto.return_type != 0 {
                     self.check_type(RETURN_TYPE, &proto.name, proto.return_type, &v)?;
@@ -1519,6 +1877,27 @@ impl<'p> Vm<'p> {
     }
 }
 
+impl Namespace {
+    fn of(m: &ModuleInfo) -> Namespace {
+        Namespace {
+            lang: m.lang,
+            classes: m.classes.clone(),
+            interfaces: m.interfaces.clone(),
+            owners: HashMap::new(),
+            statics: HashMap::new(),
+        }
+    }
+}
+
+/// Hana's `ImportClassConflict` / `...Own` (the program's own class).
+fn conflict(source: &str, class: &str, theirs: &str) -> RuntimeError {
+    if theirs.is_empty() {
+        err(CLASS_CONFLICT_OWN).str_arg(source).str_arg(class)
+    } else {
+        err(CLASS_CONFLICT).str_arg(source).str_arg(class).str_arg(theirs)
+    }
+}
+
 /// Arithmetic and comparison of two numbers.
 #[inline(always)]
 fn arith(op: BinOp, x: f64, y: f64) -> Result<Value, RuntimeError> {
@@ -1579,7 +1958,7 @@ mod tests {
             INPUT_NUMBER, INPUT_BOOLEAN, INPUT_TYPE, THIS_NOT_BOUND, SUPER_OUTSIDE, STATIC_OUTSIDE,
             CLASS_NOT_FOUND, INSTANTIATE_INTERFACE, INSTANTIATE_ABSTRACT, STATIC_METHOD_NOT_FOUND,
             STATIC_MEMBER_NOT_FOUND, SUPER_MEMBER_METHOD, PRIVATE_METHOD, PRIVATE_FIELD, PROTECTED_METHOD,
-            PROTECTED_FIELD,
+            PROTECTED_FIELD, IMPORT_TARGET, IMPORT_PACKAGE, CLASS_CONFLICT, CLASS_CONFLICT_OWN,
         ] {
             assert!(crate::catalog::CATALOG.iter().any(|e| e.0 == code), "{code} is not a Hana error code");
         }

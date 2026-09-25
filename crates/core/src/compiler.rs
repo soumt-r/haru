@@ -22,8 +22,64 @@ use crate::value::{FuncObj, Value};
 #[derive(Debug)]
 pub struct Unsupported(pub String);
 
-pub fn compile(program: &ast::Program, lang: &'static Lang) -> Result<Program, Unsupported> {
-    let error_class = builtin_error_class(lang);
+/// What a `[모듈]` name means to this build, in a language: `None` when no
+/// standard module has that name; `Some((true, functions))` for one Haru has
+/// (its functions' names in that language); `Some((false, _))` for one only
+/// Hana has so far.
+pub type StdLookup<'s> = &'s dyn Fn(&str, &str) -> Option<(bool, Vec<String>)>;
+
+/// A file module read and parsed ahead (import paths are written literally).
+enum Source {
+    Ok(ast::Program, &'static Lang),
+    /// The error its import raises when it runs: (code, argument).
+    Fail(&'static str, String),
+}
+
+/// Every file the statements import, and the files those import, by key.
+fn discover(stmts: &[Stmt], sources: &mut HashMap<String, Source>) {
+    let mut found = Vec::new();
+    walk_stmts(
+        stmts,
+        &mut |s| {
+            if let Stmt::Import { module, is_builtin: false, .. } = s {
+                found.push(module.clone());
+            }
+        },
+        &mut |_| {},
+    );
+    for path in found {
+        let key = format!("file:{path}");
+        if sources.contains_key(&key) {
+            continue;
+        }
+        let lang = crate::lang::for_path(std::path::Path::new(&path));
+        let source = match std::fs::read_to_string(&path) {
+            Err(_) => Source::Fail("ImportError.ImportFileNotFound", path.clone()),
+            Ok(text) => match haru_syntax::parse(&text, lang.syntax) {
+                (prog, diags) if diags.is_empty() => Source::Ok(prog, lang),
+                _ => Source::Fail("ImportError.ImportFileSyntax", path.clone()),
+            },
+        };
+        sources.insert(key.clone(), source);
+        if let Source::Ok(prog, _) = &sources[&key] {
+            // Borrow ends before the recursive insertions.
+            let stmts: Vec<Stmt> = prog.statements.clone();
+            discover(&stmts, sources);
+        }
+    }
+}
+
+pub fn compile(program: &ast::Program, lang: &'static Lang, std_lookup: StdLookup) -> Result<Program, Unsupported> {
+    let mut sources = HashMap::new();
+    discover(&program.statements, &mut sources);
+    check_supported(&program.statements, lang, std_lookup)?;
+    for s in sources.values() {
+        if let Source::Ok(p, l) = s {
+            check_supported(&p.statements, l, std_lookup)?;
+        }
+    }
+    let error_classes = [builtin_error_class(&crate::lang::HARI), builtin_error_class(&crate::lang::KANADE)];
+
     let mut c = Compiler {
         prog: Program {
             lang,
@@ -32,146 +88,292 @@ pub fn compile(program: &ast::Program, lang: &'static Lang) -> Result<Program, U
             vars: Vec::new(),
             types: vec![TypeSpec::parse("", lang)],
             globals: Vec::new(),
-            global_names: Vec::new(),
-            functions: Vec::new(),
-            classes: HashMap::new(),
-            interfaces: HashSet::new(),
+            modules: Vec::new(),
+            classes: Vec::new(),
+            imports: Vec::new(),
         },
         type_ids: HashMap::new(),
         str_consts: HashMap::new(),
+        sources: &sources,
+        std_lookup,
+        module_ids: HashMap::new(),
+        lang,
+        module: 0,
         globals: HashMap::new(),
         functions: HashMap::new(),
         class_defs: HashMap::new(),
+        class_ids: HashMap::new(),
     };
-    c.check_supported(&program.statements)?;
-
-    // Built-ins are variables of the top level (a program may even replace them).
-    for (i, name) in lang.builtins.iter().enumerate() {
-        let slot = c.new_global(name, false);
-        c.prog.globals[slot.loc_global() as usize] = Value::func(FuncObj::Builtin(i as u8));
+    // Module ids first (imports refer to them), then each module's code.
+    c.module_ids.insert("<main>".to_string(), 0);
+    let mut keys: Vec<&String> = sources.iter().filter(|(_, s)| matches!(s, Source::Ok(..))).map(|(k, _)| k).collect();
+    keys.sort();
+    for (i, k) in keys.iter().enumerate() {
+        c.module_ids.insert((*k).clone(), (i + 1) as u32);
     }
-    for (name, flags) in declared_names(&program.statements) {
-        if !c.globals.contains_key(&name) {
-            c.new_global(&name, flags);
-        } else if flags {
-            let slot = c.globals.get_mut(&name).unwrap();
-            if slot.meta.is_none() {
-                let meta = c.prog.globals.len() as u32;
-                c.prog.globals.push(Value::UNDEF);
-                slot.meta = Some(Loc::Global(meta));
-            }
+    c.compile_module("<main>", &program.statements, lang, &error_classes);
+    for k in keys {
+        let Source::Ok(p, l) = &sources[k] else { unreachable!() };
+        c.compile_module(k, &p.statements, l, &error_classes);
+    }
+    Ok(c.prog)
+}
+
+impl<'a> Compiler<'a> {
+    /// Compiles one module (the program or an imported file) with its own
+    /// globals, functions and classes.
+    fn compile_module(&mut self, key: &str, stmts: &'a [Stmt], lang: &'static Lang, error_classes: &'a [Stmt; 2]) {
+        let id = self.prog.modules.len() as u32;
+        self.lang = lang;
+        self.module = id;
+        self.globals = HashMap::new();
+        self.functions = HashMap::new();
+        self.class_defs = HashMap::new();
+        self.class_ids = HashMap::new();
+        let global_start = self.prog.globals.len() as u32;
+
+        // Built-ins are variables of the top level (a program may even replace them).
+        for (i, name) in lang.builtins.iter().enumerate() {
+            let slot = self.new_global(name, false);
+            self.prog.globals[slot.loc_global() as usize] = Value::func(FuncObj::Builtin(i as u8));
         }
-    }
-
-    // Classes and interfaces of the top level, the later of a name winning,
-    // after the built-in error class (which a program may replace).
-    let mut class_order: Vec<String> = Vec::new();
-    let mut defs: HashMap<String, &Stmt> = HashMap::new();
-    for s in std::iter::once(&error_class).chain(program.statements.iter()) {
-        match s {
-            Stmt::Class { name: Some(n), .. } => {
-                if defs.insert(n.name.clone(), s).is_none() {
-                    class_order.push(n.name.clone());
+        for (name, flags) in self.declared_names(stmts) {
+            if !self.globals.contains_key(&name) {
+                self.new_global(&name, flags);
+            } else if flags {
+                let slot = self.globals.get_mut(&name).unwrap();
+                if slot.meta.is_none() {
+                    let meta = self.prog.globals.len() as u32;
+                    self.prog.globals.push(Value::UNDEF);
+                    slot.meta = Some(Loc::Global(meta));
                 }
             }
-            Stmt::Interface { name: Some(n), .. } => {
-                c.prog.interfaces.insert(symbol::intern(&n.name));
-            }
-            _ => {}
         }
-    }
 
-    // Top-level functions: the first of each name (later ones are never found).
-    let mut jobs: Vec<Job> = Vec::new();
-    for s in &program.statements {
-        if let Stmt::Function(f) = s {
-            if !c.functions.contains_key(&f.name) {
-                let proto = (jobs.len() + 1) as u32;
-                c.functions.insert(f.name.clone(), proto);
-                c.prog.functions.push((f.name.clone(), proto));
-                jobs.push(Job::Function(f));
-            }
-        }
-    }
-    // Every method, constructor, getter and setter of every class.
-    let mut class_protos: HashMap<String, ClassProtos> = HashMap::new();
-    for name in &class_order {
-        let Stmt::Class { body, .. } = defs[name] else { unreachable!() };
-        let mut cp = ClassProtos::default();
-        for s in body {
+        // Classes and interfaces of the top level, the later of a name winning,
+        // after the built-in error class (which a program may replace).
+        let error_class = if lang.name == "kanade" { &error_classes[1] } else { &error_classes[0] };
+        let mut class_order: Vec<String> = Vec::new();
+        let mut defs: HashMap<String, &'a Stmt> = HashMap::new();
+        let mut interfaces = HashSet::new();
+        for s in std::iter::once(error_class).chain(stmts.iter()) {
             match s {
-                Stmt::Function(f) => {
-                    jobs.push(Job::Method(f));
-                    cp.methods.push((f.name.clone(), jobs.len() as u32, f.is_static, Access::parse(f.access)));
-                    if f.name == lang.equals_method && cp.equals.is_none() {
-                        jobs.push(Job::Equals(f));
-                        cp.equals = Some(jobs.len() as u32);
+                Stmt::Class { name: Some(n), .. } => {
+                    if defs.insert(n.name.clone(), s).is_none() {
+                        class_order.push(n.name.clone());
                     }
                 }
-                Stmt::Constructor { params, body, .. } => {
-                    jobs.push(Job::Ctor(params, body));
-                    if cp.ctor.is_none() {
-                        cp.ctor = Some(jobs.len() as u32);
-                    }
-                }
-                Stmt::VarDecl(v) => {
-                    let name = v.name.clone().unwrap_or_default();
-                    let getter = v.getter.as_ref().map(|g| {
-                        jobs.push(Job::Getter(g));
-                        jobs.len() as u32
-                    });
-                    let setter = v.setter.as_ref().map(|st| {
-                        jobs.push(Job::Setter(st));
-                        jobs.len() as u32
-                    });
-                    let ty = if v.is_static { None } else { Some(v.type_ref.as_ref().map_or(0, |t| c.type_id(&t.name))) };
-                    cp.fields.push(FieldDecl { name, access: Access::parse(v.access), getter, setter, ty });
+                Stmt::Interface { name: Some(n), .. } => {
+                    interfaces.insert(symbol::intern(&n.name));
                 }
                 _ => {}
             }
         }
-        class_protos.insert(name.clone(), cp);
-    }
-    c.class_defs = defs;
-    c.build_classes(&class_order, &class_protos);
 
-    c.prog.protos.push(placeholder("<main>"));
-    for _ in &jobs {
-        c.prog.protos.push(placeholder(""));
-    }
-    let main = FnCompiler::new(&mut c, false).compile_main(&program.statements);
-    c.prog.protos[0] = main;
-    for (i, job) in jobs.iter().enumerate() {
-        let proto = match *job {
-            Job::Function(f) => FnCompiler::new(&mut c, false).compile_callable(
-                &f.name,
-                &f.params,
-                &f.body.statements,
-                f.return_type.as_ref(),
-                false,
-            ),
-            Job::Method(f) => FnCompiler::new(&mut c, true).compile_callable(
-                &f.name,
-                &f.params,
-                &f.body.statements,
-                f.return_type.as_ref(),
-                false,
-            ),
-            Job::Equals(f) => FnCompiler::new(&mut c, true).compile_callable(&f.name, &f.params, &f.body.statements, None, true),
-            Job::Ctor(params, body) => {
-                FnCompiler::new(&mut c, true).compile_callable(lang.syntax.constructor_function_name, params, body, None, false)
+        // Every top-level function gets a body; calls find the first of a name.
+        let base = self.prog.protos.len() as u32; // `base` is the module's top level
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut all_functions = Vec::new();
+        for s in stmts {
+            if let Stmt::Function(f) = s {
+                jobs.push(Job::Function(f));
+                let proto = base + jobs.len() as u32;
+                all_functions.push((f.name.clone(), proto));
+                self.functions.entry(f.name.clone()).or_insert(proto);
             }
-            Job::Getter(body) => FnCompiler::new(&mut c, true).compile_callable("", &[], body, None, false),
-            Job::Setter(st) => {
-                let params: Vec<ast::Param> =
-                    st.param.iter().map(|n| ast::Param { name: n.clone(), type_annotation: None, default: None }).collect();
-                FnCompiler::new(&mut c, true).compile_callable("", &params, &st.body, None, true)
+        }
+        // Every method, constructor, getter, setter and field initializer of every class.
+        let mut class_protos: HashMap<String, ClassProtos> = HashMap::new();
+        for name in &class_order {
+            let Stmt::Class { body, .. } = defs[name] else { unreachable!() };
+            let mut cp = ClassProtos::default();
+            jobs.push(Job::Init(body));
+            cp.init = base + jobs.len() as u32;
+            for s in body {
+                match s {
+                    Stmt::Function(f) => {
+                        jobs.push(Job::Method(f));
+                        cp.methods.push((f.name.clone(), base + jobs.len() as u32, f.is_static, Access::parse(f.access)));
+                        if f.name == lang.equals_method && cp.equals.is_none() {
+                            jobs.push(Job::Equals(f));
+                            cp.equals = Some(base + jobs.len() as u32);
+                        }
+                    }
+                    Stmt::Constructor { params, body, .. } => {
+                        jobs.push(Job::Ctor(params, body));
+                        if cp.ctor.is_none() {
+                            cp.ctor = Some(base + jobs.len() as u32);
+                        }
+                    }
+                    Stmt::VarDecl(v) => {
+                        let name = v.name.clone().unwrap_or_default();
+                        let getter = v.getter.as_ref().map(|g| {
+                            jobs.push(Job::Getter(g));
+                            base + jobs.len() as u32
+                        });
+                        let setter = v.setter.as_ref().map(|st| {
+                            jobs.push(Job::Setter(st));
+                            base + jobs.len() as u32
+                        });
+                        let ty = if v.is_static { None } else { Some(v.type_ref.as_ref().map_or(0, |t| self.type_id(&t.name))) };
+                        cp.fields.push(FieldDecl { name, access: Access::parse(v.access), getter, setter, ty });
+                    }
+                    _ => {}
+                }
             }
-        };
-        c.prog.protos[i + 1] = proto;
+            class_protos.insert(name.clone(), cp);
+        }
+        self.class_defs = defs;
+        self.build_classes(&class_order, &class_protos);
+
+        self.prog.protos.push(placeholder("<main>", id));
+        for _ in &jobs {
+            self.prog.protos.push(placeholder("", id));
+        }
+        let main = FnCompiler::new(self, false).compile_main(stmts);
+        self.prog.protos[base as usize] = main;
+        for (i, job) in jobs.iter().enumerate() {
+            let proto = match *job {
+                Job::Function(f) => FnCompiler::new(self, false).compile_callable(
+                    &f.name,
+                    &f.params,
+                    &f.body.statements,
+                    f.return_type.as_ref(),
+                    false,
+                ),
+                Job::Method(f) => FnCompiler::new(self, true).compile_callable(
+                    &f.name,
+                    &f.params,
+                    &f.body.statements,
+                    f.return_type.as_ref(),
+                    false,
+                ),
+                Job::Equals(f) => FnCompiler::new(self, true).compile_callable(&f.name, &f.params, &f.body.statements, None, true),
+                Job::Ctor(params, body) => {
+                    FnCompiler::new(self, true).compile_callable(lang.syntax.constructor_function_name, params, body, None, false)
+                }
+                Job::Getter(body) => FnCompiler::new(self, true).compile_callable("", &[], body, None, false),
+                Job::Setter(st) => {
+                    let params: Vec<ast::Param> =
+                        st.param.iter().map(|n| ast::Param { name: n.clone(), type_annotation: None, default: None }).collect();
+                    FnCompiler::new(self, true).compile_callable("", &params, &st.body, None, true)
+                }
+                Job::Init(body) => FnCompiler::new(self, true).compile_field_init(body),
+            };
+            self.prog.protos[base as usize + i + 1] = proto;
+        }
+
+        let classes = self.class_ids.iter().map(|(n, id)| (symbol::intern(n), *id)).collect();
+        self.prog.modules.push(ModuleInfo {
+            key: key.to_string(),
+            lang,
+            main: base,
+            globals: self.globals.iter().map(|(n, s)| (n.clone(), s.loc_global())).collect(),
+            global_range: (global_start, self.prog.globals.len() as u32),
+            functions: self.functions.clone(),
+            all_functions,
+            classes,
+            interfaces,
+            error_class: symbol::intern(lang.error_class),
+        });
     }
-    c.prog.global_names = c.globals.iter().map(|(n, s)| (n.clone(), s.loc_global())).collect();
-    Ok(c.prog)
+
+    /// The names an import binds where it stands (its items, or with `전부`
+    /// the functions of the module).
+    fn import_names(&self, module: &str, is_builtin: bool, all: bool, items: &[ast::ImportItem]) -> Vec<String> {
+        let mut names: Vec<String> =
+            items.iter().map(|i| if i.alias.is_empty() { i.name.clone() } else { i.alias.clone() }).collect();
+        if all {
+            if is_builtin {
+                if let Some((true, fns)) = (self.std_lookup)(self.lang.name, module) {
+                    names.extend(fns);
+                }
+            } else if let Some(Source::Ok(p, _)) = self.sources.get(&format!("file:{module}")) {
+                for s in &p.statements {
+                    if let Stmt::Function(f) = s {
+                        names.push(f.name.clone());
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// The names a scope's statements can declare, with whether any declaration
+    /// of the name has a type or is a constant (it then needs a meta slot).
+    /// Blocks of `만약`/`따라 나누자`/`일단 해보자` belong to the scope; loops,
+    /// functions and catch handlers open their own. An import declares what it binds.
+    fn declared_names(&self, stmts: &[Stmt]) -> Vec<(String, bool)> {
+        fn add(out: &mut Vec<(String, bool)>, name: &str, meta: bool) {
+            match out.iter_mut().find(|(n, _)| n == name) {
+                Some(e) => e.1 |= meta,
+                None => out.push((name.to_string(), meta)),
+            }
+        }
+        fn go(c: &Compiler, stmts: &[Stmt], out: &mut Vec<(String, bool)>) {
+            for s in stmts {
+                match s {
+                    Stmt::VarDecl(v) if !v.is_static => {
+                        if let Some(n) = &v.name {
+                            add(out, n, v.type_ref.is_some() || v.is_constant);
+                        }
+                    }
+                    Stmt::Input { target: Some(n), .. } => add(out, n, false),
+                    Stmt::Import { module, is_builtin, all, items } => {
+                        for n in c.import_names(module, *is_builtin, *all, items) {
+                            add(out, &n, false);
+                        }
+                    }
+                    Stmt::If { consequent, alternate, .. } => {
+                        go(c, &consequent.statements, out);
+                        if let Some(b) = alternate {
+                            go(c, &b.statements, out);
+                        }
+                    }
+                    Stmt::Switch { cases, .. } => {
+                        for case in cases {
+                            go(c, &case.consequent.statements, out);
+                        }
+                    }
+                    Stmt::Try { block, finalizer, .. } => {
+                        go(c, &block.statements, out);
+                        if let Some(f) = finalizer {
+                            go(c, &f.statements, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        go(self, stmts, &mut out);
+        out
+    }
+}
+
+/// Constructs this version cannot run yet; they fail before anything runs.
+fn check_supported(stmts: &[Stmt], lang: &Lang, std_lookup: StdLookup) -> Result<(), Unsupported> {
+    let mut problem: Option<String> = None;
+    walk_stmts(
+        stmts,
+        &mut |s| {
+            if let Stmt::Import { module, is_builtin: true, .. } = s {
+                if problem.is_none() {
+                    let package = module.contains('/') || std::path::Path::new("packages").join(module).exists();
+                    if package {
+                        problem = Some(format!("package [{module}]"));
+                    } else if let Some((false, _)) = std_lookup(lang.name, module) {
+                        problem = Some(format!("standard module [{module}]"));
+                    }
+                }
+            }
+        },
+        &mut |_| {},
+    );
+    match problem {
+        Some(p) => Err(Unsupported(p)),
+        None => Ok(()),
+    }
 }
 
 /// What gets compiled into a function body.
@@ -184,6 +386,9 @@ enum Job<'a> {
     Getter(&'a [Stmt]),
     /// Binds only the new value (to the parameter, when it has one).
     Setter(&'a ast::Setter),
+    /// A class's field initializers, for objects made where the class is not
+    /// known when compiling (an imported class).
+    Init(&'a [Stmt]),
 }
 
 /// The compiled parts of one class, in declaration order.
@@ -193,6 +398,7 @@ struct ClassProtos {
     methods: Vec<(String, u32, bool, Access)>,
     ctor: Option<u32>,
     equals: Option<u32>,
+    init: u32,
     fields: Vec<FieldDecl>,
 }
 
@@ -245,9 +451,10 @@ fn builtin_error_class(lang: &Lang) -> Stmt {
     }
 }
 
-fn placeholder(name: &str) -> Proto {
+fn placeholder(name: &str, module: u32) -> Proto {
     Proto {
         name: name.to_string(),
+        module,
         raw_params: false,
         code: Vec::new(),
         nregs: 0,
@@ -269,12 +476,21 @@ impl Slot {
 
 struct Compiler<'a> {
     prog: Program,
-    type_ids: HashMap<String, u32>,
+    type_ids: HashMap<(String, &'static str), u32>,
     str_consts: HashMap<String, u32>,
+    sources: &'a HashMap<String, Source>,
+    std_lookup: StdLookup<'a>,
+    module_ids: HashMap<String, u32>,
+
+    // The module being compiled.
+    lang: &'static Lang,
+    module: u32,
     globals: HashMap<String, Slot>,
     functions: HashMap<String, u32>,
     /// Class declarations by name (the built-in error class included).
     class_defs: HashMap<String, &'a Stmt>,
+    /// Class ids by name.
+    class_ids: HashMap<String, u32>,
 }
 
 impl<'a> Compiler<'a> {
@@ -318,6 +534,7 @@ impl<'a> Compiler<'a> {
                 ctor: None,
                 statics: HashMap::new(),
                 equals: protos[name].equals,
+                init: protos[name].init,
                 lineage: Vec::new(),
                 supertypes: HashSet::new(),
                 super_start: base.as_ref().map(|b| self.class_defs.contains_key(&b.name).then(|| symbol::intern(&b.name))),
@@ -369,7 +586,8 @@ impl<'a> Compiler<'a> {
                     info.statics.entry(symbol::intern(mname)).or_insert(*proto);
                 }
             }
-            self.prog.classes.insert(info.name, info);
+            self.class_ids.insert(name.clone(), self.prog.classes.len() as u32);
+            self.prog.classes.push(info);
         }
     }
 
@@ -404,12 +622,13 @@ impl<'a> Compiler<'a> {
     }
 
     fn type_id(&mut self, text: &str) -> u32 {
-        if let Some(&i) = self.type_ids.get(text) {
+        let key = (text.to_string(), self.lang.name);
+        if let Some(&i) = self.type_ids.get(&key) {
             return i;
         }
         let i = self.prog.types.len() as u32;
-        self.prog.types.push(TypeSpec::parse(text, self.prog.lang));
-        self.type_ids.insert(text.to_string(), i);
+        self.prog.types.push(TypeSpec::parse(text, self.lang));
+        self.type_ids.insert(key, i);
         i
     }
 
@@ -440,32 +659,6 @@ impl<'a> Compiler<'a> {
         let slot = Slot { loc, meta };
         self.globals.insert(name.to_string(), slot);
         slot
-    }
-
-    /// Fails for constructs of later milestones, before anything runs (Hana
-    /// validates classes before running, so a partial run would differ).
-    fn check_supported(&self, stmts: &[Stmt]) -> Result<(), Unsupported> {
-        let problem = std::cell::Cell::new(None);
-        let note = |what: Option<&'static str>| {
-            if problem.get().is_none() {
-                problem.set(what);
-            }
-        };
-        walk_stmts(stmts, &mut |s| {
-            note(match s {
-                Stmt::Import { .. } => Some("imports"),
-                _ => None,
-            })
-        }, &mut |e| {
-            note(match e {
-                Expr::FunctionRef(n) if n.starts_with('\'') || n.starts_with('『') => Some("reflection"),
-                _ => None,
-            })
-        });
-        match problem.get() {
-            Some(p) => Err(Unsupported(p.to_string())),
-            None => Ok(()),
-        }
     }
 }
 
@@ -585,52 +778,6 @@ fn walk_expr(x: &Expr, e: &mut dyn FnMut(&Expr)) {
     }
 }
 
-/// The names a scope's statements can declare, with whether any declaration
-/// of the name has a type or is a constant (it then needs a meta slot).
-/// Blocks of `만약`/`따라 나누자` belong to the scope; loops, functions and
-/// catch handlers open their own.
-fn declared_names(stmts: &[Stmt]) -> Vec<(String, bool)> {
-    fn go(stmts: &[Stmt], out: &mut Vec<(String, bool)>) {
-        for s in stmts {
-            match s {
-                Stmt::VarDecl(v) if !v.is_static => {
-                    if let Some(n) = &v.name {
-                        add(out, n, v.type_ref.is_some() || v.is_constant);
-                    }
-                }
-                Stmt::Input { target: Some(n), .. } => add(out, n, false),
-                Stmt::If { consequent, alternate, .. } => {
-                    go(&consequent.statements, out);
-                    if let Some(b) = alternate {
-                        go(&b.statements, out);
-                    }
-                }
-                Stmt::Switch { cases, .. } => {
-                    for c in cases {
-                        go(&c.consequent.statements, out);
-                    }
-                }
-                Stmt::Try { block, finalizer, .. } => {
-                    go(&block.statements, out);
-                    if let Some(f) = finalizer {
-                        go(&f.statements, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    fn add(out: &mut Vec<(String, bool)>, name: &str, meta: bool) {
-        match out.iter_mut().find(|(n, _)| n == name) {
-            Some(e) => e.1 |= meta,
-            None => out.push((name.to_string(), meta)),
-        }
-    }
-    let mut out = Vec::new();
-    go(stmts, &mut out);
-    out
-}
-
 struct Scope {
     names: HashMap<String, Slot>,
 }
@@ -687,6 +834,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
     fn finish(self, name: &str, params: Vec<Param>, return_type: u32, raw_params: bool) -> Proto {
         Proto {
             name: name.to_string(),
+            module: self.c.module,
             raw_params,
             code: self.code,
             nregs: self.max_reg,
@@ -735,7 +883,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
                     self.emit(Op::SetStatic { class, name, src: r });
                 }
                 Stmt::Assign { target: Expr::Member { object, property }, value } => {
-                    let plural = matches!(&**object, Expr::Identifier(o) if self.c.prog.lang.plural_self_words.contains(&o.as_str()));
+                    let plural = matches!(&**object, Expr::Identifier(o) if self.c.lang.plural_self_words.contains(&o.as_str()));
                     if let (true, Expr::Identifier(p)) = (plural, &**property) {
                         let r = self.alloc();
                         match value {
@@ -776,7 +924,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             params.push(Param { name: self.c.name(&p.name), slot: first_regs[i], meta, ty });
         }
         // A repeated parameter name is one variable: the later parameter's.
-        for (n, flags) in declared_names(body) {
+        for (n, flags) in self.c.declared_names(body) {
             match scope.names.get_mut(&n) {
                 Some(slot) => {
                     if flags && slot.meta.is_none() {
@@ -905,7 +1053,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             let loc = Loc::Reg(self.alloc());
             scope.names.insert(name.to_string(), Slot { loc, meta: None });
         }
-        for (name, flags) in declared_names(stmts) {
+        for (name, flags) in self.c.declared_names(stmts) {
             match scope.names.get_mut(&name) {
                 Some(slot) => {
                     if flags && slot.meta.is_none() {
@@ -1043,6 +1191,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
                 self.emit(Op::Throw { src: r });
             }
             Stmt::Try { block, handlers, finalizer } => self.try_stmt(block, handlers, finalizer.as_ref()),
+            Stmt::Import { module, is_builtin, all, items } => self.import(module, *is_builtin, *all, items),
             // Declarations Hana does not run where they stand.
             Stmt::Class { .. } | Stmt::Interface { .. } | Stmt::Constructor { .. } | Stmt::InterfaceMethod(_) => {}
             Stmt::ForRange { start, end, loop_var, body } => self.for_range(start, end, loop_var, body),
@@ -1078,7 +1227,6 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             // A function runs only when called; a declaration elsewhere than
             // the top level is never found (Hana ignores it).
             Stmt::Function(_) => {}
-            _ => self.unsupported("statement"),
         }
         self.next_reg = mark;
     }
@@ -1226,6 +1374,90 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         }
     }
 
+    /// Where a name an import binds goes: the innermost scope (Hana's
+    /// `env.Declare`), which declared it.
+    fn bind_slot(&self, name: &str) -> Loc {
+        match self.scopes.last() {
+            Some(scope) => scope.names[name].loc,
+            None => self.c.globals[name].loc,
+        }
+    }
+
+    /// `...에서 ...을 가져오자`: loads the module when it runs, then binds.
+    fn import(&mut self, module: &str, is_builtin: bool, all: bool, items: &[ast::ImportItem]) {
+        let native = items.iter().any(|i| i.name.starts_with(self.c.lang.native_prefix));
+        let kind = if is_builtin && native {
+            // A package's native library (Hana's ABI); there is no such package here.
+            ImportKind::Fail { code: "ImportError.ImportDLLNotFound".to_string(), args: vec![module.to_string()] }
+        } else if is_builtin {
+            ImportKind::Std(module.to_string())
+        } else {
+            let key = format!("file:{module}");
+            match (self.c.module_ids.get(&key), self.c.sources.get(&key)) {
+                (Some(&m), _) => ImportKind::File(m),
+                (None, Some(Source::Fail(code, arg))) => ImportKind::Fail { code: code.to_string(), args: vec![arg.clone()] },
+                _ => ImportKind::Fail { code: "ImportError.ImportFileNotFound".to_string(), args: vec![module.to_string()] },
+            }
+        };
+        let items: Vec<(String, String, Loc)> = items
+            .iter()
+            .map(|i| {
+                let bind = if i.alias.is_empty() { i.name.clone() } else { i.alias.clone() };
+                let slot = self.bind_slot(&bind);
+                (i.name.clone(), bind, slot)
+            })
+            .collect();
+        let aliased = items.iter().filter(|(n, b, _)| n != b).map(|(n, _, _)| symbol::intern(n)).collect();
+        let mut all_slots = HashMap::new();
+        if all {
+            for n in self.c.import_names(module, is_builtin, true, &[]) {
+                let slot = self.bind_slot(&n);
+                all_slots.insert(n, slot);
+            }
+        }
+        let import = self.c.prog.imports.len() as u32;
+        self.c.prog.imports.push(ImportInfo { kind, source: module.to_string(), all, items, all_slots, aliased });
+        self.emit(Op::Import { import });
+    }
+
+    /// A class's field initializers as a body of their own (run on `this`).
+    fn compile_field_init(mut self, body: &[Stmt]) -> Proto {
+        let obj = self.alloc();
+        self.emit(Op::GetThis { dst: obj });
+        for s in body {
+            let mark = self.next_reg;
+            match s {
+                Stmt::VarDecl(v) if !v.is_static => {
+                    let r = self.alloc();
+                    match &v.value {
+                        Some(e) => self.expr_to(e, r),
+                        None => {
+                            self.emit(Op::LoadNull { dst: r });
+                        }
+                    }
+                    let name = self.c.name(v.name.as_deref().unwrap_or(""));
+                    let ty = v.type_ref.as_ref().map_or(0, |t| self.c.type_id(&t.name));
+                    self.emit(Op::InitField { obj, name, src: r, ty });
+                }
+                Stmt::Assign { target: Expr::Identifier(n), value } => {
+                    let r = self.alloc();
+                    match value {
+                        Some(e) => self.expr_to(e, r),
+                        None => {
+                            self.emit(Op::LoadNull { dst: r });
+                        }
+                    }
+                    let name = self.c.name(n);
+                    self.emit(Op::InitField { obj, name, src: r, ty: 0 });
+                }
+                _ => {}
+            }
+            self.next_reg = mark;
+        }
+        self.emit(Op::ReturnNull);
+        self.finish("", Vec::new(), 0, false)
+    }
+
     /// `일단 해보자`: the block, handlers chosen by the thrown value's class,
     /// and a `마무리는 항상` that runs on every way out.
     fn try_stmt(&mut self, block: &Block, handlers: &[ast::CatchClause], finalizer: Option<&Block>) {
@@ -1309,7 +1541,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         self.expr_to(end, e);
         let step = self.alloc();
         self.emit(Op::RangePrep { start: v, end: e, step });
-        let name = if loop_var.is_empty() { self.c.prog.lang.default_index } else { loop_var };
+        let name = if loop_var.is_empty() { self.c.lang.default_index } else { loop_var };
         let (from, to) = self.open_scope(&[name], &body.statements);
         let var_slot = self.slot_reg(name);
         self.definite.push(var_slot);
@@ -1332,7 +1564,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
 
     fn for_each(&mut self, list: &Expr, body: &Block) {
         // `'목록'의 '항목'마다`: the member expression names the list and the item.
-        let lang = self.c.prog.lang;
+        let lang = self.c.lang;
         let (iterable, item) = match list {
             Expr::Member { object, property } => match &**property {
                 Expr::Identifier(n) => (&**object, n.as_str()),
@@ -1394,11 +1626,11 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             Expr::Null => {
                 self.emit(Op::LoadNull { dst });
             }
-            Expr::Identifier(n) if self.c.prog.lang.self_words.contains(&n.as_str()) => {
+            Expr::Identifier(n) if self.c.lang.self_words.contains(&n.as_str()) => {
                 let var = self.var(n);
                 self.emit(Op::SelfOr { dst, var });
             }
-            Expr::Identifier(n) if self.c.prog.lang.plural_self_words.contains(&n.as_str()) => {
+            Expr::Identifier(n) if self.c.lang.plural_self_words.contains(&n.as_str()) => {
                 let var = self.var(n);
                 self.emit(Op::StaticOr { dst, var });
             }
@@ -1586,7 +1818,27 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         self.emit(Op::Enter);
         self.open_calls += 1;
         let argc = args.len() as u16;
+        let quote = self.c.lang.var_quote;
+        let quoted = |n: &str| n.starts_with(quote.0) && n.ends_with(quote.1) && n.len() > quote.0.len() + quote.1.len();
         match callee {
+            // `<'변수'>()`: the function the variable names.
+            Expr::FunctionRef(name) if quoted(name) => {
+                let callee = self.alloc();
+                self.reflect(name, callee, true);
+                let base = self.args(args);
+                self.emit(Op::CallValue { dst, callee, base, argc });
+            }
+            // `'객체'의 <'변수'>()`: the method the variable names.
+            Expr::Member { object, property } if matches!(&**property, Expr::FunctionRef(n) if quoted(n)) => {
+                let Expr::FunctionRef(name) = &**property else { unreachable!() };
+                let method = self.alloc();
+                self.reflect(name, method, false);
+                let obj = self.alloc();
+                self.expr_to(object, obj);
+                self.emit(Op::MethodPrepDyn { obj, name: method });
+                let base = self.args(args);
+                self.emit(Op::CallMethodDyn { dst, obj, name: method, base, argc });
+            }
             Expr::FunctionRef(name) => self.call_named(name, args, dst),
             // `TYPE의 〈함수〉()` where TYPE is not a class: a plain call.
             Expr::Member { object, property }
@@ -1668,7 +1920,16 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
                 self.next_reg = mark;
             }
         }
-        match self.c.prog.classes.get(&sym).and_then(|c| c.ctor) {
+        if !self.c.class_defs.contains_key(&name) {
+            // A class this module does not declare (imported): found when it runs.
+            self.emit(Op::InitFieldsDyn { obj: dst });
+            let base = self.args(args);
+            self.emit(Op::CallCtorDyn { obj: dst, base, argc: args.len() as u16 });
+            self.open_calls -= 1;
+            return;
+        }
+        let ctor = self.c.class_ids.get(&name).and_then(|&id| self.c.prog.classes[id as usize].ctor);
+        match ctor {
             Some(proto) => {
                 let base = self.args(args);
                 self.emit(Op::CallCtor { obj: dst, proto, class: sym, base, argc: args.len() as u16 });
@@ -1678,6 +1939,18 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             }
         }
         self.open_calls -= 1;
+    }
+
+    /// A reflected name `'변수'` (quotes included): `resolve` gives the
+    /// function value it names, else just the name.
+    fn reflect(&mut self, quoted: &str, dst: Reg, resolve: bool) {
+        let q = self.c.lang.var_quote;
+        let inner = &quoted[q.0.len()..quoted.len() - q.1.len()];
+        let var = self.var(inner);
+        let site = self.c.prog.consts.len() as u32; // a unique number per site
+        self.c.prog.consts.push(Value::NULL);
+        let quoted = self.c.name(quoted);
+        self.emit(Op::Reflect { dst, site: if resolve { site } else { site | 1 << 31 }, var, quoted });
     }
 
     fn call_named(&mut self, name: &str, args: &[Expr], dst: Reg) {
@@ -1705,7 +1978,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
                     self.emit(Op::LoadK { dst: r, k });
                 }
                 TemplatePart::Code(code) => {
-                    let e = parse_embedded(&code, self.c.prog.lang);
+                    let e = parse_embedded(&code, self.c.lang);
                     self.expr_to(&e, r);
                     self.emit(Op::Format { dst: r, src: r });
                 }
