@@ -101,8 +101,64 @@ pub(super) fn invoke(vm: &mut Vm, code: Code, fi: usize, start: usize) -> Done {
 
 enum State {
     Untried,
+    /// On the compiling thread.
+    Compiling,
     Failed,
     Ready(Code),
+}
+
+/// A function's IR for the compiling thread.
+struct Job {
+    proto: u32,
+    func: cranelift_codegen::ir::Function,
+    /// With the optimizer (it has loops in registers).
+    optimized: bool,
+}
+
+/// What came back: the machine code and its alignment, or why not.
+struct Compiled {
+    proto: u32,
+    code: Result<(Vec<u8>, u64), String>,
+}
+
+/// The compiling thread: Cranelift's work on a function's IR is most of the
+/// time a compile takes, and the program goes on meanwhile (interpreted)
+/// instead of waiting.
+struct Worker {
+    jobs: std::sync::mpsc::Sender<Job>,
+    done: std::sync::mpsc::Receiver<Compiled>,
+    /// When each function in flight was sent (for HARU_JIT_DEBUG).
+    sent: HashMap<u32, std::time::Instant>,
+}
+
+impl Worker {
+    fn start(plain: cranelift_codegen::isa::OwnedTargetIsa, optimized: cranelift_codegen::isa::OwnedTargetIsa) -> Option<Worker> {
+        let (jobs, inbox) = std::sync::mpsc::channel::<Job>();
+        let (outbox, done) = std::sync::mpsc::channel::<Compiled>();
+        std::thread::Builder::new()
+            .name("haru-jit".into())
+            .spawn(move || {
+                for job in inbox {
+                    let isa = if job.optimized { &*optimized } else { &*plain };
+                    let mut ctx = Context::for_function(job.func);
+                    let code = match ctx.compile(isa, &mut Default::default()) {
+                        // No relocations: helpers are called by address and
+                        // constants live in the code.
+                        Ok(c) if c.buffer.relocs().is_empty() => {
+                            let align = (c.buffer.alignment as u64).max(16);
+                            Ok((c.code_buffer().to_vec(), align))
+                        }
+                        Ok(_) => Err("relocations".to_string()),
+                        Err(e) => Err(format!("{:?}", e.inner)),
+                    };
+                    if outbox.send(Compiled { proto: job.proto, code }).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Worker { jobs, done, sent: HashMap::new() })
+    }
 }
 
 /// Where an `Rc`'s strong count is, before the value its pointer points at
@@ -154,6 +210,8 @@ const IC_EMPTY: Ic = Ic { class: NONE, pos: 0, check: 0, access: 0 };
 pub(super) struct Jit {
     /// What functions with loops in registers are compiled for.
     loop_isa: cranelift_codegen::isa::OwnedTargetIsa,
+    /// The compiling thread (none: compile where asked, as with threshold 0).
+    worker: Option<Worker>,
     /// Whether compiled code counts references itself (`rc_layout_holds`).
     inline_rc: bool,
     /// Where an object's properties are inside it (through the `RefCell`).
@@ -192,6 +250,11 @@ impl Jit {
         // Functions with loops in registers: the optimizer takes the checks
         // and moves the copy repeats out of their loops.
         let loop_isa = isa_with("speed")?;
+        // Threshold 0 (tests) compiles each function before it first runs.
+        let worker = match threshold > 0 && std::env::var_os("HARU_JIT_SYNC").is_none() {
+            true => Worker::start(isa.clone(), loop_isa.clone()),
+            false => None,
+        };
         let module = JITModule::new(JITBuilder::with_isa(isa, cranelift_module::default_libcall_names()));
         let ctx = module.make_context();
         // Compiled code writes `Post::Value` as 0.
@@ -200,6 +263,7 @@ impl Jit {
         }
         Some(Jit {
             loop_isa,
+            worker,
             inline_rc: rc_layout_holds() && std::env::var_os("HARU_JIT_NO_INLINE_RC").is_none(),
             off_props: {
                 let o = ObjObj { class: 0, props: Default::default() };
@@ -223,6 +287,13 @@ impl Jit {
         match self.states[id as usize] {
             State::Ready(c) => Some(c),
             State::Failed => None,
+            State::Compiling => {
+                self.install_finished(prog);
+                match self.states[id as usize] {
+                    State::Ready(c) => Some(c),
+                    _ => None,
+                }
+            }
             State::Untried => {
                 // Compiling takes time in proportion to the function's size, so a
                 // bigger one must have run longer first.
@@ -242,6 +313,23 @@ impl Jit {
                 }
                 let started = std::time::Instant::now();
                 self.ics[id as usize] = vec![IC_EMPTY; prog.protos[id as usize].code.len()].into_boxed_slice();
+                if self.worker.is_some() {
+                    // The IR here, the rest on the compiling thread; the
+                    // interpreter goes on until the code is back.
+                    self.states[id as usize] = match self.build_ir(id, prog) {
+                        Some(optimized) => {
+                            let func = std::mem::replace(&mut self.ctx.func, cranelift_codegen::ir::Function::new());
+                            let w = self.worker.as_mut().unwrap();
+                            w.sent.insert(id, started);
+                            match w.jobs.send(Job { proto: id, func, optimized }) {
+                                Ok(()) => State::Compiling,
+                                Err(_) => State::Failed,
+                            }
+                        }
+                        None => State::Failed,
+                    };
+                    return None;
+                }
                 let c = self.compile(id, prog);
                 if std::env::var_os("HARU_JIT_DEBUG").is_some() {
                     let p = &prog.protos[id as usize];
@@ -273,7 +361,49 @@ impl Jit {
         self.module.define_function_bytes(id, align, &bytes, &[]).map_err(|e| format!("{e:?}"))
     }
 
-    fn compile(&mut self, proto_id: u32, prog: &Program) -> Option<Code> {
+    /// Takes in the functions the compiling thread has finished.
+    fn install_finished(&mut self, prog: &Program) {
+        let Some(w) = self.worker.as_mut() else { return };
+        let finished: Vec<Compiled> = w.done.try_iter().collect();
+        for Compiled { proto, code } in finished {
+            let sent = self.worker.as_mut().unwrap().sent.remove(&proto);
+            let installed = code.and_then(|(bytes, align)| {
+                let id = self.module.declare_anonymous_function(&self.signature()).map_err(|e| format!("{e:?}"))?;
+                self.module.define_function_bytes(id, align, &bytes, &[]).map_err(|e| format!("{e:?}"))?;
+                self.module.finalize_definitions().map_err(|e| format!("{e:?}"))?;
+                Ok(unsafe { mem::transmute::<*const u8, Code>(self.module.get_finalized_function(id)) })
+            });
+            if std::env::var_os("HARU_JIT_DEBUG").is_some() {
+                let p = &prog.protos[proto as usize];
+                let took = sent.map(|t| format!("{:?}", t.elapsed())).unwrap_or_default();
+                match &installed {
+                    Ok(_) => eprintln!("jit: {} ({} ops): ready after {took} (compiled meanwhile)", p.name, p.code.len()),
+                    Err(e) => eprintln!("jit: {}: {e}", p.name),
+                }
+            }
+            self.states[proto as usize] = match installed {
+                Ok(c) => {
+                    self.table[proto as usize] = c as usize;
+                    self.natives[proto as usize] = prog.protos[proto as usize].code.iter().map(|op| native(op, prog)).collect();
+                    State::Ready(c)
+                }
+                Err(_) => State::Failed,
+            };
+        }
+    }
+
+    /// What compiled code is called as: `(env) -> status`.
+    fn signature(&self) -> Signature {
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.module.target_config().pointer_type()));
+        sig.returns.push(AbiParam::new(types::I32));
+        sig
+    }
+
+    /// Builds function `proto_id`'s IR in `ctx`; whether it has loops in
+    /// registers (to be compiled with the optimizer), or None when it is
+    /// not to be compiled.
+    fn build_ir(&mut self, proto_id: u32, prog: &Program) -> Option<bool> {
         let proto = &prog.protos[proto_id as usize];
         if proto.code.is_empty() || std::env::var_os("HARU_JIT_SKIP").is_some_and(|s| s.to_str() == Some(&proto.name)) {
             return None;
@@ -281,10 +411,7 @@ impl Jit {
         let ptr = self.module.target_config().pointer_type();
         let cc = self.module.isa().default_call_conv();
         self.module.clear_context(&mut self.ctx);
-        let sig = &mut self.ctx.func.signature;
-        sig.params.push(AbiParam::new(ptr));
-        sig.returns.push(AbiParam::new(types::I32));
-        let id = self.module.declare_anonymous_function(&self.ctx.func.signature).ok()?;
+        self.ctx.func.signature = self.signature();
         let has_loops = {
             let b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
             let ics = self.ics[proto_id as usize].as_mut_ptr();
@@ -300,9 +427,16 @@ impl Jit {
                 proto.code.len()
             );
         }
+        Some(has_loops && std::env::var_os("HARU_JIT_OPT").is_none())
+    }
+
+    fn compile(&mut self, proto_id: u32, prog: &Program) -> Option<Code> {
+        let proto = &prog.protos[proto_id as usize];
+        let has_loops = self.build_ir(proto_id, prog)?;
+        let id = self.module.declare_anonymous_function(&self.ctx.func.signature).ok()?;
         let dump = std::env::var_os("HARU_JIT_DUMP").is_some_and(|d| d.to_str() == Some(&proto.name));
         self.ctx.set_disasm(dump);
-        let defined = if has_loops && std::env::var_os("HARU_JIT_OPT").is_none() {
+        let defined = if has_loops {
             self.define_optimized(id)
         } else {
             self.module.define_function(id, &mut self.ctx).map_err(|e| format!("{e:?}"))
