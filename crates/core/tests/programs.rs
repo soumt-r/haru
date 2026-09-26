@@ -24,9 +24,11 @@ fn a_function_declared_in_a_block_is_never_found() {
 }
 
 #[test]
-fn break_and_return_at_the_top_level_are_errors() {
+fn top_level_break_is_an_error_and_return_ends_the_program() {
     assert_eq!(hari("\"전\"을 출력하자\n반복을 끝내자\n"), "전\n런타임 오류: IllegalBreakError: '반복을 끝내자'는 반복 안에서만 쓸 수 있어요.\n");
-    assert_eq!(hari("\"전\"을 출력하자\n1을 돌려주자\n"), "전\n런타임 오류: return\n");
+    assert_eq!(hari("\"전\"을 출력하자\n1을 돌려주자\n\"후\"를 출력하자\n"), "전\n");
+    let finally = "일단 해보자:\n    2를 돌려주자\n마무리는 항상:\n    \"마무리\"를 출력하자\n\"뒤\"를 출력하자\n";
+    assert_eq!(hari(finally), "마무리\n");
 }
 
 #[test]

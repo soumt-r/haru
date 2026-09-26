@@ -338,11 +338,12 @@ impl<'p> Vm<'p> {
         let result = loop {
             match self.exec() {
                 Ok(()) => break Ok(()),
-                Err(signal) => {
-                    if let Err(s) = self.unwind(signal) {
-                        break Err(signal_error(s));
-                    }
-                }
+                Err(signal) => match self.unwind(signal) {
+                    // A 돌려주자 at the top level ends the program.
+                    Err(Signal::Return(_)) => break Ok(()),
+                    Err(s) => break Err(signal_error(s)),
+                    Ok(()) => {}
+                },
             }
         };
         self.flush();
@@ -368,6 +369,11 @@ impl<'p> Vm<'p> {
                 let frame = self.frames.pop().unwrap();
                 self.stack.truncate(frame.base);
                 return Err(signal);
+            }
+            if let (Post::ModuleInit(_), Signal::Return(_)) = (frame.post, &signal) {
+                // A 돌려주자 at a module's top level ends its code: loaded.
+                self.finish_call(Value::NULL, false)?;
+                return Ok(());
             }
             if let Post::ModuleInit(m) = frame.post {
                 // The import fails with it; the module may be loaded again later.
