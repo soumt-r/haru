@@ -1170,6 +1170,18 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
     /// comparison that ends the condition jumps by itself instead of making a
     /// boolean first (its register is the condition's own, read by nothing else).
     fn jump_if_false(&mut self, cond: Reg) -> usize {
+        // `==` keeps a `JumpIfFalse` after it (see `Op::EqJump`).
+        let eq = match self.code.last() {
+            Some(&Op::Eq { dst, a, b, neg }) if dst == cond => Some(Op::EqJump { a, b, neg, dst, to: 0 }),
+            Some(&Op::EqK { dst, a, k, neg }) if dst == cond => Some(Op::EqKJump { a, k, neg, dst, to: 0 }),
+            _ => None,
+        };
+        if let Some(op) = eq {
+            self.code.pop();
+            let at = self.emit(op);
+            self.emit(Op::JumpIfFalse { cond, to: 0 });
+            return at;
+        }
         let fused = match self.code.last() {
             Some(&Op::BinK { op, dst, a, k }) if dst == cond && op.is_comparison() => Some(Op::CmpKJump { op, a, k, to: 0 }),
             Some(&Op::Bin { op, dst, a, b }) if dst == cond && op.is_comparison() => Some(Op::CmpJump { op, a, b, to: 0 }),
@@ -1195,9 +1207,14 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             | Op::JumpIfTrue { to, .. }
             | Op::CmpJump { to, .. }
             | Op::CmpKJump { to, .. } => *to = target,
+            Op::EqJump { to, .. } | Op::EqKJump { to, .. } => {
+                *to = target;
+                // And the jump after it (for objects deciding `==`).
+                self.patch_jump(at + 1, target);
+            }
             Op::RangeTest { exit, .. } | Op::IterNext { exit, .. } => *exit = target,
             Op::ArgGiven { skip, .. } | Op::Member { skip, .. } | Op::SetMember { skip, .. } => *skip = target,
-            Op::SetIndexFail { skip, .. } => *skip = target,
+            Op::SetIndexFail { skip, .. } | Op::UpdateK { skip, .. } => *skip = target,
             other => panic!("not a jump: {other:?}"),
         }
     }
@@ -1460,6 +1477,16 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         // `'x'에 y를 더하자` is `x = x + y`: one instruction, so a string can grow in place.
         if let (Expr::Identifier(n), Some(Expr::Binary { left, op, right })) = (target, value) {
             if matches!(&**left, Expr::Identifier(m) if m == n) && (op == "+" || op == "-") {
+                // With a number: the common case in one instruction first.
+                let fast = match &**right {
+                    Expr::Number(x) => {
+                        let var = self.var(n);
+                        let k = self.c.num_const(if *x == 0.0 { 0.0 } else { *x });
+                        let op = if op == "+" { BinOp::Add } else { BinOp::Sub };
+                        Some(self.emit(Op::UpdateK { var, k, op, skip: 0 }))
+                    }
+                    _ => None,
+                };
                 let a = self.alloc();
                 self.get_var(n, a);
                 let b = self.alloc();
@@ -1467,6 +1494,10 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
                 let var = self.var(n);
                 let op = if op == "+" { BinOp::Add } else { BinOp::Sub };
                 self.emit(Op::Update { var, a, b, op });
+                if let Some(at) = fast {
+                    let here = self.here();
+                    self.patch_jump(at, here);
+                }
                 return;
             }
         }
@@ -1930,6 +1961,18 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             let k = self.c.num_const(if *n == 0.0 { 0.0 } else { *n });
             self.emit(Op::BinK { op, dst, a, k });
             return;
+        }
+        // `==` / `!=` against a number or a string: the constant itself.
+        if matches!(op, "==" | "!=") {
+            let k = match right {
+                Expr::Number(n) => Some(self.c.num_const(if *n == 0.0 { 0.0 } else { *n })),
+                Expr::Str(raw) => Some(self.c.str_const(&unescape(raw))),
+                _ => None,
+            };
+            if let Some(k) = k {
+                self.emit(Op::EqK { dst, a, k, neg: op == "!=" });
+                return;
+            }
         }
         let b = self.operand(right);
         let kind = match op {

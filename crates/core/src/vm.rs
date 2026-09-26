@@ -974,6 +974,37 @@ impl<'p> Vm<'p> {
                             _ => tri!(self.assign(var, fi, result)),
                         }
                     }
+                    Op::UpdateK { var, k, op, skip } => {
+                        let v = &prog.vars[var as usize];
+                        if let ([Slot { loc: loc @ (Loc::Reg(_) | Loc::Global(_)), meta }], Some(y)) =
+                            (v.slots.as_slice(), prog.consts[k as usize].as_num())
+                        {
+                            let cur = match *loc {
+                                Loc::Reg(r) => &reg!(r),
+                                Loc::Global(g) => &self.globals[g as usize],
+                                Loc::This(_) => unreachable!(),
+                            };
+                            if let Some(x) = cur.as_num() {
+                                let result = boxed(if op == BinOp::Add { x + y } else { x - y });
+                                // A type that takes the number, and not 고정.
+                                let fine = match meta {
+                                    None => true,
+                                    Some(m) => {
+                                        let (declared, constant) = meta_parts(&self.get(*m, fi));
+                                        !constant && (declared == 0 || self.fits(declared, &result))
+                                    }
+                                };
+                                if fine {
+                                    match *loc {
+                                        Loc::Reg(r) => reg!(r) = result,
+                                        Loc::Global(g) => self.globals[g as usize] = result,
+                                        Loc::This(_) => unreachable!(),
+                                    }
+                                    pc = skip as usize;
+                                }
+                            }
+                        }
+                    }
                     Op::Undef { from, to } => {
                         for r in from..to {
                             reg!(r) = Value::UNDEF;
@@ -1008,6 +1039,40 @@ impl<'p> Vm<'p> {
                         }
                         let eq = reg!(a).go_eq(&reg!(b));
                         reg!(dst) = Value::bool(eq != neg);
+                    }
+                    Op::EqK { dst, a, k, neg } => {
+                        let c = &prog.consts[k as usize];
+                        if let Some(o) = reg!(a).as_object() {
+                            if let Some(eq) = self.class(o.class).and_then(|c| c.equals) {
+                                // The method takes the constant as its argument.
+                                let (class, this) = (o.class, reg!(a).clone());
+                                reg!(dst) = c.clone();
+                                enter!(pc, self.call_proto(eq, base + dst as usize, 1, dst, this, class, Post::Equals { neg }, false));
+                            }
+                        }
+                        let eq = reg!(a).go_eq(c);
+                        reg!(dst) = Value::bool(eq != neg);
+                    }
+                    Op::EqJump { a, b, neg, dst, to } => {
+                        if let Some(o) = reg!(a).as_object() {
+                            if let Some(eq) = self.class(o.class).and_then(|c| c.equals) {
+                                // Its result goes to the `JumpIfFalse` after this.
+                                let (class, this) = (o.class, reg!(a).clone());
+                                enter!(pc, self.call_proto(eq, base + b as usize, 1, dst, this, class, Post::Equals { neg }, false));
+                            }
+                        }
+                        pc = if reg!(a).go_eq(&reg!(b)) != neg { pc + 1 } else { to as usize };
+                    }
+                    Op::EqKJump { a, k, neg, dst, to } => {
+                        let c = &prog.consts[k as usize];
+                        if let Some(o) = reg!(a).as_object() {
+                            if let Some(eq) = self.class(o.class).and_then(|c| c.equals) {
+                                let (class, this) = (o.class, reg!(a).clone());
+                                reg!(dst) = c.clone();
+                                enter!(pc, self.call_proto(eq, base + dst as usize, 1, dst, this, class, Post::Equals { neg }, false));
+                            }
+                        }
+                        pc = if reg!(a).go_eq(c) != neg { pc + 1 } else { to as usize };
                     }
                     Op::Truth { dst, src } => {
                         let v = &reg!(src);

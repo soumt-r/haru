@@ -52,6 +52,14 @@ fn slots_of(op: &Op, prog: &Program) -> Option<Vec<At>> {
         Op::SetGlobal { slot, src } => vec![G(slot), R(src)],
         Op::Bin { dst, a, b, .. } | Op::Eq { dst, a, b, .. } => vec![R(dst), R(a), R(b)],
         Op::BinK { dst, a, k, .. } if num(k) => vec![R(dst), R(a)],
+        Op::EqK { dst, a, k, .. } if num(k) => vec![R(dst), R(a)],
+        Op::UpdateK { var, k, .. } if num(k) => match prog.vars[var as usize].slots.as_slice() {
+            [Slot { loc: Loc::Reg(r), meta: None | Some(Loc::Reg(_) | Loc::Global(_)) }] => vec![R(*r)],
+            [Slot { loc: Loc::Global(g), meta: None | Some(Loc::Reg(_) | Loc::Global(_)) }] => vec![G(*g)],
+            _ => return None,
+        },
+        Op::EqJump { a, b, dst, .. } => vec![R(a), R(b), R(dst)],
+        Op::EqKJump { a, k, dst, .. } if num(k) => vec![R(a), R(dst)],
         Op::Truth { dst, src } => vec![R(dst), R(src)],
         Op::Jump { .. } => vec![],
         Op::JumpIfFalse { cond, .. } | Op::JumpIfTrue { cond, .. } => vec![R(cond)],
@@ -79,7 +87,7 @@ fn slots_of(op: &Op, prog: &Program) -> Option<Vec<At>> {
 /// The meta slot of a typed variable an `Update` changes, if any.
 fn update_meta(op: &Op, prog: &Program) -> Option<At> {
     match *op {
-        Op::Update { var, .. } => match prog.vars[var as usize].slots.first()?.meta? {
+        Op::Update { var, .. } | Op::UpdateK { var, .. } => match prog.vars[var as usize].slots.first()?.meta? {
             Loc::Reg(r) => Some(At::Reg(r)),
             Loc::Global(g) => Some(At::Global(g)),
             Loc::This(_) => None,
@@ -356,6 +364,59 @@ impl Gen<'_, '_> {
                 let eq = if neg { self.b.ins().bxor_imm(eq, 1) } else { eq };
                 self.set_bool(r, R(dst), eq);
                 self.spec_next(r, pc);
+            }
+            Op::UpdateK { var, k, op, skip } => {
+                // The meta was checked on entry; a number changes here, else
+                // the instructions after it do it.
+                let target = match self.prog.vars[var as usize].slots[0].loc {
+                    Loc::Reg(reg) => R(reg),
+                    Loc::Global(g) => G(g),
+                    Loc::This(_) => unreachable!(),
+                };
+                let is_num = self.is(r, target, TAG_NUM);
+                let (go, next) = (self.b.create_block(), self.to(r, pc + 1));
+                self.b.ins().brif(is_num, go, &[], next, &[]);
+                self.switch(go);
+                let x = self.num(r, target);
+                let y = self.b.ins().f64const(self.prog.consts[k as usize].as_num().unwrap());
+                let n = if op == BinOp::Add { self.b.ins().fadd(x, y) } else { self.b.ins().fsub(x, y) };
+                let n = self.boxed(n);
+                self.set_num(r, target, n);
+                let skip = self.to(r, skip as usize);
+                self.b.ins().jump(skip, &[]);
+            }
+            Op::EqK { dst, a, k, neg } => {
+                let (x, _) = self.nums(r, pc, R(a), None);
+                let y = self.b.ins().f64const(self.prog.consts[k as usize].as_num().unwrap());
+                let cc = if neg { FloatCC::NotEqual } else { FloatCC::Equal };
+                let c = self.b.ins().fcmp(cc, x, y);
+                self.set_bool(r, R(dst), c);
+                self.spec_next(r, pc);
+            }
+            Op::EqJump { a, b, neg, to, .. } => {
+                // Two numbers, or two booleans; anything else leaves.
+                let (na, nb) = (self.is(r, R(a), TAG_NUM), self.is(r, R(b), TAG_NUM));
+                let nums = self.b.ins().band(na, nb);
+                let (ba, bb) = (self.is(r, R(a), TAG_BOOL), self.is(r, R(b), TAG_BOOL));
+                let bools = self.b.ins().band(ba, bb);
+                let either = self.b.ins().bor(nums, bools);
+                self.guard(r, pc, either);
+                let (x, y) = (self.num(r, R(a)), self.num(r, R(b)));
+                let fe = self.b.ins().fcmp(FloatCC::Equal, x, y);
+                let (bx, by) = (self.bv(r, R(a)), self.bv(r, R(b)));
+                let be = self.b.ins().icmp(IntCC::Equal, bx, by);
+                let eq = self.b.ins().select(nums, fe, be);
+                let eq = if neg { self.b.ins().bxor_imm(eq, 1) } else { eq };
+                let (past, to) = (self.to(r, pc + 2), self.to(r, to as usize));
+                self.b.ins().brif(eq, past, &[], to, &[]);
+            }
+            Op::EqKJump { a, k, neg, to, .. } => {
+                let (x, _) = self.nums(r, pc, R(a), None);
+                let y = self.b.ins().f64const(self.prog.consts[k as usize].as_num().unwrap());
+                let cc = if neg { FloatCC::NotEqual } else { FloatCC::Equal };
+                let c = self.b.ins().fcmp(cc, x, y);
+                let (past, to) = (self.to(r, pc + 2), self.to(r, to as usize));
+                self.b.ins().brif(c, past, &[], to, &[]);
             }
             Op::Truth { dst, src } => {
                 let ok = self.is(r, R(src), TAG_BOOL);

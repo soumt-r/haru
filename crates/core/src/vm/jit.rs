@@ -996,6 +996,32 @@ unsafe extern "C" fn h_op(env: *mut Env, pc: u32) -> u32 {
             *reg(val) = Value::UNDEF;
             next
         }
+        Op::EqK { dst, a, k, neg } => {
+            if let Some(o) = reg(a).as_object() {
+                if vm.class(o.class).and_then(|c| c.equals).is_some() {
+                    return SLOW;
+                }
+            }
+            let eq = reg(a).go_eq(&prog.consts[k as usize]);
+            *reg(dst) = Value::bool(eq != neg);
+            next
+        }
+        Op::EqJump { a, b, neg, to, .. } => {
+            if let Some(o) = reg(a).as_object() {
+                if vm.class(o.class).and_then(|c| c.equals).is_some() {
+                    return SLOW;
+                }
+            }
+            if reg(a).go_eq(reg(b)) != neg { pc + 2 } else { to }
+        }
+        Op::EqKJump { a, k, neg, to, .. } => {
+            if let Some(o) = reg(a).as_object() {
+                if vm.class(o.class).and_then(|c| c.equals).is_some() {
+                    return SLOW;
+                }
+            }
+            if reg(a).go_eq(&prog.consts[k as usize]) != neg { pc + 2 } else { to }
+        }
         Op::Eq { dst, a, b, neg } => {
             // An object whose class has `<기호 같다>` decides itself.
             if let Some(o) = reg(a).as_object() {
@@ -1604,6 +1630,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 Some(y) => self.binary(i, op, dst, a, None, Some(y)),
                 None => self.step(i),
             },
+            Op::UpdateK { var, k, op, skip } => self.update_k(i, var, k, op, skip),
             Op::Update { op, .. } if !matches!(op, BinOp::Add | BinOp::Sub) => self.direct(i),
             Op::Update { var, a, b, op } => {
                 let (target, meta) = match self.prog.vars[var as usize].slots.as_slice() {
@@ -1683,6 +1710,32 @@ impl<'a, 'b> Gen<'a, 'b> {
                 self.store_bool(d, c);
                 self.jump_next(i);
             }
+            Op::EqK { dst, a, k, neg } => {
+                // Numbers here; anything else through `h_op`.
+                let fallback = self.direct_block(i);
+                match self.prog.consts[k as usize].as_num() {
+                    Some(y) => {
+                        let xa = self.addr(At::Reg(a));
+                        let t = self.tag_of(xa);
+                        let is_num = self.is_tag(t, TAG_NUM);
+                        let go = self.b.create_block();
+                        self.b.ins().brif(is_num, go, &[], fallback, &[]);
+                        self.switch(go);
+                        let x = self.num_of(xa);
+                        let y = self.b.ins().f64const(y);
+                        let cc = if neg { FloatCC::NotEqual } else { FloatCC::Equal };
+                        let c = self.b.ins().fcmp(cc, x, y);
+                        let d = self.addr(At::Reg(dst));
+                        self.store_bool(d, c);
+                        self.jump_next(i);
+                    }
+                    None => {
+                        self.b.ins().jump(fallback, &[]);
+                    }
+                }
+            }
+            Op::EqJump { a, b, neg, to, .. } => self.eq_jump(i, a, Some(b), None, neg, to),
+            Op::EqKJump { a, k, neg, to, .. } => self.eq_jump(i, a, None, Some(k), neg, to),
             Op::Truth { dst, src } => {
                 let slow = self.slow_block(i);
                 let s = self.addr(At::Reg(src));
@@ -2660,6 +2713,104 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.b.ins().jump(skip, &[]);
     }
 
+    /// `UpdateK`: a number variable of one slot changes here (its meta, when
+    /// it has one, must take numbers); anything else goes on to the three
+    /// instructions after it.
+    fn update_k(&mut self, i: usize, var: u32, k: u32, op: BinOp, skip: u32) {
+        let next = self.next(i);
+        let (target, meta) = match (self.prog.vars[var as usize].slots.as_slice(), self.prog.consts[k as usize].as_num()) {
+            ([Slot { loc: Loc::Reg(r), meta }], Some(_)) => (At::Reg(*r), *meta),
+            ([Slot { loc: Loc::Global(g), meta }], Some(_)) => (At::Global(*g), *meta),
+            _ => {
+                self.b.ins().jump(next, &[]);
+                return;
+            }
+        };
+        let y = self.prog.consts[k as usize].as_num().unwrap();
+        if let Some(m) = meta {
+            let m = match m {
+                Loc::Reg(r) => At::Reg(r),
+                Loc::Global(g) => At::Global(g),
+                Loc::This(_) => {
+                    self.b.ins().jump(next, &[]);
+                    return;
+                }
+            };
+            self.meta_takes_numbers(m, next);
+        }
+        let ta = self.addr(target);
+        let t = self.tag_of(ta);
+        let is_num = self.is_tag(t, TAG_NUM);
+        let go = self.b.create_block();
+        self.b.ins().brif(is_num, go, &[], next, &[]);
+        self.switch(go);
+        let x = self.num_of(ta);
+        let y = self.b.ins().f64const(y);
+        let n = if op == BinOp::Add { self.b.ins().fadd(x, y) } else { self.b.ins().fsub(x, y) };
+        let n = self.boxed(n);
+        self.b.ins().store(flags(), n, ta, 8);
+        let skip = self.blocks[skip as usize];
+        self.b.ins().jump(skip, &[]);
+    }
+
+    /// Goes on in a new block when the meta slot at `m` says its variable
+    /// takes numbers (no type, or a number type, and not 고정), else to `no`.
+    fn meta_takes_numbers(&mut self, m: At, no: Block) {
+        let ma = self.addr(m);
+        let t = self.tag_of(ma);
+        let is_num = self.is_tag(t, TAG_NUM);
+        let (typed, untyped, not_num) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(is_num, typed, &[], not_num, &[]);
+        self.switch(not_num);
+        let u = self.is_tag(t, TAG_UNDEF);
+        let n = self.is_tag(t, TAG_NULL);
+        let none = self.b.ins().bor(u, n);
+        self.b.ins().brif(none, untyped, &[], no, &[]);
+        self.switch(typed);
+        let v = self.num_of(ma);
+        let mut ok = self.b.ins().iconst(types::I8, 0);
+        for id in number_types(self.prog) {
+            let k = self.b.ins().f64const((id * 2) as f64);
+            let c = self.b.ins().fcmp(FloatCC::Equal, v, k);
+            ok = self.b.ins().bor(ok, c);
+        }
+        self.b.ins().brif(ok, untyped, &[], no, &[]);
+        self.switch(untyped);
+    }
+
+    /// `EqJump` / `EqKJump`: two numbers compared here (true goes past the
+    /// `JumpIfFalse` after it, false to `to`); anything else through `h_op`.
+    fn eq_jump(&mut self, i: usize, a: Reg, b: Option<Reg>, k: Option<u32>, neg: bool, to: u32) {
+        let fallback = self.direct_block(i);
+        let k = k.map(|k| self.prog.consts[k as usize].as_num());
+        if let Some(None) = k {
+            // A string constant: `h_op`.
+            self.b.ins().jump(fallback, &[]);
+            return;
+        }
+        let (x, y) = match (b, k.flatten()) {
+            (Some(b), _) => {
+                let (xa, ya) = (self.addr(At::Reg(a)), self.addr(At::Reg(b)));
+                self.both_nums(xa, ya, fallback)
+            }
+            (None, Some(y)) => {
+                let xa = self.addr(At::Reg(a));
+                let t = self.tag_of(xa);
+                let is_num = self.is_tag(t, TAG_NUM);
+                let go = self.b.create_block();
+                self.b.ins().brif(is_num, go, &[], fallback, &[]);
+                self.switch(go);
+                (self.num_of(xa), self.b.ins().f64const(y))
+            }
+            _ => unreachable!(),
+        };
+        let cc = if neg { FloatCC::NotEqual } else { FloatCC::Equal };
+        let c = self.b.ins().fcmp(cc, x, y);
+        let past = self.blocks.get(i + 2).copied().unwrap_or(self.trap);
+        let to = self.blocks[to as usize];
+        self.b.ins().brif(c, past, &[], to, &[]);
+    }
+
     /// `dst = take(src)` (the register is left undefined).
     fn take(&mut self, i: usize, dst: At, src: Reg) {
         if let At::Reg(d) = dst {
@@ -2708,6 +2859,10 @@ fn native(op: &Op, prog: &Program) -> bool {
         | Op::Bin { .. }
         | Op::Undef { .. }
         | Op::Eq { .. }
+        | Op::EqK { .. }
+        | Op::UpdateK { .. }
+        | Op::EqJump { .. }
+        | Op::EqKJump { .. }
         | Op::Truth { .. }
         | Op::Jump { .. }
         | Op::JumpIfFalse { .. }

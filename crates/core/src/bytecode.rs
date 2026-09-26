@@ -114,6 +114,12 @@ pub enum Op {
     /// `'x'에 값을 더하자` / `빼자`: `a` holds the variable's value as read,
     /// `b` the operand. Appends to a string in place when nothing else holds it.
     Update { var: u32, a: Reg, b: Reg, op: BinOp },
+    /// `'x'에 1을 더하자` with a number constant, in its common case: a
+    /// variable of one slot (not a constant, its type taking numbers) that
+    /// holds a number changes here and the code goes on at `skip`. Otherwise
+    /// the instructions after it (reading the variable, the constant,
+    /// `Update`) do it.
+    UpdateK { var: u32, k: u32, op: BinOp, skip: u32 },
     /// Marks registers `from..to` as holding no variable (a new loop pass).
     Undef { from: Reg, to: Reg },
 
@@ -122,6 +128,15 @@ pub enum Op {
     BinK { op: BinOp, dst: Reg, a: Reg, k: u32 },
     /// `==` (or `!=` when `neg`).
     Eq { dst: Reg, a: Reg, b: Reg, neg: bool },
+    /// `Eq` against a constant (a number or a string).
+    EqK { dst: Reg, a: Reg, k: u32, neg: bool },
+    /// A condition that is `==` / `!=` and its jump on being false, in one:
+    /// on to `to`, or past the `JumpIfFalse { cond: dst }` that follows. That
+    /// jump is for an object whose class decides `==` itself: its method's
+    /// result lands in `dst` and the jump takes it from there.
+    EqJump { a: Reg, b: Reg, neg: bool, dst: Reg, to: u32 },
+    /// `EqJump` against a constant.
+    EqKJump { a: Reg, k: u32, neg: bool, dst: Reg, to: u32 },
     /// Requires a boolean (a condition) and copies it.
     Truth { dst: Reg, src: Reg },
     /// Raises `UnknownOperator` for the operator named by constant `k`.
