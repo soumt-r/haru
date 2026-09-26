@@ -68,6 +68,7 @@ fn slots_of(op: &Op, prog: &Program) -> Option<Vec<At>> {
         Op::RangePrep { start, end, step } => vec![R(start), R(end), R(step)],
         Op::RangeTest { v, end, step, .. } => vec![R(v), R(end), R(step)],
         Op::RangeStep { v, step } => vec![R(v), R(step)],
+        Op::RangeNext { v, end, step, .. } => vec![R(v), R(end), R(step)],
         Op::Undef { from, to } => (from..to).map(R).collect(),
         Op::Update { var, a, b, op: BinOp::Add | BinOp::Sub } => match prog.vars[var as usize].slots.as_slice() {
             [Slot { loc, meta }] if matches!(meta, None | Some(Loc::Reg(_) | Loc::Global(_))) => {
@@ -104,6 +105,7 @@ pub(super) fn find(code: &[Op], prog: &Program) -> Vec<(usize, usize)> {
         .enumerate()
         .filter_map(|(j, op)| match *op {
             Op::Jump { to } if (to as usize) < j => Some((to as usize, j)),
+            Op::RangeNext { body, .. } if (body as usize) <= j => Some((body as usize, j)),
             _ => None,
         })
         .collect();
@@ -475,6 +477,21 @@ impl Gen<'_, '_> {
                 let out = self.b.ins().bor(a, c);
                 let (exit, next) = (self.to(r, exit as usize), self.to(r, pc + 1));
                 self.b.ins().brif(out, exit, &[], next, &[]);
+            }
+            Op::RangeNext { v, end, step, body } => {
+                let (x, e, s) = (self.num(r, R(v)), self.num(r, R(end)), self.num(r, R(step)));
+                let n = self.b.ins().fadd(x, s);
+                self.set_num(r, R(v), n);
+                let zero = self.b.ins().f64const(0.0);
+                let up = self.b.ins().fcmp(FloatCC::GreaterThan, s, zero);
+                let past_up = self.b.ins().fcmp(FloatCC::GreaterThan, n, e);
+                let a = self.b.ins().band(up, past_up);
+                let down = self.b.ins().fcmp(FloatCC::LessThan, s, zero);
+                let past_down = self.b.ins().fcmp(FloatCC::LessThan, n, e);
+                let c = self.b.ins().band(down, past_down);
+                let out = self.b.ins().bor(a, c);
+                let (next, body) = (self.to(r, pc + 1), self.to(r, body as usize));
+                self.b.ins().brif(out, next, &[], body, &[]);
             }
             Op::RangeStep { v, step } => {
                 let (x, s) = (self.num(r, R(v)), self.num(r, R(step)));

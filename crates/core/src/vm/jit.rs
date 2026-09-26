@@ -1801,6 +1801,22 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let (exit, next) = (self.blocks[exit as usize], self.next(i));
                 self.b.ins().brif(out, exit, &[], next, &[]);
             }
+            Op::RangeNext { v, end, step, body } => {
+                let (va, ea, sa) = (self.addr(At::Reg(v)), self.addr(At::Reg(end)), self.addr(At::Reg(step)));
+                let (x, e, s) = (self.num_of(va), self.num_of(ea), self.num_of(sa));
+                let n = self.b.ins().fadd(x, s);
+                self.b.ins().store(flags(), n, va, 8);
+                let zero = self.b.ins().f64const(0.0);
+                let up = self.b.ins().fcmp(FloatCC::GreaterThan, s, zero);
+                let past_up = self.b.ins().fcmp(FloatCC::GreaterThan, n, e);
+                let a = self.b.ins().band(up, past_up);
+                let down = self.b.ins().fcmp(FloatCC::LessThan, s, zero);
+                let past_down = self.b.ins().fcmp(FloatCC::LessThan, n, e);
+                let c = self.b.ins().band(down, past_down);
+                let out = self.b.ins().bor(a, c);
+                let (next, body) = (self.next(i), self.blocks[body as usize]);
+                self.b.ins().brif(out, next, &[], body, &[]);
+            }
             Op::RangeStep { v, step } => {
                 let (va, sa) = (self.addr(At::Reg(v)), self.addr(At::Reg(step)));
                 let (x, s) = (self.num_of(va), self.num_of(sa));
@@ -2871,6 +2887,7 @@ fn native(op: &Op, prog: &Program) -> bool {
         | Op::RangePrep { .. }
         | Op::RangeTest { .. }
         | Op::RangeStep { .. }
+        | Op::RangeNext { .. }
         | Op::Boxed { .. }
         | Op::Enter
         | Op::Leave

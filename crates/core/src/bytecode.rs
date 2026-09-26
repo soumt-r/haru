@@ -150,6 +150,10 @@ pub enum Op {
     /// Leaves the loop (to `exit`) once `v` has passed `end`.
     RangeTest { v: Reg, end: Reg, step: Reg, exit: u32 },
     RangeStep { v: Reg, step: Reg },
+    /// The end of a range loop's pass: `RangeStep`, then `RangeTest` —
+    /// back to `body` (the instruction after the `RangeTest`) while `v` has
+    /// not passed `end`, else on.
+    RangeNext { v: Reg, end: Reg, step: Reg, body: u32 },
     /// Normalizes a number as Hana's `num.Box` does (-0 becomes 0): the
     /// range loop's variable.
     Boxed { dst: Reg },

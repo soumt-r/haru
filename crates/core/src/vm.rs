@@ -899,6 +899,24 @@ impl<'p> Vm<'p> {
                 }};
             }
 
+            // A loop turning back to `to`: the function may be hot enough to
+            // go on as native code from there.
+            macro_rules! back_edge {
+                ($to:expr) => {
+                    #[cfg(feature = "jit")]
+                    if !STEP && self.jit.is_some() {
+                        if let Some(code) = self.jit_code(self.frames[fi].proto) {
+                            self.frames[fi].pc = $to as usize;
+                            match jit::invoke(self, code, fi, $to as usize) {
+                                jit::Done::Returned => continue 'frames,
+                                jit::Done::End => return Ok(()),
+                                jit::Done::Failed(s) => return Err(s),
+                            }
+                        }
+                    }
+                };
+            }
+
             let mut stepped = false;
             loop {
                 if STEP {
@@ -1083,20 +1101,20 @@ impl<'p> Vm<'p> {
                     }
                     Op::UnknownOp { k } => fail!(err(UNKNOWN_OPERATOR).arg(prog.consts[k as usize].clone())),
                     Op::Jump { to } => {
-                        // A loop turning: the function may be hot enough to go
-                        // on as native code from here.
-                        #[cfg(feature = "jit")]
-                        if !STEP && (to as usize) < pc && self.jit.is_some() {
-                            if let Some(code) = self.jit_code(self.frames[fi].proto) {
-                                self.frames[fi].pc = to as usize;
-                                match jit::invoke(self, code, fi, to as usize) {
-                                    jit::Done::Returned => continue 'frames,
-                                    jit::Done::End => return Ok(()),
-                                    jit::Done::Failed(s) => return Err(s),
-                                }
-                            }
+                        if (to as usize) < pc {
+                            back_edge!(to);
                         }
                         pc = to as usize;
+                    }
+                    Op::RangeNext { v, end, step, body } => {
+                        let s = reg!(step).as_num().unwrap();
+                        let n = reg!(v).as_num().unwrap() + s;
+                        reg!(v) = Value::num(n);
+                        let e = reg!(end).as_num().unwrap();
+                        if !((s > 0.0 && n > e) || (s < 0.0 && n < e)) {
+                            back_edge!(body);
+                            pc = body as usize;
+                        }
                     }
                     Op::CmpJump { op, a, b, to } => {
                         let (x, y) = (&reg!(a), &reg!(b));
@@ -2128,9 +2146,15 @@ impl<'p> Vm<'p> {
                 }
             }
         } else if let Some(d) = o.as_dict() {
+            let mut map = d.map.borrow_mut();
+            // A key already there keeps its entry (no new key made).
+            if let Some(slot) = Key::view(&k).and_then(|key| map.get_mut(key)) {
+                *slot = v;
+                return Ok(());
+            }
             match Key::new(k) {
                 Some(k) => {
-                    d.map.borrow_mut().insert(k, v);
+                    map.insert(k, v);
                 }
                 None => return Err(err(UNSUPPORTED).str_arg("dictionary as a key")),
             }

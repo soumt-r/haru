@@ -1788,13 +1788,11 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         self.emit(Op::Undef { from, to });
         self.emit(Op::Move { dst: var_slot, src: v });
         self.emit(Op::Boxed { dst: var_slot });
-        let step_at = self.here();
         let mut exits = self.loop_body(body, top);
-        // The step goes before the jump back: rewrite the jump into step + jump.
-        let back = self.code.pop();
-        self.emit(Op::RangeStep { v, step });
-        self.code.push(back.unwrap());
-        let _ = step_at;
+        // The jump back becomes the step, the test and the jump to the body
+        // in one (the test at the top runs only on the way in).
+        self.code.pop();
+        self.emit(Op::RangeNext { v, end: e, step, body: test as u32 + 1 });
         exits.push(test);
         self.close_scope(from);
         self.end_loop(top, exits);
