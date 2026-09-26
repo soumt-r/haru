@@ -47,6 +47,14 @@ fn loops() {
     check("loops", include_str!("jit/loops.hr"), include_str!("jit/loops.out"));
 }
 
+/// Lists and dictionaries read and written by compiled code: keys in and
+/// out of range, fractions, other types, missing keys, -0, writes past the
+/// end, lengths, lists in lists.
+#[test]
+fn collections() {
+    check("collections", include_str!("jit/collections.hr"), include_str!("jit/collections.out"));
+}
+
 #[test]
 fn calls_and_errors() {
     check("calls_and_errors", include_str!("jit/calls_and_errors.hr"), include_str!("jit/calls_and_errors.out"));

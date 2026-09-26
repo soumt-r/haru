@@ -15,7 +15,7 @@ mod host;
 pub mod lang;
 mod modules;
 pub mod symbol;
-pub(crate) mod stack;
+pub mod stack;
 pub mod value;
 pub mod vm;
 

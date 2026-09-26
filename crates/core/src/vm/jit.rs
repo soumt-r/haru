@@ -27,7 +27,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::Module;
 
 use super::*;
-use crate::value::ObjObj;
+use crate::value::{Key, ObjObj};
 
 mod loops;
 
@@ -216,6 +216,8 @@ pub(super) struct Jit {
     inline_rc: bool,
     /// Where an object's properties are inside it (through the `RefCell`).
     off_props: usize,
+    /// Where a list's items are inside it (through the `RefCell`).
+    off_items: usize,
     /// Each compiled function's inline caches, one per instruction.
     ics: Vec<Box<[Ic]>>,
     /// Each function's code, or 0 (not compiled): what compiled calls read.
@@ -273,6 +275,10 @@ impl Jit {
             off_props: {
                 let o = ObjObj { class: 0, props: Default::default() };
                 o.props.as_ptr() as usize - &o as *const ObjObj as usize
+            },
+            off_items: {
+                let l = crate::value::ListObj { items: Default::default() };
+                l.items.as_ptr() as usize - &l as *const crate::value::ListObj as usize
             },
             ics: (0..protos).map(|_| Box::default()).collect(),
             table: vec![0; protos].into_boxed_slice(),
@@ -420,7 +426,7 @@ impl Jit {
         let has_loops = {
             let b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
             let ics = self.ics[proto_id as usize].as_mut_ptr();
-            Gen::new(b, ptr, cc, proto, prog, self.table.as_ptr(), self.inline_rc, self.off_props, ics).build()
+            Gen::new(b, ptr, cc, proto, prog, self.table.as_ptr(), self.inline_rc, self.off_props, self.off_items, ics).build()
         };
         if std::env::var_os("HARU_JIT_DEBUG").is_some() {
             eprintln!(
@@ -1126,6 +1132,30 @@ unsafe extern "C" fn h_return_null(env: *mut Env) -> u32 {
     }
 }
 
+/// `o`'s value at key `k`, `o` a dictionary: 1 when `k` is no key or not
+/// there (the interpreter reports it).
+unsafe extern "C" fn h_dict_get(dst: *mut Value, o: *const Value, k: *const Value) -> u32 {
+    let d = (*o).as_dict().unwrap();
+    let Some(key) = Key::view(&*k) else { return 1 };
+    let found = d.map.borrow().get(key).cloned();
+    match found {
+        Some(v) => {
+            *dst = v;
+            0
+        }
+        None => 1,
+    }
+}
+
+/// `o`'s value at key `k` becomes `v`, `o` a dictionary: 1 when `k` is no
+/// key.
+unsafe extern "C" fn h_dict_set(o: *const Value, k: *const Value, v: *const Value) -> u32 {
+    let d = (*o).as_dict().unwrap();
+    let Some(key) = Key::new((*k).clone()) else { return 1 };
+    d.map.borrow_mut().insert(key, (*v).clone());
+    0
+}
+
 /// Releases `n` values from `p` on (a frame's registers going away).
 unsafe extern "C" fn h_release_regs(p: *mut Value, n: usize) {
     for i in 0..n {
@@ -1204,6 +1234,7 @@ struct Sigs {
     one_ptr: SigRef,
     two_ptr: SigRef,
     ptr_len: SigRef,
+    three_ptr: SigRef,
 }
 
 struct Gen<'a, 'b> {
@@ -1219,6 +1250,7 @@ struct Gen<'a, 'b> {
     table: *const usize,
     inline_rc: bool,
     off_props: usize,
+    off_items: usize,
     ics: *mut Ic,
     /// The registers' address (loaded again after anything that may have
     /// moved the stack).
@@ -1258,6 +1290,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         table: *const usize,
         inline_rc: bool,
         off_props: usize,
+        off_items: usize,
         ics: *mut Ic,
     ) -> Self {
         let mut sig = |params: &[types::Type], ret: Option<types::Type>| {
@@ -1276,6 +1309,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             one_ptr: sig(&[ptr], None),
             two_ptr: sig(&[ptr, ptr], None),
             ptr_len: sig(&[ptr, ptr], None),
+            three_ptr: sig(&[ptr, ptr, ptr], Some(types::I32)),
         };
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -1307,6 +1341,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             table,
             inline_rc,
             off_props,
+            off_items,
             ics,
             regs,
             globals,
@@ -1756,6 +1791,24 @@ impl<'a, 'b> Gen<'a, 'b> {
             },
             Op::CallMethod { .. } => self.call_via(i, h_method_start as usize, h_step as usize),
             Op::SelfOr { dst, .. } => self.self_or(i, dst),
+            Op::Index { dst, obj, key } => {
+                let k = self.addr(At::Reg(key));
+                self.index(i, dst, obj, k, None)
+            }
+            Op::IndexK { dst, obj, k } => {
+                let c = &self.prog.consts[k as usize];
+                let ka = self.b.ins().iconst(self.ptr, c as *const Value as i64);
+                self.index(i, dst, obj, ka, c.as_num())
+            }
+            Op::SetIndex { obj, key, val } => {
+                let k = self.addr(At::Reg(key));
+                self.set_index(i, obj, k, None, val)
+            }
+            Op::SetIndexK { obj, k, val } => {
+                let c = &self.prog.consts[k as usize];
+                let ka = self.b.ins().iconst(self.ptr, c as *const Value as i64);
+                self.set_index(i, obj, ka, c.as_num(), val)
+            }
             Op::MethodPrep { obj, .. } => self.method_prep(i, obj),
             Op::GetVar { dst, var } => match self.prog.vars[var as usize].slots.first() {
                 Some(Slot { loc: Loc::Reg(r), .. }) => self.get_var_reg(i, dst, *r),
@@ -1768,10 +1821,6 @@ impl<'a, 'b> Gen<'a, 'b> {
             Op::Decl { .. }
             | Op::Assign { .. }
             | Op::GetThis { .. }
-            | Op::Index { .. }
-            | Op::IndexK { .. }
-            | Op::SetIndex { .. }
-            | Op::SetIndexK { .. }
             | Op::Format { .. }
             | Op::Concat { .. }
             | Op::IterNext { .. }
@@ -2323,6 +2372,89 @@ impl<'a, 'b> Gen<'a, 'b> {
         }
     }
 
+    /// The address of a list's item at the number key at `ka` (`known`: the
+    /// key when it is a constant), for the list at `oa`, else `fallback`.
+    fn list_item(&mut self, oa: V, ka: V, known: Option<f64>, fallback: Block) -> V {
+        if known.is_none() {
+            let kt = self.tag_of(ka);
+            let is_num = self.is_tag(kt, TAG_NUM);
+            let go = self.b.create_block();
+            self.b.ins().brif(is_num, go, &[], fallback, &[]);
+            self.switch(go);
+        }
+        // Go's int(n) - 1 (a key outside the list, NaN or too big for an
+        // int, is the interpreter's to report).
+        let n = match known {
+            Some(n) => self.b.ins().f64const(n),
+            None => self.num_of(ka),
+        };
+        let at = self.b.ins().fcvt_to_sint_sat(types::I64, n);
+        let at = self.b.ins().iadd_imm(at, -1);
+        let p = self.payload_of(oa);
+        let items = self.off_items as i32;
+        let base = self.b.ins().load(self.ptr, flags(), p, items + OFF_PTR as i32);
+        let len = self.b.ins().load(types::I64, flags(), p, items + OFF_LEN as i32);
+        let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, at, len);
+        let go = self.b.create_block();
+        self.b.ins().brif(inside, go, &[], fallback, &[]);
+        self.switch(go);
+        let off = self.b.ins().ishl_imm(at, 4);
+        self.b.ins().iadd(base, off)
+    }
+
+    /// `'목록'의 i번째` / `'표'의 "키"`: a list's item or a dictionary's
+    /// value here; anything else (strings, errors) through `h_op`.
+    fn index(&mut self, i: usize, dst: Reg, obj: Reg, ka: V, known: Option<f64>) {
+        let fallback = self.direct_block(i);
+        let oa = self.addr(At::Reg(obj));
+        let t = self.tag_of(oa);
+        let (list, not_list, dict) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let is_list = self.is_tag(t, tag::LIST as i64);
+        self.b.ins().brif(is_list, list, &[], not_list, &[]);
+        self.switch(not_list);
+        let is_dict = self.is_tag(t, tag::DICT as i64);
+        self.b.ins().brif(is_dict, dict, &[], fallback, &[]);
+
+        self.switch(dict);
+        let d = self.addr(At::Reg(dst));
+        let r = self.call(self.sigs.three_ptr, h_dict_get as usize, &[d, oa, ka]).unwrap();
+        self.reload();
+        let next = self.next(i);
+        self.b.ins().brif(r, fallback, &[], next, &[]);
+
+        self.switch(list);
+        let e = self.list_item(oa, ka, known, fallback);
+        let d = self.addr(At::Reg(dst));
+        self.copy_value(e, d);
+        self.jump_next(i);
+    }
+
+    /// `'목록'의 i번째를 ...로 정하자` and the same for a dictionary.
+    fn set_index(&mut self, i: usize, obj: Reg, ka: V, known: Option<f64>, val: Reg) {
+        let fallback = self.direct_block(i);
+        let oa = self.addr(At::Reg(obj));
+        let t = self.tag_of(oa);
+        let (list, not_list, dict) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let is_list = self.is_tag(t, tag::LIST as i64);
+        self.b.ins().brif(is_list, list, &[], not_list, &[]);
+        self.switch(not_list);
+        let is_dict = self.is_tag(t, tag::DICT as i64);
+        self.b.ins().brif(is_dict, dict, &[], fallback, &[]);
+
+        self.switch(dict);
+        let va = self.addr(At::Reg(val));
+        let r = self.call(self.sigs.three_ptr, h_dict_set as usize, &[oa, ka, va]).unwrap();
+        self.reload();
+        let next = self.next(i);
+        self.b.ins().brif(r, fallback, &[], next, &[]);
+
+        self.switch(list);
+        let e = self.list_item(oa, ka, known, fallback);
+        let va = self.addr(At::Reg(val));
+        self.copy_value(va, e);
+        self.jump_next(i);
+    }
+
     /// `'나'`: the frame's object when it has one (else `h_op`).
     fn self_or(&mut self, i: usize, dst: Reg) {
         let fallback = self.direct_block(i);
@@ -2376,6 +2508,28 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.b.ins().iadd_imm(e, PROP_VALUE as i64)
     }
 
+    /// A block for `'목록'의 길이`: a list's length, else `fallback`.
+    fn list_length(&mut self, dst: Reg, obj: Reg, skip: u32, fallback: Block) -> Block {
+        let cur = self.b.current_block().unwrap();
+        let blk = self.b.create_block();
+        self.switch(blk);
+        let oa = self.addr(At::Reg(obj));
+        let t = self.tag_of(oa);
+        let is_list = self.is_tag(t, tag::LIST as i64);
+        let go = self.b.create_block();
+        self.b.ins().brif(is_list, go, &[], fallback, &[]);
+        self.switch(go);
+        let p = self.payload_of(oa);
+        let len = self.b.ins().load(types::I64, flags(), p, self.off_items as i32 + OFF_LEN as i32);
+        let n = self.b.ins().fcvt_from_uint(types::F64, len);
+        let d = self.addr(At::Reg(dst));
+        self.store_num(d, n);
+        let skip = self.blocks[skip as usize];
+        self.b.ins().jump(skip, &[]);
+        self.switch(cur);
+        blk
+    }
+
     /// A block for when the cache does not know the value in `obj`: a
     /// dictionary goes on to the key (`'표'의 "가"`, the next instruction),
     /// anything else to `fallback`.
@@ -2396,6 +2550,11 @@ impl<'a, 'b> Gen<'a, 'b> {
     fn member(&mut self, i: usize, dst: Reg, obj: Reg, name: u32, skip: u32) {
         let fallback = self.direct_block(i);
         let fallback = self.dict_goes_on(i, obj, fallback);
+        let fallback = if name == crate::symbol::intern(self.prog.lang.length_word) {
+            self.list_length(dst, obj, skip, fallback)
+        } else {
+            fallback
+        };
         let v = self.cached_prop(i, obj, name, fallback);
         self.check_ic_access(i, obj, fallback);
         let d = self.addr(At::Reg(dst));

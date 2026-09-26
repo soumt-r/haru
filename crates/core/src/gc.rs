@@ -86,7 +86,7 @@ impl Live {
     /// Takes its contents out (to be dropped once every garbage container is emptied).
     fn empty(&self, out: &mut Vec<Value>, keys: &mut Vec<Key>) {
         match self {
-            Live::List(r) => out.append(&mut r.items.borrow_mut()),
+            Live::List(r) => out.extend(r.items.borrow_mut().take_all()),
             Live::Dict(r) => {
                 for (k, v) in r.map.borrow_mut().drain() {
                     keys.push(k);

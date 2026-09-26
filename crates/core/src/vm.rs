@@ -1096,7 +1096,7 @@ impl<'p> Vm<'p> {
                         let items = if let Some(s) = v.as_str() {
                             s.chars().map(|c| Value::string(c.to_string())).collect()
                         } else if let Some(l) = v.as_list() {
-                            l.items.borrow().clone()
+                            l.items.borrow().to_vec()
                         } else {
                             fail!(err(NOT_ITERABLE));
                         };
@@ -2086,10 +2086,10 @@ impl<'p> Vm<'p> {
                 None => Err(err(LIST_INDEX_NUMBER)),
             },
             tag::DICT => {
-                let Some(key) = Key::new(k.clone()) else {
+                let Some(key) = Key::view(k) else {
                     return Err(err(UNSUPPORTED).str_arg("dictionary as a key"));
                 };
-                match o.as_dict().unwrap().map.borrow().get(&key) {
+                match o.as_dict().unwrap().map.borrow().get(key) {
                     Some(v) => Ok(v.clone()),
                     None => Err(err(DICT_KEY).arg(k.clone())),
                 }

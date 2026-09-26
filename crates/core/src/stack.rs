@@ -6,7 +6,7 @@ use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 
 #[repr(C)]
-pub(crate) struct Stack<T> {
+pub struct Stack<T> {
     pub(crate) ptr: *mut T,
     pub(crate) len: usize,
     pub(crate) cap: usize,
@@ -39,7 +39,7 @@ impl<T> Stack<T> {
     }
 
     #[inline]
-    pub(crate) fn push(&mut self, v: T) {
+    pub fn push(&mut self, v: T) {
         if self.len < self.cap {
             unsafe { self.ptr.add(self.len).write(v) };
             self.len += 1;
@@ -49,7 +49,7 @@ impl<T> Stack<T> {
     }
 
     #[inline]
-    pub(crate) fn pop(&mut self) -> Option<T> {
+    pub fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
             return None;
         }
@@ -58,7 +58,7 @@ impl<T> Stack<T> {
     }
 
     #[inline]
-    pub(crate) fn truncate(&mut self, len: usize) {
+    pub fn truncate(&mut self, len: usize) {
         self.edit(|s| s.truncate(len));
     }
 
@@ -69,6 +69,23 @@ impl<T> Stack<T> {
     /// Takes everything out.
     pub(crate) fn take_all(&mut self) -> Vec<T> {
         self.edit(std::mem::take)
+    }
+
+    pub fn from_vec(v: Vec<T>) -> Stack<T> {
+        let mut v = ManuallyDrop::new(v);
+        Stack { ptr: v.as_mut_ptr(), len: v.len(), cap: v.capacity() }
+    }
+
+    pub fn insert(&mut self, i: usize, v: T) {
+        self.edit(|s| s.insert(i, v));
+    }
+
+    pub fn remove(&mut self, i: usize) -> T {
+        self.edit(|s| s.remove(i))
+    }
+
+    pub fn clear(&mut self) {
+        self.edit(Vec::clear);
     }
 }
 

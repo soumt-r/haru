@@ -29,8 +29,10 @@ pub struct StrObj {
     pub text: String,
 }
 
+/// A list. Its items have a fixed layout (`Stack`): compiled code reads and
+/// writes them directly.
 pub struct ListObj {
-    pub items: RefCell<Vec<Value>>,
+    pub items: RefCell<crate::stack::Stack<Value>>,
 }
 
 /// A dictionary. Keys compare the way Hana's (Go map) keys do: numbers,
@@ -164,7 +166,7 @@ impl Value {
     }
 
     pub fn list(items: Vec<Value>) -> Value {
-        let r = Rc::new(ListObj { items: RefCell::new(items) });
+        let r = Rc::new(ListObj { items: RefCell::new(crate::stack::Stack::from_vec(items)) });
         crate::gc::track_list(&r);
         Value::heap(tag::LIST, r)
     }
@@ -393,12 +395,19 @@ impl fmt::Display for Value {
 
 /// A dictionary key: a value compared like a Go map key.
 #[derive(Clone)]
+#[repr(transparent)]
 pub struct Key(pub Value);
 
 impl Key {
     /// Dictionaries cannot be keys (Go cannot hash maps).
     pub fn new(v: Value) -> Option<Key> {
         (v.tag() != tag::DICT && !v.is_undef()).then_some(Key(v))
+    }
+
+    /// A value as a key to look up with, without a new reference.
+    pub fn view(v: &Value) -> Option<&Key> {
+        // `Key` is a transparent wrapper of `Value`.
+        (v.tag() != tag::DICT && !v.is_undef()).then(|| unsafe { &*(v as *const Value as *const Key) })
     }
 }
 
