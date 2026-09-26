@@ -2,9 +2,12 @@
 //! on standard output, runtime errors on standard error, exit status 1), so
 //! the two can be compared. A construct Haru cannot run yet exits with 3.
 //! `--time` prints how long reading and running took, measured in-process.
+//! `--jit` (or `HARU_JIT=1`) runs functions as native code; `HARU_JIT=0`
+//! turns that off again.
 
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use haru_core::vm::{codes, Vm};
@@ -12,7 +15,33 @@ use haru_core::{compiler, lang, syntax_report};
 
 use crate::packages::{Bundled, Resolver};
 
+/// Whether `--jit` was given.
+pub static JIT_FLAG: AtomicBool = AtomicBool::new(false);
+
+fn jit_wanted() -> bool {
+    match std::env::var("HARU_JIT").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => JIT_FLAG.load(Ordering::Relaxed),
+    }
+}
+
 pub fn run(path: &Path, time: bool, extra: Vec<Bundled>, files: &'static [(&'static str, &'static str)]) -> ExitCode {
+    if !jit_wanted() {
+        return run_here(path, time, extra, files, false);
+    }
+    // Compiled code calls functions on the machine's stack: a deep one
+    // (reserved, not committed) so that Hana's call depth limit comes first.
+    let path = path.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || run_here(&path, time, extra, files, true))
+        .ok()
+        .and_then(|t| t.join().ok())
+        .unwrap_or(ExitCode::FAILURE)
+}
+
+fn run_here(path: &Path, time: bool, extra: Vec<Bundled>, files: &'static [(&'static str, &'static str)], jit: bool) -> ExitCode {
     let lang = lang::for_path(path);
     let embedded = files.iter().find(|(p, _)| Path::new(p) == path).map(|(_, t)| t.to_string());
     let source = match embedded.map_or_else(|| std::fs::read_to_string(path), Ok) {
@@ -45,6 +74,9 @@ pub fn run(path: &Path, time: bool, extra: Vec<Bundled>, files: &'static [(&'sta
 
     let rt = resolver.rt.borrow();
     let mut vm = Vm::new(&compiled).with_runtime(&rt);
+    if jit {
+        vm.enable_jit();
+    }
     let stdin = std::io::stdin();
     vm.read_line = Box::new(move || {
         let mut line = String::new();

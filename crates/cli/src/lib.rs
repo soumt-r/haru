@@ -53,6 +53,10 @@ pub fn main_with(build: Build) -> ExitCode {
         }
         None => false,
     };
+    if let Some(i) = args.iter().position(|a| a == "--jit") {
+        args.remove(i);
+        run::JIT_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     // Hana's `--allow-file=false` / `--allow-net=false` (both allowed by default).
     for (flag, deny) in [("--allow-file", haru_std::deny_files as fn()), ("--allow-net", haru_std::deny_net)] {
         match bool_flag(&mut args, flag) {

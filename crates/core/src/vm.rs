@@ -196,7 +196,16 @@ pub struct Vm<'p> {
     last_flush: std::time::Instant,
     /// The next line of input; `None` at the end (reads as an empty line).
     pub read_line: Box<dyn FnMut() -> Option<String>>,
+    /// Native code for functions, when the JIT is on.
+    #[cfg(feature = "jit")]
+    jit: Option<Box<jit::Jit>>,
+    /// What compiled code failed with, on its way to the code that called it.
+    #[cfg(feature = "jit")]
+    jit_signal: Option<Signal>,
 }
+
+#[cfg(feature = "jit")]
+mod jit;
 
 impl<'p> Vm<'p> {
     pub fn new(prog: &'p Program) -> Vm<'p> {
@@ -229,7 +238,24 @@ impl<'p> Vm<'p> {
             output: Output::Stdout(Vec::new()),
             last_flush: std::time::Instant::now(),
             read_line: Box::new(|| None),
+            #[cfg(feature = "jit")]
+            jit: None,
+            #[cfg(feature = "jit")]
+            jit_signal: None,
         }
+    }
+
+    /// Runs functions as native code (compiled when first called). Returns
+    /// whether the JIT is available on this machine.
+    #[cfg(feature = "jit")]
+    pub fn enable_jit(&mut self) -> bool {
+        self.jit = jit::Jit::new(self.prog.protos.len()).map(Box::new);
+        self.jit.is_some()
+    }
+
+    #[cfg(not(feature = "jit"))]
+    pub fn enable_jit(&mut self) -> bool {
+        false
     }
 
     /// The registry of native modules (the standard library) imports use.
@@ -305,40 +331,15 @@ impl<'p> Vm<'p> {
     /// leaving frames that have none. Fails when it reaches the top.
     fn unwind(&mut self, mut signal: Signal) -> Result<(), Signal> {
         loop {
-            let frame = self.frames.last_mut().unwrap();
-            let proto = &self.prog.protos[frame.proto as usize];
-            let at = frame.pc.saturating_sub(1) as u32;
-            let takes = |k: HandlerKind| match signal {
-                Signal::Error(_) => true,
-                Signal::Break => k != HandlerKind::Catch,
-                Signal::Return(_) => k == HandlerKind::Finally,
-            };
-            let handler = proto
-                .handlers
-                .iter()
-                .enumerate()
-                .filter(|(_, h)| h.start <= at && at < h.end && takes(h.kind))
-                .min_by_key(|(_, h)| h.end - h.start);
-            let lp = match signal {
-                Signal::Break => proto.loops.iter().filter(|l| l.start <= at && at < l.end).min_by_key(|l| l.end - l.start),
-                _ => None,
-            };
-            match (handler, lp) {
-                (Some((i, h)), l) if l.is_none_or(|l| h.end - h.start <= l.end - l.start) => {
-                    frame.pc = h.target as usize;
-                    self.depth = frame.depth + h.open_calls;
-                    let key = i as u32;
-                    frame.pending.retain(|(k, _)| *k != key);
-                    frame.pending.push((key, signal));
-                    return Ok(());
-                }
-                (_, Some(l)) => {
-                    frame.pc = l.exit as usize;
-                    self.depth = frame.depth;
-                    return Ok(());
-                }
-                _ => {}
+            // Frames below `stop_at` belong to code waiting for this run to end.
+            if self.frames.len() <= self.stop_at {
+                return Err(signal);
             }
+            signal = match self.catch_here(signal) {
+                Ok(()) => return Ok(()),
+                Err(s) => s,
+            };
+            let frame = self.frames.last_mut().unwrap();
             // Nothing in this frame takes it.
             if frame.post == Post::Capture && !matches!(signal, Signal::Return(_)) {
                 // It leaves the function a native function called: back to that function.
@@ -367,6 +368,45 @@ impl<'p> Vm<'p> {
                     self.stack.truncate(frame.base);
                 }
             }
+        }
+    }
+
+    /// Hands a signal to the innermost handler or loop of the running frame
+    /// that takes it (the frame goes on there), or gives it back.
+    fn catch_here(&mut self, signal: Signal) -> Result<(), Signal> {
+        let frame = self.frames.last_mut().unwrap();
+        let proto = &self.prog.protos[frame.proto as usize];
+        let at = frame.pc.saturating_sub(1) as u32;
+        let takes = |k: HandlerKind| match signal {
+            Signal::Error(_) => true,
+            Signal::Break => k != HandlerKind::Catch,
+            Signal::Return(_) => k == HandlerKind::Finally,
+        };
+        let handler = proto
+            .handlers
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.start <= at && at < h.end && takes(h.kind))
+            .min_by_key(|(_, h)| h.end - h.start);
+        let lp = match signal {
+            Signal::Break => proto.loops.iter().filter(|l| l.start <= at && at < l.end).min_by_key(|l| l.end - l.start),
+            _ => None,
+        };
+        match (handler, lp) {
+            (Some((i, h)), l) if l.is_none_or(|l| h.end - h.start <= l.end - l.start) => {
+                frame.pc = h.target as usize;
+                self.depth = frame.depth + h.open_calls;
+                let key = i as u32;
+                frame.pending.retain(|(k, _)| *k != key);
+                frame.pending.push((key, signal));
+                Ok(())
+            }
+            (_, Some(l)) => {
+                frame.pc = l.exit as usize;
+                self.depth = frame.depth;
+                Ok(())
+            }
+            _ => Err(signal),
         }
     }
 
@@ -714,12 +754,36 @@ impl<'p> Vm<'p> {
     // ---- the loop
 
     fn exec(&mut self) -> Flow<()> {
+        self.exec_mode::<false>()
+    }
+
+    /// The loop. `STEP`: runs only the running frame's instruction at its pc
+    /// and returns (with the frame's pc after it, or a callee's frame started
+    /// or the frame gone); compiled code runs what it has no code for so.
+    fn exec_mode<const STEP: bool>(&mut self) -> Flow<()> {
         let prog = self.prog;
+        let mut entered = false;
         'frames: loop {
-            if self.frames.len() <= self.stop_at {
+            if STEP {
+                if entered {
+                    return Ok(());
+                }
+                entered = true;
+            } else if self.frames.len() <= self.stop_at {
                 return Ok(());
             }
             let fi = self.frames.len() - 1;
+            #[cfg(feature = "jit")]
+            if !STEP && self.jit.is_some() && self.frames[fi].pc == 0 {
+                // A function starting: as native code when it has some.
+                if let Some(code) = self.jit_code(self.frames[fi].proto) {
+                    match jit::invoke(self, code, fi) {
+                        jit::Done::Returned => continue 'frames,
+                        jit::Done::End => return Ok(()),
+                        jit::Done::Failed(s) => return Err(s),
+                    }
+                }
+            }
             let frame = &self.frames[fi];
             let proto = &prog.protos[frame.proto as usize];
             self.ns = frame.ns;
@@ -767,7 +831,15 @@ impl<'p> Vm<'p> {
                 }};
             }
 
+            let mut stepped = false;
             loop {
+                if STEP {
+                    if stepped {
+                        self.frames[fi].pc = pc;
+                        return Ok(());
+                    }
+                    stepped = true;
+                }
                 debug_assert!(pc < code.len());
                 // Every function ends in a return, so pc stays inside the code.
                 let op = unsafe { *code.get_unchecked(pc) };
