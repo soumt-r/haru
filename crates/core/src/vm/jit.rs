@@ -966,6 +966,22 @@ unsafe extern "C" fn h_op(env: *mut Env, pc: u32) -> u32 {
                 _ => SLOW,
             }
         }
+        // A variable of several places (a method's, which may be a property):
+        // as the interpreter does it.
+        Op::Update { var, a, b, op } => {
+            let result = match (reg(a).as_num(), reg(b).as_num(), op) {
+                (Some(x), Some(y), BinOp::Add) => boxed(x + y),
+                (Some(x), Some(y), BinOp::Sub) => boxed(x - y),
+                _ => match vm.slow_binary(op, reg(a), reg(b)) {
+                    Ok(v) => v,
+                    Err(_) => return SLOW,
+                },
+            };
+            match vm.assign(var, fi, result) {
+                Ok(()) => next,
+                Err(_) => SLOW,
+            }
+        }
         Op::NewObj { dst, class } => {
             crate::gc::safe_point();
             match vm.class(class) {
@@ -2818,17 +2834,21 @@ impl<'a, 'b> Gen<'a, 'b> {
     }
 
     /// A block for when the cache does not know the value in `obj`: a
-    /// dictionary goes on to the key (`'표'의 "가"`, the next instruction),
-    /// anything else to `fallback`.
-    fn dict_goes_on(&mut self, i: usize, obj: Reg, fallback: Block) -> Block {
+    /// dictionary (or a value of a tag in `also`) goes on to the key (`'표'의
+    /// "가"`, the next instruction), anything else to `fallback`.
+    fn dict_goes_on(&mut self, i: usize, obj: Reg, fallback: Block, also: &[i64]) -> Block {
         let cur = self.b.current_block().unwrap();
         let blk = self.b.create_block();
         self.switch(blk);
         let oa = self.addr(At::Reg(obj));
         let t = self.tag_of(oa);
-        let dict = self.is_tag(t, tag::DICT as i64);
+        let mut on = self.is_tag(t, tag::DICT as i64);
+        for &k in also {
+            let c = self.is_tag(t, k);
+            on = self.b.ins().bor(on, c);
+        }
         let next = self.next(i);
-        self.b.ins().brif(dict, next, &[], fallback, &[]);
+        self.b.ins().brif(on, next, &[], fallback, &[]);
         self.switch(cur);
         blk
     }
@@ -2836,8 +2856,11 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// A property read (`'점'의 '가로'`): from where the cache says it is.
     fn member(&mut self, i: usize, dst: Reg, obj: Reg, name: u32, skip: u32) {
         let fallback = self.direct_block(i);
-        let fallback = self.dict_goes_on(i, obj, fallback);
-        let fallback = if name == crate::symbol::intern(self.prog.lang.length_word) {
+        // A list's or string's `'x'번째` (not its length): the key is next.
+        let length = name == crate::symbol::intern(self.prog.lang.length_word);
+        let also: &[i64] = if length { &[] } else { &[tag::LIST as i64, tag::STR as i64] };
+        let fallback = self.dict_goes_on(i, obj, fallback, also);
+        let fallback = if length {
             let fallback = self.str_length(dst, obj, skip, fallback);
             self.list_length(dst, obj, skip, fallback)
         } else {
@@ -2918,7 +2941,8 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// what the field's type takes.
     fn set_member(&mut self, i: usize, obj: Reg, val: Reg, name: u32, skip: u32) {
         let fallback = self.direct_block(i);
-        let fallback = self.dict_goes_on(i, obj, fallback);
+        // A list's `'x'번째`: the key is next (a string's is an error).
+        let fallback = self.dict_goes_on(i, obj, fallback, &[tag::LIST as i64]);
         let v = self.cached_prop(i, obj, name, fallback);
         let ic = self.b.ins().iconst(self.ptr, unsafe { self.ics.add(i) } as i64);
         let check = self.b.ins().load(types::I32, MemFlags::new(), ic, 8);
