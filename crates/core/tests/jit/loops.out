@@ -1,0 +1,21 @@
+25000000
+글자
+DivideByZeroError: 0으로 나눌 수 없어요.
+참
+0
+DivideByZeroError: 0으로 나눌 수 없어요.
+1107579
+0
+4321
+참
+1501
+16626
+2001000
+TypeError: '정수'에는 '숫자' 타입만 담을 수 있어요. '문자열' 값이 들어왔어요.
+2002499
+ConstantAssignmentError: 상수 '고정수'의 값은 변경할 수 없어요.
+5
+시작
+2000
+0
+NullReferenceError: '+' 연산에는 비어있음 값을 쓸 수 없어요.

@@ -39,6 +39,14 @@ fn objects() {
     check("objects", include_str!("jit/objects.hr"), include_str!("jit/objects.out"));
 }
 
+/// Loops of numbers in registers and every way out of them: another type
+/// arriving, errors inside `일단 해보자`, `%` edge cases, breaks, booleans,
+/// nested loops, typed and constant variables, -0.
+#[test]
+fn loops() {
+    check("loops", include_str!("jit/loops.hr"), include_str!("jit/loops.out"));
+}
+
 #[test]
 fn calls_and_errors() {
     check("calls_and_errors", include_str!("jit/calls_and_errors.hr"), include_str!("jit/calls_and_errors.out"));

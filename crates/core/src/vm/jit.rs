@@ -29,6 +29,8 @@ use cranelift_module::Module;
 use super::*;
 use crate::value::ObjObj;
 
+mod loops;
+
 /// What the helpers answer instead of a pc.
 const RETURNED: u32 = 0xFFFF_FFF0;
 const ERR: u32 = 0xFFFF_FFF1;
@@ -150,6 +152,8 @@ pub(super) struct Ic {
 const IC_EMPTY: Ic = Ic { class: NONE, pos: 0, check: 0, access: 0 };
 
 pub(super) struct Jit {
+    /// What functions with loops in registers are compiled for.
+    loop_isa: cranelift_codegen::isa::OwnedTargetIsa,
     /// Whether compiled code counts references itself (`rc_layout_holds`).
     inline_rc: bool,
     /// Where an object's properties are inside it (through the `RefCell`).
@@ -173,15 +177,21 @@ pub(super) struct Jit {
 
 impl Jit {
     pub(super) fn new(protos: usize, threshold: u32) -> Option<Jit> {
-        let mut flags = settings::builder();
         // Quicker compiles: the code mostly moves values in memory, which the
         // optimizer gains nothing on. (The single-pass register allocator
         // compiles faster still, but its code runs twice as long.)
-        flags.set("opt_level", "none").ok()?;
-        flags.set("enable_verifier", "false").ok()?;
-        flags.set("use_colocated_libcalls", "false").ok()?;
-        flags.set("is_pic", "false").ok()?;
-        let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
+        let isa_with = |opt: &str| {
+            let mut flags = settings::builder();
+            flags.set("opt_level", opt).ok()?;
+            flags.set("enable_verifier", "false").ok()?;
+            flags.set("use_colocated_libcalls", "false").ok()?;
+            flags.set("is_pic", "false").ok()?;
+            cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()
+        };
+        let isa = isa_with(std::env::var("HARU_JIT_OPT").as_deref().unwrap_or("none"))?;
+        // Functions with loops in registers: the optimizer takes the checks
+        // and moves the copy repeats out of their loops.
+        let loop_isa = isa_with("speed")?;
         let module = JITModule::new(JITBuilder::with_isa(isa, cranelift_module::default_libcall_names()));
         let ctx = module.make_context();
         // Compiled code writes `Post::Value` as 0.
@@ -189,6 +199,7 @@ impl Jit {
             return None;
         }
         Some(Jit {
+            loop_isa,
             inline_rc: rc_layout_holds() && std::env::var_os("HARU_JIT_NO_INLINE_RC").is_none(),
             off_props: {
                 let o = ObjObj { class: 0, props: Default::default() };
@@ -249,6 +260,19 @@ impl Jit {
         }
     }
 
+    /// Compiles the function in `ctx` with the optimizer (`loop_isa`) and
+    /// hands the code to the module. The code has no relocations: helpers
+    /// are called by address and constants live in the code.
+    fn define_optimized(&mut self, id: cranelift_module::FuncId) -> Result<(), String> {
+        let compiled = self.ctx.compile(&*self.loop_isa, &mut Default::default()).map_err(|e| format!("{:?}", e.inner))?;
+        if !compiled.buffer.relocs().is_empty() {
+            return Err("relocations".into());
+        }
+        let align = (compiled.buffer.alignment as u64).max(16);
+        let bytes = compiled.code_buffer().to_vec();
+        self.module.define_function_bytes(id, align, &bytes, &[]).map_err(|e| format!("{e:?}"))
+    }
+
     fn compile(&mut self, proto_id: u32, prog: &Program) -> Option<Code> {
         let proto = &prog.protos[proto_id as usize];
         if proto.code.is_empty() || std::env::var_os("HARU_JIT_SKIP").is_some_and(|s| s.to_str() == Some(&proto.name)) {
@@ -261,11 +285,11 @@ impl Jit {
         sig.params.push(AbiParam::new(ptr));
         sig.returns.push(AbiParam::new(types::I32));
         let id = self.module.declare_anonymous_function(&self.ctx.func.signature).ok()?;
-        {
+        let has_loops = {
             let b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
             let ics = self.ics[proto_id as usize].as_mut_ptr();
-            Gen::new(b, ptr, cc, proto, prog, self.table.as_ptr(), self.inline_rc, self.off_props, ics).build();
-        }
+            Gen::new(b, ptr, cc, proto, prog, self.table.as_ptr(), self.inline_rc, self.off_props, ics).build()
+        };
         if std::env::var_os("HARU_JIT_DEBUG").is_some() {
             eprintln!(
                 "  {} blocks, {} insts, {} regs, {}/{} ops native",
@@ -276,7 +300,19 @@ impl Jit {
                 proto.code.len()
             );
         }
-        if let Err(e) = self.module.define_function(id, &mut self.ctx) {
+        let dump = std::env::var_os("HARU_JIT_DUMP").is_some_and(|d| d.to_str() == Some(&proto.name));
+        self.ctx.set_disasm(dump);
+        let defined = if has_loops && std::env::var_os("HARU_JIT_OPT").is_none() {
+            self.define_optimized(id)
+        } else {
+            self.module.define_function(id, &mut self.ctx).map_err(|e| format!("{e:?}"))
+        };
+        if dump {
+            if let Some(code) = self.ctx.compiled_code().and_then(|c| c.vcode.as_ref()) {
+                eprintln!("{code}");
+            }
+        }
+        if let Err(e) = defined {
             if std::env::var_os("HARU_JIT_DEBUG").is_some() {
                 eprintln!("jit: {}: {e:?}", proto.name);
             }
@@ -1022,7 +1058,7 @@ struct Gen<'a, 'b> {
 }
 
 /// Where a value sits: a register or a global.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum At {
     Reg(Reg),
     Global(u32),
@@ -1102,17 +1138,38 @@ impl<'a, 'b> Gen<'a, 'b> {
         g
     }
 
-    fn build(mut self) {
+    /// Builds the function; whether it has loops in registers.
+    fn build(mut self) -> bool {
+        // Loops of numbers get a copy that keeps them in CPU registers,
+        // entered at the loop head.
+        let found = match std::env::var_os("HARU_JIT_NO_LOOPS") {
+            Some(_) => Vec::new(),
+            None => loops::find(&self.proto.code, self.prog),
+        };
+        let mut regions: Vec<loops::Region> = found.iter().map(|&(h, j)| self.region(h, j)).collect();
+        if std::env::var_os("HARU_JIT_DEBUG").is_some() && !found.is_empty() {
+            eprintln!("  loops in registers: {found:?}");
+        }
         for i in 0..self.proto.code.len() {
             let blk = self.blocks[i];
             self.switch(blk);
+            if let Some(r) = regions.iter().find(|r| r.head == i) {
+                let ordinary = self.b.create_block();
+                self.enter_region(r, ordinary);
+                self.switch(ordinary);
+            }
             self.op(i);
         }
+        for r in &mut regions {
+            self.emit_region(r);
+        }
+        let has_loops = !regions.is_empty();
         self.emit_dispatch();
         self.switch(self.trap);
         self.b.ins().trap(TrapCode::unwrap_user(1));
         self.b.seal_all_blocks();
         self.b.finalize();
+        has_loops
     }
 
     /// The registers' address, again (after a helper that may have moved
