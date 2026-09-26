@@ -408,13 +408,13 @@ impl Default for Member {
 pub struct ClassInfo {
     pub name: u32,
     pub is_abstract: bool,
-    pub members: HashMap<u32, Member>,
+    pub members: crate::value::Map<u32, Member>,
     /// Declared type of a field (first non-static declaration of the chain).
-    pub field_types: HashMap<u32, u32>,
+    pub field_types: crate::value::Map<u32, u32>,
     /// The constructor (first of the chain).
     pub ctor: Option<u32>,
     /// Static methods of the class itself.
-    pub statics: HashMap<u32, u32>,
+    pub statics: crate::value::Map<u32, u32>,
     /// `<기호 같다>` of the class itself, compiled for `==`.
     pub equals: Option<u32>,
     /// Its own field initializers as a body (see `Op::InitFieldsDyn`).
@@ -463,7 +463,7 @@ pub struct ModuleInfo {
     pub functions: HashMap<String, u32>,
     pub all_functions: Vec<(String, u32)>,
     /// Its classes (name symbol -> class id) and interfaces.
-    pub classes: HashMap<u32, u32>,
+    pub classes: crate::value::Map<u32, u32>,
     pub interfaces: HashSet<u32>,
     /// The name of its language's built-in error class.
     pub error_class: u32,

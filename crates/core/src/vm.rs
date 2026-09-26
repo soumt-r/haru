@@ -129,11 +129,11 @@ enum Post {
 /// run in the caller's; a module's top-level code runs in the module's.
 struct Namespace {
     lang: &'static Lang,
-    classes: HashMap<u32, u32>,
+    classes: crate::value::Map<u32, u32>,
     interfaces: HashSet<u32>,
     /// Which module a class name was brought from (for conflicts).
     owners: HashMap<u32, String>,
-    statics: HashMap<(u32, u32), Value>,
+    statics: crate::value::Map<(u32, u32), Value>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -184,7 +184,7 @@ pub struct Vm<'p> {
     module_ns: Vec<Option<u32>>,
     module_state: Vec<ModState>,
     /// What each reflection site settled on.
-    reflected: HashMap<u32, u32>,
+    reflected: crate::value::Map<u32, u32>,
     runtime: Option<&'p Runtime>,
     /// While a native function calls back into the program: the frame count
     /// at which that call is done (0 otherwise).
@@ -220,7 +220,7 @@ impl<'p> Vm<'p> {
                 v[0] = ModState::Loading;
                 v
             },
-            reflected: HashMap::new(),
+            reflected: Default::default(),
             runtime: None,
             stop_at: 0,
             captured: None,
@@ -1123,7 +1123,7 @@ impl<'p> Vm<'p> {
                     }
                     Op::MakeDict { dst, base: b, n } => {
                         crate::gc::safe_point();
-                        let mut map = HashMap::with_capacity(n as usize);
+                        let mut map = crate::value::Map::with_capacity_and_hasher(n as usize, Default::default());
                         for i in 0..n as usize {
                             let k = std::mem::replace(&mut reg!(b as usize + 2 * i), Value::UNDEF);
                             let v = std::mem::replace(&mut reg!(b as usize + 2 * i + 1), Value::UNDEF);
@@ -2090,7 +2090,7 @@ impl Namespace {
             classes: m.classes.clone(),
             interfaces: m.interfaces.clone(),
             owners: HashMap::new(),
-            statics: HashMap::new(),
+            statics: Default::default(),
         }
     }
 }

@@ -6,6 +6,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+
+/// The maps the running program uses (keys are symbols and values; no
+/// hashing attacks to fear, so a fast hasher).
+pub type Map<K, V> = HashMap<K, V, rustc_hash::FxBuildHasher>;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem::ManuallyDrop;
@@ -32,14 +36,14 @@ pub struct ListObj {
 /// A dictionary. Keys compare the way Hana's (Go map) keys do: numbers,
 /// strings and booleans by value, lists and objects by identity.
 pub struct DictObj {
-    pub map: RefCell<HashMap<Key, Value>>,
+    pub map: RefCell<Map<Key, Value>>,
 }
 
 /// An instance: its class and its properties (created by assignment, as in
 /// Hana, so not a fixed layout). Keys are symbols (`crate::symbol`).
 pub struct ObjObj {
     pub class: u32,
-    pub props: RefCell<HashMap<u32, Value>>,
+    pub props: RefCell<Map<u32, Value>>,
 }
 
 /// A native object (a resource): the object a module gave and its kind,
@@ -107,7 +111,7 @@ impl Value {
         Value::heap(tag::LIST, r)
     }
 
-    pub fn dict(map: HashMap<Key, Value>) -> Value {
+    pub fn dict(map: Map<Key, Value>) -> Value {
         let r = Rc::new(DictObj { map: RefCell::new(map) });
         crate::gc::track_dict(&r);
         Value::heap(tag::DICT, r)
@@ -118,7 +122,7 @@ impl Value {
     }
 
     pub fn object(class: u32) -> Value {
-        let r = Rc::new(ObjObj { class, props: RefCell::new(HashMap::new()) });
+        let r = Rc::new(ObjObj { class, props: RefCell::new(Map::default()) });
         crate::gc::track_object(&r);
         Value::heap(tag::OBJECT, r)
     }

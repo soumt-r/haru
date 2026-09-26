@@ -681,10 +681,10 @@ impl<'a> Compiler<'a> {
             let mut info = ClassInfo {
                 name: symbol::intern(name),
                 is_abstract: *is_abstract,
-                members: HashMap::new(),
-                field_types: HashMap::new(),
+                members: Default::default(),
+                field_types: Default::default(),
                 ctor: None,
-                statics: HashMap::new(),
+                statics: Default::default(),
                 equals: protos[name].equals,
                 init: protos[name].init,
                 lineage: Vec::new(),

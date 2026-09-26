@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 haru-abi.workspace = true
 haru-syntax.workspace = true
+rustc-hash = "2"
