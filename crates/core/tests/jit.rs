@@ -67,3 +67,11 @@ fn calls_and_errors() {
 fn lazy_frames() {
     check("lazy_frames", include_str!("jit/lazy_frames.hr"), include_str!("jit/lazy_frames.out"));
 }
+
+/// A method's variables: fields read and declared as variables, a field
+/// added later, a global of the same name, a name in two scopes, typed and
+/// constant declarations, appending.
+#[test]
+fn method_vars() {
+    check("method_vars", include_str!("jit/method_vars.hr"), include_str!("jit/method_vars.out"));
+}

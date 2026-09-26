@@ -1780,59 +1780,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             },
             Op::UpdateK { var, k, op, skip } => self.update_k(i, var, k, op, skip),
             Op::Update { op, .. } if !matches!(op, BinOp::Add | BinOp::Sub) => self.direct(i),
-            Op::Update { var, a, b, op } => {
-                let (target, meta) = match self.prog.vars[var as usize].slots.as_slice() {
-                    [Slot { loc: Loc::Reg(r), meta }] => (At::Reg(*r), *meta),
-                    [Slot { loc: Loc::Global(g), meta }] => (At::Global(*g), *meta),
-                    _ => return self.direct(i),
-                };
-                // Strings (appending) and the rest: h_op, else the interpreter.
-                let slow = self.direct_block(i);
-                if let Some(m) = meta {
-                    // A declared type or 고정: a number fits when the type is
-                    // none, a number or anything, and it is not a constant.
-                    let m = match m {
-                        Loc::Reg(r) => At::Reg(r),
-                        Loc::Global(g) => At::Global(g),
-                        Loc::This(_) => return self.direct(i),
-                    };
-                    let ma = self.addr(m);
-                    let t = self.tag_of(ma);
-                    let is_num = self.is_tag(t, TAG_NUM);
-                    let (typed, untyped) = (self.b.create_block(), self.b.create_block());
-                    let not_num = self.b.create_block();
-                    self.b.ins().brif(is_num, typed, &[], not_num, &[]);
-                    self.switch(not_num);
-                    // Undefined or null: no type.
-                    let u = self.is_tag(t, TAG_UNDEF);
-                    let n = self.is_tag(t, TAG_NULL);
-                    let none = self.b.ins().bor(u, n);
-                    self.b.ins().brif(none, untyped, &[], slow, &[]);
-                    self.switch(typed);
-                    let v = self.num_of(ma);
-                    let mut ok = None;
-                    for id in number_types(self.prog) {
-                        let k = self.b.ins().f64const((id * 2) as f64);
-                        let c = self.b.ins().fcmp(FloatCC::Equal, v, k);
-                        ok = Some(match ok {
-                            Some(o) => self.b.ins().bor(o, c),
-                            None => c,
-                        });
-                    }
-                    match ok {
-                        Some(ok) => self.b.ins().brif(ok, untyped, &[], slow, &[]),
-                        None => self.b.ins().jump(slow, &[]),
-                    };
-                    self.switch(untyped);
-                }
-                let (xa, ya) = (self.addr(At::Reg(a)), self.addr(At::Reg(b)));
-                let (x, y) = self.both_nums(xa, ya, slow);
-                let r = if op == BinOp::Add { self.b.ins().fadd(x, y) } else { self.b.ins().fsub(x, y) };
-                let r = self.boxed(r);
-                let t = self.addr(target);
-                self.store_num(t, r);
-                self.jump_next(i);
-            }
+            Op::Update { var, a, b, op } => self.update_op(i, var, a, b, op),
             Op::Undef { from, to } => {
                 if (to - from) as i64 <= UNROLL {
                     for r in from..to {
@@ -2029,10 +1977,26 @@ impl<'a, 'b> Gen<'a, 'b> {
                 self.set_index(i, obj, ka, c.as_num(), val)
             }
             Op::MethodPrep { obj, .. } => self.method_prep(i, obj),
-            Op::GetVar { dst, var } => match self.prog.vars[var as usize].slots.first() {
-                Some(Slot { loc: Loc::Reg(r), .. }) => self.get_var_reg(i, dst, *r),
-                _ => self.direct(i),
-            },
+            Op::GetVar { dst, var } => {
+                let slots = &self.prog.vars[var as usize].slots;
+                let regs: Vec<Reg> = slots
+                    .iter()
+                    .map_while(|s| match s.loc {
+                        Loc::Reg(r) => Some(r),
+                        _ => None,
+                    })
+                    .collect();
+                let this = match slots.get(regs.len()) {
+                    Some(Slot { loc: Loc::This(name), .. }) => Some(*name),
+                    _ => None,
+                };
+                match (regs.as_slice(), this) {
+                    ([], _) => self.direct(i),
+                    ([r], None) => self.get_var_reg(i, dst, *r),
+                    _ => self.get_var_this(i, dst, &regs, this),
+                }
+            }
+            Op::Decl { var, src, ty, konst: false } if self.decl_local_fits(var, ty) => self.decl_local(i, var, src, ty),
             Op::Member { dst, obj, name, skip } => self.member(i, dst, obj, name, skip),
             Op::SetMember { obj, val, name, skip } if name != NONE => self.set_member(i, obj, val, name, skip),
             Op::SetMember { .. } => self.direct(i),
@@ -2924,6 +2888,242 @@ impl<'a, 'b> Gen<'a, 'b> {
 
     /// A variable whose first place is register `r`: its value when it has
     /// one (else `h_op` looks further).
+    /// `'x'에 y를 더하자` (or 빼자) of numbers, into the variable's place. A
+    /// method's variable is in the first of its registers that holds it
+    /// (anything else: `h_op`).
+    fn update_op(&mut self, i: usize, var: u32, a: Reg, b: Reg, op: BinOp) {
+        if !matches!(op, BinOp::Add | BinOp::Sub) {
+            return self.direct(i);
+        }
+        let slots = self.prog.vars[var as usize].slots.clone();
+        let places: Vec<(At, Option<Loc>)> = match slots.as_slice() {
+            [Slot { loc: Loc::Reg(r), meta }] => vec![(At::Reg(*r), *meta)],
+            [Slot { loc: Loc::Global(g), meta }] => vec![(At::Global(*g), *meta)],
+            _ => slots
+                .iter()
+                .map_while(|s| match s.loc {
+                    Loc::Reg(r) => Some((At::Reg(r), s.meta)),
+                    _ => None,
+                })
+                .collect(),
+        };
+        if places.is_empty() {
+            return self.direct(i);
+        }
+        let single = slots.len() == 1;
+        // Strings (appending) and the rest: h_op, else the interpreter.
+        let slow = self.direct_block(i);
+        for (k, &(target, meta)) in places.iter().enumerate() {
+            if single {
+                self.update_into(i, target, meta, a, b, op, slow);
+                break;
+            }
+            // Not this place when it holds nothing: the next one.
+            let other = if k + 1 == places.len() { slow } else { self.b.create_block() };
+            let ta = self.addr(target);
+            let t = self.tag_of(ta);
+            let undef = self.is_tag(t, TAG_UNDEF);
+            let go = self.b.create_block();
+            self.b.ins().brif(undef, other, &[], go, &[]);
+            self.switch(go);
+            self.update_into(i, target, meta, a, b, op, slow);
+            if other != slow {
+                self.switch(other);
+            }
+        }
+    }
+
+    /// The numeric update of `update_op` into `target` (whose declared type
+    /// and constness `meta` holds), else `slow`.
+    #[allow(clippy::too_many_arguments)]
+    fn update_into(&mut self, i: usize, target: At, meta: Option<Loc>, a: Reg, b: Reg, op: BinOp, slow: Block) {
+        if let Some(m) = meta {
+            // A declared type or 고정: a number fits when the type is
+            // none, a number or anything, and it is not a constant.
+            let m = match m {
+                Loc::Reg(r) => At::Reg(r),
+                Loc::Global(g) => At::Global(g),
+                Loc::This(_) => {
+                    self.b.ins().jump(slow, &[]);
+                    return;
+                }
+            };
+            let ma = self.addr(m);
+            let t = self.tag_of(ma);
+            let is_num = self.is_tag(t, TAG_NUM);
+            let (typed, untyped) = (self.b.create_block(), self.b.create_block());
+            let not_num = self.b.create_block();
+            self.b.ins().brif(is_num, typed, &[], not_num, &[]);
+            self.switch(not_num);
+            // Undefined or null: no type.
+            let u = self.is_tag(t, TAG_UNDEF);
+            let n = self.is_tag(t, TAG_NULL);
+            let none = self.b.ins().bor(u, n);
+            self.b.ins().brif(none, untyped, &[], slow, &[]);
+            self.switch(typed);
+            let v = self.num_of(ma);
+            let mut ok = None;
+            for id in number_types(self.prog) {
+                let k = self.b.ins().f64const((id * 2) as f64);
+                let c = self.b.ins().fcmp(FloatCC::Equal, v, k);
+                ok = Some(match ok {
+                    Some(o) => self.b.ins().bor(o, c),
+                    None => c,
+                });
+            }
+            match ok {
+                Some(ok) => self.b.ins().brif(ok, untyped, &[], slow, &[]),
+                None => self.b.ins().jump(slow, &[]),
+            };
+            self.switch(untyped);
+        }
+        let (xa, ya) = (self.addr(At::Reg(a)), self.addr(At::Reg(b)));
+        let (x, y) = self.both_nums(xa, ya, slow);
+        let r = if op == BinOp::Add { self.b.ins().fadd(x, y) } else { self.b.ins().fsub(x, y) };
+        let r = self.boxed(r);
+        let t = self.addr(target);
+        self.store_num(t, r);
+        self.jump_next(i);
+    }
+
+    /// The payload of the running method's object (`'나'`), or `fallback`.
+    fn this_object(&mut self, fallback: Block) -> V {
+        self.if_framed(fallback);
+        let fp = self.b.ins().load(self.ptr, flags(), self.vm, (OFF_FRAMES + OFF_PTR) as i32);
+        let off = self.b.ins().imul_imm(self.fi, FRAME_SIZE as i64);
+        let f = self.b.ins().iadd(fp, off);
+        let this = self.b.ins().iadd_imm(f, F_THIS as i64);
+        let t = self.tag_of(this);
+        let is_obj = self.is_tag(t, tag::OBJECT as i64);
+        let go = self.b.create_block();
+        self.b.ins().brif(is_obj, go, &[], fallback, &[]);
+        self.switch(go);
+        self.payload_of(this)
+    }
+
+    /// Looks for property `name` among the object's (at payload `p`): the
+    /// block it goes to when found (its parameter the value's address) and
+    /// the one when not.
+    fn scan_prop(&mut self, p: V, name: u32) -> (Block, Block) {
+        let props = self.off_props as i32;
+        let items = self.b.ins().load(self.ptr, flags(), p, props + OFF_PTR as i32);
+        let len = self.b.ins().load(types::I64, flags(), p, props + OFF_LEN as i32);
+        let (head, body, found, missing) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
+        self.b.append_block_param(head, types::I64);
+        self.b.append_block_param(found, self.ptr);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        self.b.ins().jump(head, &[BlockArg::Value(zero)]);
+        self.switch(head);
+        let k = self.b.block_params(head)[0];
+        let more = self.b.ins().icmp(IntCC::UnsignedLessThan, k, len);
+        self.b.ins().brif(more, body, &[], missing, &[]);
+        self.switch(body);
+        let off = self.b.ins().imul_imm(k, PROP_SIZE as i64);
+        let e = self.b.ins().iadd(items, off);
+        let n = self.b.ins().load(types::I32, flags(), e, PROP_NAME as i32);
+        let hit = self.b.ins().icmp_imm(IntCC::Equal, n, name as i64);
+        let v = self.b.ins().iadd_imm(e, PROP_VALUE as i64);
+        let k1 = self.b.ins().iadd_imm(k, 1);
+        self.b.ins().brif(hit, found, &[BlockArg::Value(v)], head, &[BlockArg::Value(k1)]);
+        (found, missing)
+    }
+
+    /// A variable of several places (`'x'` in a loop, in a method): the
+    /// first of its registers that holds it, else the object's property of
+    /// that name (a property read as a variable: no getter, no access
+    /// check), else `h_op`.
+    fn get_var_this(&mut self, i: usize, dst: Reg, regs: &[Reg], this: Option<u32>) {
+        let fallback = self.direct_block(i);
+        for &r in regs {
+            let s = self.addr(At::Reg(r));
+            let t = self.tag_of(s);
+            let undef = self.is_tag(t, TAG_UNDEF);
+            let (reg, other) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(undef, other, &[], reg, &[]);
+            self.switch(reg);
+            let d = self.addr(At::Reg(dst));
+            self.copy_value(s, d);
+            self.jump_next(i);
+            self.switch(other);
+        }
+        let Some(name) = this else {
+            self.b.ins().jump(fallback, &[]);
+            return;
+        };
+        let p = self.this_object(fallback);
+        let (found, missing) = self.scan_prop(p, name);
+        self.switch(missing);
+        self.b.ins().jump(fallback, &[]);
+        self.switch(found);
+        let v = self.b.block_params(found)[0];
+        let d = self.addr(At::Reg(dst));
+        self.copy_value(v, d);
+        self.jump_next(i);
+    }
+
+    /// Whether `decl_local` does a declaration of `var` with type `ty`: a
+    /// method's variable (its register, then the object's property, then
+    /// perhaps a global) of a type checked by tag.
+    fn decl_local_fits(&self, var: u32, ty: u32) -> bool {
+        let slots = self.prog.vars[var as usize].slots.as_slice();
+        let places = matches!(
+            slots,
+            [Slot { loc: Loc::Reg(_), meta: None | Some(Loc::Reg(_)) }, Slot { loc: Loc::This(_), .. }]
+                | [Slot { loc: Loc::Reg(_), meta: None | Some(Loc::Reg(_)) }, Slot { loc: Loc::This(_), .. }, Slot { loc: Loc::Global(_), .. }]
+        );
+        places && self.simple_type(ty).is_some()
+    }
+
+    /// `정하자` of a method's variable that is nowhere yet (the common case in
+    /// a loop's body, which starts without its variables): the value, of the
+    /// declared type, goes into its register. A variable that exists (in the
+    /// register, as a property, as a global) takes `h_op`'s way.
+    fn decl_local(&mut self, i: usize, var: u32, src: Reg, ty: u32) {
+        let slots = self.prog.vars[var as usize].slots.clone();
+        let (r, meta, name) = match (slots[0], slots[1]) {
+            (Slot { loc: Loc::Reg(r), meta }, Slot { loc: Loc::This(name), .. }) => (r, meta, name),
+            _ => unreachable!(),
+        };
+        let fallback = self.direct_block(i);
+        let va = self.addr(At::Reg(src));
+        let tags = self.simple_type(ty).unwrap();
+        self.check_tags(va, tags, fallback);
+        let ra = self.addr(At::Reg(r));
+        let t = self.tag_of(ra);
+        let undef = self.is_tag(t, TAG_UNDEF);
+        let go = self.b.create_block();
+        self.b.ins().brif(undef, go, &[], fallback, &[]);
+        self.switch(go);
+        if let Some(Slot { loc: Loc::Global(g), .. }) = slots.get(2) {
+            let ga = self.addr(At::Global(*g));
+            let t = self.tag_of(ga);
+            let undef = self.is_tag(t, TAG_UNDEF);
+            let go = self.b.create_block();
+            self.b.ins().brif(undef, go, &[], fallback, &[]);
+            self.switch(go);
+        }
+        let p = self.this_object(fallback);
+        let (found, missing) = self.scan_prop(p, name);
+        self.switch(found);
+        self.b.ins().jump(fallback, &[]);
+        self.switch(missing);
+        // The value moves into the register (which held nothing).
+        let va = self.addr(At::Reg(src));
+        let vt = self.b.ins().load(types::I64, flags(), va, 0);
+        let vp = self.b.ins().load(types::I64, flags(), va, 8);
+        let ra = self.addr(At::Reg(r));
+        self.store(ra, vt, vp);
+        let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
+        self.b.ins().store(flags(), undef, va, 0);
+        if let Some(Loc::Reg(m)) = meta {
+            let ma = self.addr(At::Reg(m));
+            let t = self.b.ins().iconst(types::I64, TAG_NUM);
+            let n = self.b.ins().iconst(types::I64, ((ty * 2) as f64).to_bits() as i64);
+            self.store(ma, t, n);
+        }
+        self.jump_next(i);
+    }
+
     fn get_var_reg(&mut self, i: usize, dst: Reg, r: Reg) {
         let fallback = self.direct_block(i);
         let s = self.addr(At::Reg(r));
