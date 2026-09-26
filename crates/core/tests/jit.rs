@@ -31,6 +31,14 @@ fn deep_calls() {
     check("deep_calls", include_str!("jit/deep_calls.hr"), include_str!("jit/deep_calls.out"));
 }
 
+/// Inline caches: a site that sees two classes, fields in other places,
+/// access rules from inside and outside, getters and setters, a field's
+/// type on write, dictionaries, string appends, typed lists.
+#[test]
+fn objects() {
+    check("objects", include_str!("jit/objects.hr"), include_str!("jit/objects.out"));
+}
+
 #[test]
 fn calls_and_errors() {
     check("calls_and_errors", include_str!("jit/calls_and_errors.hr"), include_str!("jit/calls_and_errors.out"));

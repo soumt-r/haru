@@ -12,6 +12,13 @@
 //!   haru ast <file>          (syntax tree as JSON)
 //!   haru ast-check <dir>     (compare with Hana's trees from tools/astdump)
 
+/// The allocator for everything `haru` (and a program built with it) does:
+/// values are many small allocations, where the system's allocator is slow
+/// (Windows' especially). Native packages keep their own allocators: a value
+/// is always made and freed by the host, a resource by its own module.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod ast;
 mod build;
 mod manifest;

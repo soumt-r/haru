@@ -27,6 +27,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::Module;
 
 use super::*;
+use crate::value::ObjObj;
 
 /// What the helpers answer instead of a pc.
 const RETURNED: u32 = 0xFFFF_FFF0;
@@ -102,7 +103,59 @@ enum State {
     Ready(Code),
 }
 
+/// Where an `Rc`'s strong count is, before the value its pointer points at
+/// (std's `RcInner` is `repr(C)`: strong, weak, value). Compiled code counts
+/// references itself when `rc_layout_holds` finds it so.
+const RC_STRONG: i32 = -16;
+
+/// Whether the strong count of every kind of heap value is at `RC_STRONG`.
+fn rc_layout_holds() -> bool {
+    use crate::value::{DictObj, ListObj, ObjObj, ResObj, StrObj};
+    fn check<T>(v: T) -> bool {
+        if mem::align_of::<T>() > 8 {
+            return false;
+        }
+        let p = std::rc::Rc::into_raw(std::rc::Rc::new(v));
+        let count = unsafe { *((p as *const u8).offset(RC_STRONG as isize) as *const usize) };
+        unsafe { std::rc::Rc::increment_strong_count(p) };
+        let two = unsafe { *((p as *const u8).offset(RC_STRONG as isize) as *const usize) };
+        unsafe {
+            std::rc::Rc::decrement_strong_count(p);
+            drop(std::rc::Rc::from_raw(p));
+        }
+        count == 1 && two == 2
+    }
+    mem::align_of::<ResObj>() <= 8
+        && mem::align_of::<crate::value::FuncObj>() <= 8
+        && check(StrObj { text: String::new() })
+        && check(ListObj { items: Default::default() })
+        && check(DictObj { map: Default::default() })
+        && check(ObjObj { class: 0, props: Default::default() })
+}
+
+/// An inline cache: at a property read or write, the class of the object
+/// last seen there and where the property was in it; `check` is what the
+/// written value must be (0 anything, 1 a number, 2 a string, 3 a boolean,
+/// or 비어있음 for 1-3); `access` who may read it (0 anyone, 1 a method, 2
+/// a method of that very object). `class` NONE: nothing seen yet.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct Ic {
+    class: u32,
+    pos: u32,
+    check: u32,
+    access: u32,
+}
+
+const IC_EMPTY: Ic = Ic { class: NONE, pos: 0, check: 0, access: 0 };
+
 pub(super) struct Jit {
+    /// Whether compiled code counts references itself (`rc_layout_holds`).
+    inline_rc: bool,
+    /// Where an object's properties are inside it (through the `RefCell`).
+    off_props: usize,
+    /// Each compiled function's inline caches, one per instruction.
+    ics: Vec<Box<[Ic]>>,
     /// Each function's code, or 0 (not compiled): what compiled calls read.
     table: Box<[usize]>,
     /// Calls and loop turns of each function not compiled yet; it is
@@ -136,6 +189,12 @@ impl Jit {
             return None;
         }
         Some(Jit {
+            inline_rc: rc_layout_holds() && std::env::var_os("HARU_JIT_NO_INLINE_RC").is_none(),
+            off_props: {
+                let o = ObjObj { class: 0, props: Default::default() };
+                o.props.as_ptr() as usize - &o as *const ObjObj as usize
+            },
+            ics: (0..protos).map(|_| Box::default()).collect(),
             table: vec![0; protos].into_boxed_slice(),
             counts: vec![0; protos],
             threshold,
@@ -154,9 +213,12 @@ impl Jit {
             State::Ready(c) => Some(c),
             State::Failed => None,
             State::Untried => {
+                // Compiling takes time in proportion to the function's size, so a
+                // bigger one must have run longer first.
+                let size = prog.protos[id as usize].code.len() as u32;
                 let n = &mut self.counts[id as usize];
                 *n += 1;
-                if *n <= self.threshold {
+                if *n <= self.threshold.saturating_mul(1 + size / 16) {
                     return None;
                 }
                 // Code that is mostly what the interpreter does anyway gains
@@ -168,7 +230,8 @@ impl Jit {
                     return None;
                 }
                 let started = std::time::Instant::now();
-                let c = self.compile(&prog.protos[id as usize], prog);
+                self.ics[id as usize] = vec![IC_EMPTY; prog.protos[id as usize].code.len()].into_boxed_slice();
+                let c = self.compile(id, prog);
                 if std::env::var_os("HARU_JIT_DEBUG").is_some() {
                     let p = &prog.protos[id as usize];
                     eprintln!("jit: {} ({} ops): {:?}{}", p.name, p.code.len(), started.elapsed(), if c.is_none() { " failed" } else { "" });
@@ -186,7 +249,8 @@ impl Jit {
         }
     }
 
-    fn compile(&mut self, proto: &Proto, prog: &Program) -> Option<Code> {
+    fn compile(&mut self, proto_id: u32, prog: &Program) -> Option<Code> {
+        let proto = &prog.protos[proto_id as usize];
         if proto.code.is_empty() || std::env::var_os("HARU_JIT_SKIP").is_some_and(|s| s.to_str() == Some(&proto.name)) {
             return None;
         }
@@ -199,7 +263,8 @@ impl Jit {
         let id = self.module.declare_anonymous_function(&self.ctx.func.signature).ok()?;
         {
             let b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
-            Gen::new(b, ptr, cc, proto, prog, self.table.as_ptr()).build();
+            let ics = self.ics[proto_id as usize].as_mut_ptr();
+            Gen::new(b, ptr, cc, proto, prog, self.table.as_ptr(), self.inline_rc, self.off_props, ics).build();
         }
         if std::env::var_os("HARU_JIT_DEBUG").is_some() {
             eprintln!(
@@ -226,6 +291,12 @@ impl Jit {
 }
 
 impl Vm<'_> {
+    /// The inline cache of instruction `pc` of the running frame `fi`.
+    fn ic(&mut self, fi: usize, pc: u32) -> Option<&mut Ic> {
+        let proto = self.frames[fi].proto as usize;
+        self.jit.as_mut()?.ics.get_mut(proto)?.get_mut(pc as usize)
+    }
+
     /// Whether the interpreter, running instructions for compiled code,
     /// hands back at `pc` of `proto`.
     #[inline]
@@ -306,12 +377,58 @@ impl Vm<'_> {
     }
 }
 
+// ---- counting what the helpers do (HARU_JIT_STATS)
+
+mod stats {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("HARU_JIT_STATS").is_some())
+    }
+
+    thread_local! {
+        static COUNTS: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
+    }
+
+    pub fn count(what: impl FnOnce() -> String) {
+        if on() {
+            COUNTS.with(|c| *c.borrow_mut().entry(what()).or_default() += 1);
+        }
+    }
+
+    pub fn report() {
+        if on() {
+            COUNTS.with(|c| {
+                let mut v: Vec<_> = c.borrow().iter().map(|(k, n)| (k.clone(), *n)).collect();
+                v.sort_by(|a, b| b.1.cmp(&a.1));
+                for (k, n) in v {
+                    eprintln!("jit stats: {n:>10} {k}");
+                }
+            });
+        }
+    }
+}
+
+pub(super) fn report_stats() {
+    stats::report();
+}
+
+/// The instruction at `pc` of frame `fi`, by name (for the counts).
+fn op_name(vm: &Vm, fi: usize, pc: u32) -> String {
+    let op = vm.prog.protos[vm.frames[fi].proto as usize].code[pc as usize];
+    format!("{op:?}").split([' ', '{']).next().unwrap_or("").to_string()
+}
+
 // ---- helpers the compiled code calls
 
 unsafe extern "C" fn h_step(env: *mut Env, pc: u32) -> u32 {
     let env = &mut *env;
     let vm = &mut *env.vm;
     let fi = env.fi;
+    stats::count(|| format!("step {}", op_name(vm, fi, pc)));
     vm.frames[fi].pc = pc as usize;
     let r = vm.exec_mode::<true>();
     let next = vm.jit_resume(fi, r);
@@ -320,6 +437,7 @@ unsafe extern "C" fn h_step(env: *mut Env, pc: u32) -> u32 {
 }
 
 unsafe extern "C" fn h_call(env: *mut Env, pc: u32) -> u32 {
+    stats::count(|| "h_call".to_string());
     let env = &mut *env;
     let vm = &mut *env.vm;
     let fi = env.fi;
@@ -339,6 +457,7 @@ unsafe extern "C" fn h_call(env: *mut Env, pc: u32) -> u32 {
 /// and fills `callee` for it, returning the code. 0: the callee has none
 /// (nothing done); 1: starting it failed (the signal kept).
 unsafe extern "C" fn h_call_start(env: *mut Env, pc: u32, callee: *mut Env) -> usize {
+    stats::count(|| "h_call_start".to_string());
     let env = &mut *env;
     let vm = &mut *env.vm;
     let fi = env.fi;
@@ -375,6 +494,7 @@ unsafe extern "C" fn h_call_start(env: *mut Env, pc: u32, callee: *mut Env) -> u
 
 /// After a fast call at `pc` failed: to start (`started` 0) or in the callee.
 unsafe extern "C" fn h_call_failed(env: *mut Env, pc: u32, started: u32) -> u32 {
+    stats::count(|| "h_call_failed".to_string());
     let env = &mut *env;
     let vm = &mut *env.vm;
     let fi = env.fi;
@@ -386,7 +506,414 @@ unsafe extern "C" fn h_call_failed(env: *mut Env, pc: u32, started: u32) -> u32 
     next
 }
 
+/// What `h_op` answers when the common case does not hold: it changed
+/// nothing, and the interpreter does the instruction instead.
+const SLOW: u32 = u32::MAX;
+
+/// Instructions done here directly (no trip through the interpreter's
+/// loop), with the interpreter's own code, in their common case: the next
+/// pc, or `SLOW`. Nothing is changed before the case is known to hold, so
+/// the interpreter can then do the instruction from the start.
+unsafe extern "C" fn h_op(env: *mut Env, pc: u32) -> u32 {
+    let env = &mut *env;
+    let vm = &mut *env.vm;
+    let fi = env.fi;
+    stats::count(|| format!("op {}", op_name(vm, fi, pc)));
+    let prog = vm.prog;
+    let op = prog.protos[vm.frames[fi].proto as usize].code[pc as usize];
+    let regs = vm.stack.as_mut_ptr().add(env.base);
+    let reg = |r: Reg| unsafe { &mut *regs.add(r as usize) };
+    let next = pc + 1;
+    match op {
+        Op::GetVar { dst, var } => match vm.read_var(var, fi) {
+            Ok(v) => {
+                *reg(dst) = v;
+                next
+            }
+            Err(_) => SLOW,
+        },
+        Op::Decl { var, src, ty, konst } => match vm.declare(var, fi, reg(src).clone(), ty, konst) {
+            Ok(()) => {
+                *reg(src) = Value::UNDEF;
+                next
+            }
+            Err(_) => SLOW,
+        },
+        Op::Assign { var, src } => match vm.assign(var, fi, reg(src).clone()) {
+            Ok(()) => {
+                *reg(src) = Value::UNDEF;
+                next
+            }
+            Err(_) => SLOW,
+        },
+        Op::SelfOr { dst, var } => {
+            let this = vm.frames[fi].this.clone();
+            if !this.is_undef() {
+                *reg(dst) = this;
+                return next;
+            }
+            match vm.read_var(var, fi) {
+                Ok(v) => {
+                    *reg(dst) = v;
+                    next
+                }
+                Err(_) => SLOW,
+            }
+        }
+        Op::GetThis { dst } => {
+            let this = vm.frames[fi].this.clone();
+            if this.is_undef() {
+                return SLOW;
+            }
+            *reg(dst) = this;
+            next
+        }
+        Op::Member { dst, obj, name, skip } => {
+            let o = reg(obj).clone();
+            let length = name == vm.length_word;
+            match o.tag() {
+                tag::LIST if length => {
+                    let n = o.as_list().unwrap().items.borrow().len();
+                    *reg(dst) = Value::num(n as f64);
+                    skip
+                }
+                tag::STR if length => {
+                    let n = o.as_str().unwrap().chars().count();
+                    *reg(dst) = Value::num(n as f64);
+                    skip
+                }
+                tag::LIST | tag::STR | tag::DICT => next,
+                tag::OBJECT => {
+                    let class = o.as_object().unwrap().class;
+                    let m = vm.member_of(class, name);
+                    if m.getter.is_some() || vm.check_access(fi, &o, m.field_access, false, name).is_err() {
+                        return SLOW;
+                    }
+                    let props = o.as_object().unwrap().props.borrow();
+                    let v = props.get(&name).cloned().unwrap_or(Value::NULL);
+                    // A field without a getter: compiled code reads it itself
+                    // next time (checking who may, as `check_access`).
+                    let at = props.position(name);
+                    drop(props);
+                    let access = match m.field_access {
+                        Access::Public => 0,
+                        Access::Protected => 1,
+                        Access::Private => 2,
+                    };
+                    if let (Some(pos), Some(ic)) = (at, vm.ic(fi, pc)) {
+                        *ic = Ic { class, pos: pos as u32, check: 0, access };
+                    }
+                    *reg(dst) = v;
+                    skip
+                }
+                CLASS => {
+                    let class = o.as_class().unwrap();
+                    match vm.namespaces[vm.ns as usize].statics.get(&(class, name)) {
+                        Some(v) => {
+                            *reg(dst) = v.clone();
+                            skip
+                        }
+                        None => SLOW,
+                    }
+                }
+                _ => SLOW,
+            }
+        }
+        Op::Index { dst, obj, key } => match vm.index(reg(obj), reg(key)) {
+            Ok(v) => {
+                *reg(dst) = v;
+                next
+            }
+            Err(_) => SLOW,
+        },
+        Op::IndexK { dst, obj, k } => match vm.index(reg(obj), &prog.consts[k as usize]) {
+            Ok(v) => {
+                *reg(dst) = v;
+                next
+            }
+            Err(_) => SLOW,
+        },
+        Op::SetIndex { obj, key, val } => {
+            let (o, k, v) = (reg(obj).clone(), reg(key).clone(), reg(val).clone());
+            match vm.set_index(&o, k, v) {
+                Ok(()) => next,
+                Err(_) => SLOW,
+            }
+        }
+        Op::SetIndexK { obj, k, val } => {
+            let (o, v) = (reg(obj).clone(), reg(val).clone());
+            match vm.set_index(&o, prog.consts[k as usize].clone(), v) {
+                Ok(()) => next,
+                Err(_) => SLOW,
+            }
+        }
+        Op::SetMember { obj, val, name, skip } => {
+            let o = reg(obj).clone();
+            match o.tag() {
+                tag::LIST | tag::DICT => next,
+                tag::OBJECT => {
+                    if name == NONE {
+                        return skip;
+                    }
+                    let class = o.as_object().unwrap().class;
+                    if vm.member_of(class, name).setter.is_some() {
+                        return SLOW;
+                    }
+                    let v = reg(val).clone();
+                    let ty = vm.class(class).and_then(|c| c.field_types.get(&name).copied()).unwrap_or(0);
+                    if ty != 0 && !vm.fits(ty, &v) {
+                        return SLOW;
+                    }
+                    let mut props = o.as_object().unwrap().props.borrow_mut();
+                    props.insert(name, v);
+                    // Compiled code writes it itself next time (checking the
+                    // value's type when it is a simple one).
+                    let at = props.position(name);
+                    drop(props);
+                    let check = match ty {
+                        0 => Some(0),
+                        _ => match prog.types[ty as usize].kind {
+                            TypeKind::Any => Some(0),
+                            TypeKind::Number => Some(1),
+                            TypeKind::String => Some(2),
+                            TypeKind::Boolean => Some(3),
+                            _ => None,
+                        },
+                    };
+                    if let (Some(pos), Some(check), Some(ic)) = (at, check, vm.ic(fi, pc)) {
+                        *ic = Ic { class, pos: pos as u32, check, access: 0 };
+                    }
+                    skip
+                }
+                CLASS => {
+                    if name != NONE {
+                        let v = reg(val).clone();
+                        vm.namespaces[vm.ns as usize].statics.insert((o.as_class().unwrap(), name), v);
+                    }
+                    skip
+                }
+                tag::STR => SLOW,
+                _ => skip,
+            }
+        }
+        Op::MethodPrep { obj, name } => {
+            let o = reg(obj).clone();
+            match o.tag() {
+                tag::OBJECT => {
+                    let class = o.as_object().unwrap().class;
+                    let m = vm.member_of(class, name);
+                    if vm.check_access(fi, &o, m.method_access, true, name).is_err() {
+                        return SLOW;
+                    }
+                    let access = match m.method_access {
+                        Access::Public => 0,
+                        Access::Protected => 1,
+                        Access::Private => 2,
+                    };
+                    if let Some(ic) = vm.ic(fi, pc) {
+                        *ic = Ic { class, pos: 0, check: 0, access };
+                    }
+                    next
+                }
+                CLASS => {
+                    let class = o.as_class().unwrap();
+                    match vm.class(class).is_some_and(|c| c.statics.contains_key(&name)) {
+                        true => next,
+                        false => SLOW,
+                    }
+                }
+                tag::STR | tag::LIST | tag::RESOURCE => next,
+                _ => SLOW,
+            }
+        }
+        Op::Update { var, a, b, op: BinOp::Add } if reg(a).tag() == tag::STR && reg(b).tag() == tag::STR => {
+            match vm.append_update(fi, var, a, b) {
+                Ok(true) => next,
+                _ => SLOW,
+            }
+        }
+        Op::NewObj { dst, class } => {
+            crate::gc::safe_point();
+            match vm.class(class) {
+                Some(c) if !c.is_abstract => {
+                    *reg(dst) = Value::object_with(class, c.field_types.len());
+                    next
+                }
+                _ => SLOW,
+            }
+        }
+        Op::InitField { obj, name, src, ty } => {
+            if ty != 0 && !vm.fits(ty, reg(src)) {
+                return SLOW;
+            }
+            let v = std::mem::replace(reg(src), Value::UNDEF);
+            reg(obj).as_object().unwrap().props.borrow_mut().insert(name, v);
+            next
+        }
+        Op::Format { dst, src } => {
+            let text = display(reg(src), vm.lang);
+            *reg(dst) = Value::string(text);
+            next
+        }
+        Op::Concat { dst, base: b, n } => {
+            let len: usize = (0..n).map(|i| reg(b + i).as_str().map_or(0, str::len)).sum();
+            let mut s = String::with_capacity(len);
+            for i in 0..n {
+                s.push_str(reg(b + i).as_str().unwrap_or(""));
+            }
+            *reg(dst) = Value::string(s);
+            next
+        }
+        Op::IterNext { iter, idx, dst, exit } => {
+            let i = reg(idx).as_num().unwrap() as usize;
+            let item = reg(iter).as_list().unwrap().items.borrow().get(i).cloned();
+            match item {
+                Some(v) => {
+                    *reg(dst) = v;
+                    *reg(idx) = Value::num((i + 1) as f64);
+                    next
+                }
+                None => exit,
+            }
+        }
+        Op::ListCheck { list, target } => {
+            if reg(list).tag() != tag::LIST || vm.require_mutable(target, fi).is_err() {
+                return SLOW;
+            }
+            next
+        }
+        Op::ListPush { list, val, front, target } => {
+            let l = reg(list).clone();
+            let Some(items) = l.as_list().map(|l| &l.items) else {
+                return SLOW;
+            };
+            // A copy goes in: when the check fails it comes out again and the
+            // interpreter does it all with the register as it was.
+            let v = reg(val).clone();
+            if front {
+                items.borrow_mut().insert(0, v);
+            } else {
+                items.borrow_mut().push(v);
+            }
+            if vm.check_push(target, fi, &l, front).is_err() {
+                if front {
+                    items.borrow_mut().remove(0);
+                } else {
+                    items.borrow_mut().pop();
+                }
+                return SLOW;
+            }
+            *reg(val) = Value::UNDEF;
+            next
+        }
+        Op::Eq { dst, a, b, neg } => {
+            // An object whose class has `<기호 같다>` decides itself.
+            if let Some(o) = reg(a).as_object() {
+                if vm.class(o.class).and_then(|c| c.equals).is_some() {
+                    return SLOW;
+                }
+            }
+            let eq = reg(a).go_eq(reg(b));
+            *reg(dst) = Value::bool(eq != neg);
+            next
+        }
+        _ => SLOW,
+    }
+}
+
+/// `h_call_start` for a constructor (`새로운`): its result is dropped.
+unsafe extern "C" fn h_ctor_start(env: *mut Env, pc: u32, callee: *mut Env) -> usize {
+    stats::count(|| "h_ctor_start".to_string());
+    let env = &mut *env;
+    let vm = &mut *env.vm;
+    let fi = env.fi;
+    let frame = &vm.frames[fi];
+    let base = frame.base;
+    let Op::CallCtor { obj, proto, class, base: b, argc } = vm.prog.protos[frame.proto as usize].code[pc as usize] else {
+        unreachable!()
+    };
+    let Some(code) = vm.jit_code(proto) else {
+        return 0;
+    };
+    let o = vm.stack[base + obj as usize].clone();
+    vm.frames[fi].pc = pc as usize + 1;
+    match vm.call_proto(proto, base + b as usize, argc, obj, o, class, Post::Discard, true) {
+        Ok(()) => {
+            let f = vm.frames.last().unwrap();
+            *callee = Env {
+                regs: vm.stack.as_mut_ptr().add(f.base),
+                globals: vm.globals.as_mut_ptr(),
+                vm: env.vm,
+                fi: fi + 1,
+                argc: argc as usize,
+                base: f.base,
+                start: 0,
+            };
+            code as usize
+        }
+        Err(s) => {
+            vm.jit_signal = Some(s);
+            env.refresh();
+            1
+        }
+    }
+}
+
+/// `h_call_start` for a method or a static method of the program.
+unsafe extern "C" fn h_method_start(env: *mut Env, pc: u32, callee: *mut Env) -> usize {
+    stats::count(|| "h_method_start".to_string());
+    let env = &mut *env;
+    let vm = &mut *env.vm;
+    let fi = env.fi;
+    let frame = &vm.frames[fi];
+    let base = frame.base;
+    let Op::CallMethod { dst, obj, name, base: b, argc, .. } = vm.prog.protos[frame.proto as usize].code[pc as usize] else {
+        unreachable!()
+    };
+    let o = vm.stack[base + obj as usize].clone();
+    let (proto, this, class) = match o.tag() {
+        tag::OBJECT => {
+            let class = o.as_object().unwrap().class;
+            let p = if name == vm.init_name { vm.class(class).and_then(|c| c.ctor) } else { vm.member_of(class, name).method };
+            (p, o, class)
+        }
+        CLASS => {
+            let class = o.as_class().unwrap();
+            (vm.class(class).and_then(|c| c.statics.get(&name).copied()), Value::UNDEF, class)
+        }
+        _ => return 0,
+    };
+    let Some(proto) = proto else {
+        return 0;
+    };
+    let Some(code) = vm.jit_code(proto) else {
+        return 0;
+    };
+    vm.frames[fi].pc = pc as usize + 1;
+    match vm.call_proto(proto, base + b as usize, argc, dst, this, class, Post::Value, true) {
+        Ok(()) => {
+            let f = vm.frames.last().unwrap();
+            *callee = Env {
+                regs: vm.stack.as_mut_ptr().add(f.base),
+                globals: vm.globals.as_mut_ptr(),
+                vm: env.vm,
+                fi: fi + 1,
+                argc: argc as usize,
+                base: f.base,
+                start: 0,
+            };
+            code as usize
+        }
+        Err(s) => {
+            vm.jit_signal = Some(s);
+            env.refresh();
+            1
+        }
+    }
+}
+
 unsafe extern "C" fn h_return(env: *mut Env, src: u32) -> u32 {
+    stats::count(|| "h_return".to_string());
     let env = &mut *env;
     let vm = &mut *env.vm;
     let v = mem::replace(&mut vm.stack[env.base + src as usize], Value::UNDEF);
@@ -400,6 +927,7 @@ unsafe extern "C" fn h_return(env: *mut Env, src: u32) -> u32 {
 }
 
 unsafe extern "C" fn h_return_null(env: *mut Env) -> u32 {
+    stats::count(|| "h_return_null".to_string());
     let env = &mut *env;
     let vm = &mut *env.vm;
     if env.fi == 0 {
@@ -415,10 +943,12 @@ unsafe extern "C" fn h_return_null(env: *mut Env) -> u32 {
 }
 
 unsafe extern "C" fn h_drop(v: *mut Value) {
+    stats::count(|| "h_drop".to_string());
     std::ptr::drop_in_place(v);
 }
 
 unsafe extern "C" fn h_clone_into(dst: *mut Value, src: *const Value) {
+    stats::count(|| "h_clone_into".to_string());
     *dst = (*src).clone();
 }
 
@@ -445,6 +975,10 @@ const F_THIS: usize = mem::offset_of!(Frame, this);
 const F_SELF_CLASS: usize = mem::offset_of!(Frame, self_class);
 const F_NS: usize = mem::offset_of!(Frame, ns);
 const F_PENDING: usize = mem::offset_of!(Frame, pending);
+const OFF_OBJ_CLASS: usize = mem::offset_of!(ObjObj, class);
+const PROP_SIZE: usize = mem::size_of::<crate::value::Prop>();
+const PROP_NAME: usize = mem::offset_of!(crate::value::Prop, name);
+const PROP_VALUE: usize = mem::offset_of!(crate::value::Prop, value);
 
 const TAG_NULL: i64 = tag::NULL as i64;
 const TAG_BOOL: i64 = tag::BOOL as i64;
@@ -473,8 +1007,14 @@ struct Gen<'a, 'b> {
     fi: V,
     base_off: V,
     table: *const usize,
+    inline_rc: bool,
+    off_props: usize,
+    ics: *mut Ic,
+    /// The registers' address (loaded again after anything that may have
+    /// moved the stack).
     regs: Variable,
-    globals: Variable,
+    /// The globals' address (they never move).
+    globals: V,
     blocks: Vec<Block>,
     dispatch: Block,
     trap: Block,
@@ -500,6 +1040,9 @@ impl<'a, 'b> Gen<'a, 'b> {
         proto: &'a Proto,
         prog: &'a Program,
         table: *const usize,
+        inline_rc: bool,
+        off_props: usize,
+        ics: *mut Ic,
     ) -> Self {
         let mut sig = |params: &[types::Type], ret: Option<types::Type>| {
             let mut s = Signature::new(cc);
@@ -530,10 +1073,27 @@ impl<'a, 'b> Gen<'a, 'b> {
         let base = b.ins().load(ptr, flags(), env, 40);
         let base_off = b.ins().ishl_imm(base, 4);
         let regs = b.declare_var(ptr);
-        let globals = b.declare_var(ptr);
-        let g0 = b.ins().load(ptr, flags(), env, 8);
-        b.def_var(globals, g0);
-        let mut g = Gen { b, ptr, proto, prog, env, vm, fi, base_off, table, regs, globals, blocks, dispatch, trap, sigs };
+        let globals = b.ins().load(ptr, flags(), env, 8);
+        let mut g = Gen {
+            b,
+            ptr,
+            proto,
+            prog,
+            env,
+            vm,
+            fi,
+            base_off,
+            table,
+            inline_rc,
+            off_props,
+            ics,
+            regs,
+            globals,
+            blocks,
+            dispatch,
+            trap,
+            sigs,
+        };
         g.reload();
         let start = g.b.ins().load(types::I64, flags(), g.env, 48);
         let at = g.b.ins().ireduce(types::I32, start);
@@ -545,30 +1105,37 @@ impl<'a, 'b> Gen<'a, 'b> {
     fn build(mut self) {
         for i in 0..self.proto.code.len() {
             let blk = self.blocks[i];
-            self.b.switch_to_block(blk);
+            self.switch(blk);
             self.op(i);
         }
         self.emit_dispatch();
-        self.b.switch_to_block(self.trap);
+        self.switch(self.trap);
         self.b.ins().trap(TrapCode::unwrap_user(1));
         self.b.seal_all_blocks();
         self.b.finalize();
     }
 
-    /// The registers' and globals' addresses, again (after a helper that may
-    /// have moved the stack).
+    /// The registers' address, again (after a helper that may have moved
+    /// the stack).
     fn reload(&mut self) {
         let sp = self.b.ins().load(self.ptr, flags(), self.vm, (OFF_STACK + OFF_PTR) as i32);
         let r = self.b.ins().iadd(sp, self.base_off);
         self.b.def_var(self.regs, r);
     }
 
+    fn switch(&mut self, blk: Block) {
+        self.b.switch_to_block(blk);
+    }
+
     fn addr(&mut self, at: At) -> V {
-        let (var, i) = match at {
-            At::Reg(r) => (self.regs, r as i64),
-            At::Global(g) => (self.globals, g as i64),
+        let base = match at {
+            At::Reg(_) => self.b.use_var(self.regs),
+            At::Global(_) => self.globals,
         };
-        let base = self.b.use_var(var);
+        let i = match at {
+            At::Reg(r) => r as i64,
+            At::Global(g) => g as i64,
+        };
         self.b.ins().iadd_imm(base, i * 16)
     }
 
@@ -596,16 +1163,7 @@ impl<'a, 'b> Gen<'a, 'b> {
 
     /// Writes a value to `a`, releasing what was there.
     fn store(&mut self, a: V, tag: V, payload: V) {
-        let old = self.tag_of(a);
-        let t = self.b.ins().iadd_imm(old, -(tag::STR as i64));
-        let counted = self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, t, (tag::RESOURCE - tag::STR) as i64);
-        let release = self.b.create_block();
-        let cont = self.b.create_block();
-        self.b.ins().brif(counted, release, &[], cont, &[]);
-        self.b.switch_to_block(release);
-        self.call(self.sigs.one_ptr, h_drop as usize, &[a]);
-        self.b.ins().jump(cont, &[]);
-        self.b.switch_to_block(cont);
+        self.release(a);
         let tag = if self.b.func.dfg.value_type(tag) == types::I64 { tag } else { self.b.ins().uextend(types::I64, tag) };
         // Tag and (zero) padding in one store.
         self.b.ins().store(flags(), tag, a, 0);
@@ -658,25 +1216,25 @@ impl<'a, 'b> Gen<'a, 'b> {
     fn slow_block(&mut self, i: usize) -> Block {
         let cur = self.b.current_block().unwrap();
         let slow = self.b.create_block();
-        self.b.switch_to_block(slow);
+        self.switch(slow);
         self.step(i);
-        self.b.switch_to_block(cur);
+        self.switch(cur);
         slow
     }
 
     fn emit_dispatch(&mut self) {
-        self.b.switch_to_block(self.dispatch);
+        self.switch(self.dispatch);
         let r = self.b.block_params(self.dispatch)[0];
         let special = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, r, RETURNED as i64);
         let leave = self.b.create_block();
         let table = self.b.create_block();
         self.b.ins().brif(special, leave, &[], table, &[]);
 
-        self.b.switch_to_block(leave);
+        self.switch(leave);
         let status = self.b.ins().iadd_imm(r, -(RETURNED as i64));
         self.b.ins().return_(&[status]);
 
-        self.b.switch_to_block(table);
+        self.switch(table);
         let default = self.b.func.dfg.block_call(self.trap, &[]);
         let targets: Vec<_> = self.blocks.clone().into_iter().map(|blk| self.b.func.dfg.block_call(blk, &[])).collect();
         let jt = self.b.create_jump_table(JumpTableData::new(default, &targets));
@@ -696,7 +1254,20 @@ impl<'a, 'b> Gen<'a, 'b> {
                     (tag::NUM, Some(n), _) => (TAG_NUM, n.to_bits() as i64),
                     (tag::BOOL, _, Some(v)) => (TAG_BOOL, v as i64),
                     (tag::NULL, _, _) => (TAG_NULL, 0),
-                    _ => return self.step(i),
+                    _ => {
+                        // A string: a new reference to the constant.
+                        let d = self.addr(At::Reg(dst));
+                        let k = self.b.ins().iconst(self.ptr, c as *const Value as i64);
+                        if self.inline_rc && matches!(c.tag(), tag::STR..=tag::RESOURCE) {
+                            self.retain_counted(k);
+                            let t = self.b.ins().iconst(types::I64, c.tag() as i64);
+                            let p = self.payload_of(k);
+                            self.store(d, t, p);
+                        } else {
+                            self.call(self.sigs.two_ptr, h_clone_into as usize, &[d, k]);
+                        }
+                        return self.jump_next(i);
+                    }
                 };
                 let a = self.addr(At::Reg(dst));
                 let t = self.b.ins().iconst(types::I64, t);
@@ -728,20 +1299,22 @@ impl<'a, 'b> Gen<'a, 'b> {
                 Some(y) => self.binary(i, op, dst, a, None, Some(y)),
                 None => self.step(i),
             },
-            Op::Update { var, a, b, op } if matches!(op, BinOp::Add | BinOp::Sub) => {
+            Op::Update { op, .. } if !matches!(op, BinOp::Add | BinOp::Sub) => self.direct(i),
+            Op::Update { var, a, b, op } => {
                 let (target, meta) = match self.prog.vars[var as usize].slots.as_slice() {
                     [Slot { loc: Loc::Reg(r), meta }] => (At::Reg(*r), *meta),
                     [Slot { loc: Loc::Global(g), meta }] => (At::Global(*g), *meta),
-                    _ => return self.step(i),
+                    _ => return self.direct(i),
                 };
-                let slow = self.slow_block(i);
+                // Strings (appending) and the rest: h_op, else the interpreter.
+                let slow = self.direct_block(i);
                 if let Some(m) = meta {
                     // A declared type or 고정: a number fits when the type is
                     // none, a number or anything, and it is not a constant.
                     let m = match m {
                         Loc::Reg(r) => At::Reg(r),
                         Loc::Global(g) => At::Global(g),
-                        Loc::This(_) => return self.step(i),
+                        Loc::This(_) => return self.direct(i),
                     };
                     let ma = self.addr(m);
                     let t = self.tag_of(ma);
@@ -749,13 +1322,13 @@ impl<'a, 'b> Gen<'a, 'b> {
                     let (typed, untyped) = (self.b.create_block(), self.b.create_block());
                     let not_num = self.b.create_block();
                     self.b.ins().brif(is_num, typed, &[], not_num, &[]);
-                    self.b.switch_to_block(not_num);
+                    self.switch(not_num);
                     // Undefined or null: no type.
                     let u = self.is_tag(t, TAG_UNDEF);
                     let n = self.is_tag(t, TAG_NULL);
                     let none = self.b.ins().bor(u, n);
                     self.b.ins().brif(none, untyped, &[], slow, &[]);
-                    self.b.switch_to_block(typed);
+                    self.switch(typed);
                     let v = self.num_of(ma);
                     let mut ok = None;
                     for id in number_types(self.prog) {
@@ -770,7 +1343,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                         Some(ok) => self.b.ins().brif(ok, untyped, &[], slow, &[]),
                         None => self.b.ins().jump(slow, &[]),
                     };
-                    self.b.switch_to_block(untyped);
+                    self.switch(untyped);
                 }
                 let (xa, ya) = (self.addr(At::Reg(a)), self.addr(At::Reg(b)));
                 let (x, y) = self.both_nums(xa, ya, slow);
@@ -790,7 +1363,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 self.jump_next(i);
             }
             Op::Eq { dst, a, b, neg } => {
-                let slow = self.slow_block(i);
+                let slow = self.direct_block(i);
                 let (xa, ya) = (self.addr(At::Reg(a)), self.addr(At::Reg(b)));
                 let (x, y) = self.both_nums(xa, ya, slow);
                 let cc = if neg { FloatCC::NotEqual } else { FloatCC::Equal };
@@ -806,7 +1379,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let ok = self.is_tag(t, TAG_BOOL);
                 let fast = self.b.create_block();
                 self.b.ins().brif(ok, fast, &[], slow, &[]);
-                self.b.switch_to_block(fast);
+                self.switch(fast);
                 let p = self.payload_of(s);
                 let t = self.b.ins().iconst(types::I64, TAG_BOOL);
                 let d = self.addr(At::Reg(dst));
@@ -825,7 +1398,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let ok = self.is_tag(t, TAG_BOOL);
                 let fast = self.b.create_block();
                 self.b.ins().brif(ok, fast, &[], slow, &[]);
-                self.b.switch_to_block(fast);
+                self.switch(fast);
                 let p = self.payload_of(c);
                 let (to, next) = (self.blocks[to as usize], self.next(i));
                 if jump_on {
@@ -878,7 +1451,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let fast = self.b.create_block();
                 let next = self.next(i);
                 self.b.ins().brif(is_num, fast, &[], next, &[]);
-                self.b.switch_to_block(fast);
+                self.switch(fast);
                 let n = self.num_of(a);
                 let n = self.boxed(n);
                 self.b.ins().store(flags(), n, a, 8);
@@ -890,7 +1463,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let full = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, d, MAX_CALL_DEPTH as i64);
                 let fast = self.b.create_block();
                 self.b.ins().brif(full, slow, &[], fast, &[]);
-                self.b.switch_to_block(fast);
+                self.switch(fast);
                 let d = self.b.ins().iadd_imm(d, 1);
                 self.b.ins().store(flags(), d, self.vm, OFF_DEPTH as i32);
                 self.jump_next(i);
@@ -905,17 +1478,39 @@ impl<'a, 'b> Gen<'a, 'b> {
                 true => self.fast_call(i, dst, proto, base, argc),
                 false => self.call_op(i),
             },
+            Op::CallMethod { .. } => self.call_via(i, h_method_start as usize, h_step as usize),
+            Op::SelfOr { dst, .. } => self.self_or(i, dst),
+            Op::MethodPrep { obj, .. } => self.method_prep(i, obj),
+            Op::GetVar { dst, var } => match self.prog.vars[var as usize].slots.first() {
+                Some(Slot { loc: Loc::Reg(r), .. }) => self.get_var_reg(i, dst, *r),
+                _ => self.direct(i),
+            },
+            Op::Member { dst, obj, name, skip } => self.member(i, dst, obj, name, skip),
+            Op::SetMember { obj, val, name, skip } if name != NONE => self.set_member(i, obj, val, name, skip),
+            Op::SetMember { .. } => self.direct(i),
+            Op::CallCtor { .. } => self.call_via(i, h_ctor_start as usize, h_step as usize),
+            Op::Decl { .. }
+            | Op::Assign { .. }
+            | Op::GetThis { .. }
+            | Op::Index { .. }
+            | Op::IndexK { .. }
+            | Op::SetIndex { .. }
+            | Op::SetIndexK { .. }
+            | Op::Format { .. }
+            | Op::Concat { .. }
+            | Op::IterNext { .. }
+            | Op::ListCheck { .. }
+            | Op::ListPush { .. }
+            | Op::NewObj { .. }
+            | Op::InitField { .. } => self.direct(i),
             Op::ArgGiven { index, skip } => {
                 let argc = self.b.ins().load(types::I64, flags(), self.env, 32);
                 let given = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, argc, index as i64);
                 let (skip, next) = (self.blocks[skip as usize], self.next(i));
                 self.b.ins().brif(given, skip, &[], next, &[]);
             }
-            Op::Return { src } => self.return_op(src),
-            Op::ReturnNull => {
-                let r = self.call(self.sigs.env_only, h_return_null as usize, &[self.env]).unwrap();
-                self.b.ins().return_(&[r]);
-            }
+            Op::Return { src } => self.return_op(Some(src)),
+            Op::ReturnNull => self.return_op(None),
             _ => self.step(i),
         }
     }
@@ -956,7 +1551,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         }
         let fast = self.b.create_block();
         self.b.ins().brif(ok, fast, &[], slow, &[]);
-        self.b.switch_to_block(fast);
+        self.switch(fast);
     }
 
     /// A call of a function of the program, its frame started here: the
@@ -971,7 +1566,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         let code = self.b.ins().load(self.ptr, MemFlags::new(), entry, 0);
         let fast = self.b.create_block();
         self.b.ins().brif(code, fast, &[], slow, &[]);
-        self.b.switch_to_block(fast);
+        self.switch(fast);
         for (k, q) in callee.params.iter().enumerate().take(argc as usize) {
             let tags = self.simple_type(q.ty).unwrap();
             let a = self.addr(At::Reg(b + k as Reg));
@@ -990,7 +1585,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.b.ins().brif(both, go, &[], slow, &[]);
 
         // Nothing can fail from here on.
-        self.b.switch_to_block(go);
+        self.switch(go);
         let sp = self.b.ins().load(ptr, flags(), vm, (OFF_STACK + OFF_PTR) as i32);
         let off = self.b.ins().ishl_imm(slen, 4);
         let nr = self.b.ins().iadd(sp, off);
@@ -1046,7 +1641,7 @@ impl<'a, 'b> Gen<'a, 'b> {
 
         let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, ENV_SIZE, 3));
         let ce = self.b.ins().stack_addr(ptr, slot, 0);
-        let globals = self.b.use_var(self.globals);
+        let globals = self.globals;
         let fi1 = self.b.ins().iadd_imm(self.fi, 1);
         let argcv = self.b.ins().iconst(ptr, argc as i64);
         for (off, v) in [(0, nr), (8, globals), (16, vm), (24, fi1), (32, argcv), (40, slen), (48, zero)] {
@@ -1056,23 +1651,23 @@ impl<'a, 'b> Gen<'a, 'b> {
         let status = self.b.inst_results(inst)[0];
         let (ok, bad) = (self.b.create_block(), self.b.create_block());
         self.b.ins().brif(status, bad, &[], ok, &[]);
-        self.b.switch_to_block(ok);
+        self.switch(ok);
         self.reload();
         self.jump_next(i);
-        self.b.switch_to_block(bad);
+        self.switch(bad);
         let (pc, one) = (self.b.ins().iconst(types::I32, i as i64), self.b.ins().iconst(types::I32, 1));
         let r = self.call(self.sigs.failed, h_call_failed as usize, &[self.env, pc, one]).unwrap();
         self.go_on(i, r);
 
-        self.b.switch_to_block(slow);
+        self.switch(slow);
         self.call_op(i);
     }
 
-    /// `돌려주자`: a plain call's frame ends here (the caller takes the
-    /// value); anything else (a method's object, a caught signal waiting, a
-    /// caller that wants more than the value, a type to check closer) goes
-    /// through `finish_call`.
-    fn return_op(&mut self, src: Reg) {
+    /// `돌려주자`: the frame of a call that only wants the value ends here
+    /// (its registers and object released); anything else (a caught signal
+    /// waiting, a caller that wants more than the value, a type to check
+    /// closer) goes through `finish_call`.
+    fn return_op(&mut self, src: Option<Reg>) {
         let slow = self.b.create_block();
         let (vm, ptr) = (self.vm, self.ptr);
         let flen = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_LEN) as i32);
@@ -1084,33 +1679,48 @@ impl<'a, 'b> Gen<'a, 'b> {
         let pending = self.b.ins().load(ptr, flags(), f, F_PENDING as i32);
         let this = self.b.ins().load(types::I32, flags(), f, F_THIS as i32);
         let has_caller = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, flen, 2);
-        let this_ok = self.b.ins().icmp_imm(IntCC::Equal, this, TAG_UNDEF);
-        let post_ok = self.b.ins().icmp_imm(IntCC::Equal, post, 0);
+        let _ = this;
+        // Post::Value (0) takes the value; falling off the end, Post::Discard
+        // (1: a constructor, a setter) takes nothing.
+        let post_ok = match src {
+            Some(_) => self.b.ins().icmp_imm(IntCC::Equal, post, 0),
+            None => self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, post, 1),
+        };
         let pend_ok = self.b.ins().icmp_imm(IntCC::Equal, pending, 0);
-        let ok = self.b.ins().band(this_ok, post_ok);
+        let ok = post_ok;
         let ok = self.b.ins().band(ok, pend_ok);
         let ok = self.b.ins().band(ok, has_caller);
         let fast = self.b.create_block();
         self.b.ins().brif(ok, fast, &[], slow, &[]);
-        self.b.switch_to_block(fast);
-        let va = self.addr(At::Reg(src));
-        match self.simple_type(self.proto.return_type) {
-            Some(tags) => self.check_tags(va, tags, slow),
-            None => {
-                self.b.ins().jump(slow, &[]);
-                let dead = self.b.create_block();
-                self.b.switch_to_block(dead);
+        self.switch(fast);
+        let (vt, vp) = match src {
+            Some(src) => {
+                let va = self.addr(At::Reg(src));
+                match self.simple_type(self.proto.return_type) {
+                    Some(tags) => self.check_tags(va, tags, slow),
+                    None => {
+                        self.b.ins().jump(slow, &[]);
+                        let dead = self.b.create_block();
+                        self.switch(dead);
+                    }
+                }
+                let vt = self.b.ins().load(types::I64, flags(), va, 0);
+                let vp = self.b.ins().load(types::I64, flags(), va, 8);
+                let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
+                self.b.ins().store(flags(), undef, va, 0);
+                (vt, vp)
             }
-        }
-        let vt = self.b.ins().load(types::I64, flags(), va, 0);
-        let vp = self.b.ins().load(types::I64, flags(), va, 8);
-        let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
-        self.b.ins().store(flags(), undef, va, 0);
+            // 비어있음 fits every return type.
+            None => (self.b.ins().iconst(types::I64, TAG_NULL), self.b.ins().iconst(types::I64, 0)),
+        };
         // The registers go (as `truncate` drops them).
         for r in 0..self.proto.nregs {
             let a = self.addr(At::Reg(r));
             self.release(a);
         }
+        // A method's object.
+        let this = self.b.ins().iadd_imm(f, F_THIS as i64);
+        self.release(this);
         let counted = self.b.ins().load(types::I8, flags(), f, F_COUNTED as i32);
         let counted = self.b.ins().uextend(types::I32, counted);
         let d = self.b.ins().load(types::I32, flags(), vm, OFF_DEPTH as i32);
@@ -1127,13 +1737,28 @@ impl<'a, 'b> Gen<'a, 'b> {
         let slot = self.b.ins().ishl_imm(slot, 4);
         let sp = self.b.ins().load(ptr, flags(), vm, (OFF_STACK + OFF_PTR) as i32);
         let dst = self.b.ins().iadd(sp, slot);
-        self.store(dst, vt, vp);
         let r = self.b.ins().iconst(types::I32, S_RETURNED as i64);
+        if src.is_some() {
+            self.store(dst, vt, vp);
+        } else {
+            // Falling off the end: 비어있음 for Post::Value, nothing for Discard.
+            let (put, done) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(post, done, &[], put, &[]);
+            self.switch(put);
+            self.store(dst, vt, vp);
+            self.b.ins().jump(done, &[]);
+            self.switch(done);
+        }
         self.b.ins().return_(&[r]);
 
-        self.b.switch_to_block(slow);
-        let s = self.b.ins().iconst(types::I32, src as i64);
-        let r = self.call(self.sigs.ret, h_return as usize, &[self.env, s]).unwrap();
+        self.switch(slow);
+        let r = match src {
+            Some(src) => {
+                let s = self.b.ins().iconst(types::I32, src as i64);
+                self.call(self.sigs.ret, h_return as usize, &[self.env, s]).unwrap()
+            }
+            None => self.call(self.sigs.env_only, h_return_null as usize, &[self.env]).unwrap(),
+        };
         self.b.ins().return_(&[r]);
     }
 
@@ -1144,46 +1769,96 @@ impl<'a, 'b> Gen<'a, 'b> {
         let counted = self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, t, (tag::RESOURCE - tag::STR) as i64);
         let (rel, cont) = (self.b.create_block(), self.b.create_block());
         self.b.ins().brif(counted, rel, &[], cont, &[]);
-        self.b.switch_to_block(rel);
+        self.switch(rel);
+        if self.inline_rc {
+            // Not the last reference: one fewer. The last one: Rust drops it.
+            let p = self.payload_of(a);
+            let n = self.b.ins().load(types::I64, flags(), p, RC_STRONG);
+            let last = self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, n, 1);
+            let (drop_it, fewer) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(last, drop_it, &[], fewer, &[]);
+            self.switch(fewer);
+            let n1 = self.b.ins().iadd_imm(n, -1);
+            self.b.ins().store(flags(), n1, p, RC_STRONG);
+            self.b.ins().jump(cont, &[]);
+            self.switch(drop_it);
+        }
         self.call(self.sigs.one_ptr, h_drop as usize, &[a]);
         self.b.ins().jump(cont, &[]);
-        self.b.switch_to_block(cont);
+        self.switch(cont);
+    }
+
+    /// One more reference to the heap value at `a` (which has a counted tag).
+    fn retain_counted(&mut self, a: V) {
+        let p = self.payload_of(a);
+        let n = self.b.ins().load(types::I64, flags(), p, RC_STRONG);
+        let n1 = self.b.ins().iadd_imm(n, 1);
+        self.b.ins().store(flags(), n1, p, RC_STRONG);
+    }
+
+    /// Instruction `i` through `h_op`, else the interpreter.
+    fn direct(&mut self, i: usize) {
+        let pc = self.b.ins().iconst(types::I32, i as i64);
+        let r = self.call(self.sigs.step, h_op as usize, &[self.env, pc]).unwrap();
+        let slow = self.slow_block(i);
+        let (done, next) = (self.b.create_block(), self.next(i));
+        let is_slow = self.b.ins().icmp_imm(IntCC::Equal, r, SLOW as i64);
+        self.b.ins().brif(is_slow, slow, &[], done, &[]);
+        self.switch(done);
+        let is_next = self.b.ins().icmp_imm(IntCC::Equal, r, i as i64 + 1);
+        self.b.ins().brif(is_next, next, &[], self.dispatch, &[BlockArg::Value(r)]);
+    }
+
+    /// A block that runs `i` through `direct`.
+    fn direct_block(&mut self, i: usize) -> Block {
+        let cur = self.b.current_block().unwrap();
+        let blk = self.b.create_block();
+        self.switch(blk);
+        self.direct(i);
+        self.switch(cur);
+        blk
     }
 
     /// A call: straight into the callee's native code when it has some.
     fn call_op(&mut self, i: usize) {
+        self.call_via(i, h_call_start as usize, h_call as usize)
+    }
+
+    /// A call started by `start` (`h_call_start`'s answers), else by `none`
+    /// (a helper that does the whole call as the interpreter does).
+    fn call_via(&mut self, i: usize, start: usize, none_fn: usize) {
         let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, ENV_SIZE, 3));
         let callee_env = self.b.ins().stack_addr(self.ptr, slot, 0);
         let pc = self.b.ins().iconst(types::I32, i as i64);
-        let code = self.call(self.sigs.start, h_call_start as usize, &[self.env, pc, callee_env]).unwrap();
+        let code = self.call(self.sigs.start, start, &[self.env, pc, callee_env]).unwrap();
         let (none, failed, run) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
         let not_run = self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, code, 1);
         let other = self.b.create_block();
         self.b.ins().brif(not_run, other, &[], run, &[]);
-        self.b.switch_to_block(other);
+        self.switch(other);
         self.b.ins().brif(code, failed, &[], none, &[]);
 
         // No native code: the interpreter's way.
-        self.b.switch_to_block(none);
+        self.switch(none);
         let pc = self.b.ins().iconst(types::I32, i as i64);
-        let r = self.call(self.sigs.step, h_call as usize, &[self.env, pc]).unwrap();
+        let r = self.call(self.sigs.step, none_fn, &[self.env, pc]).unwrap();
         self.go_on(i, r);
 
         // It did not start.
-        self.b.switch_to_block(failed);
+        self.switch(failed);
         let (pc, zero) = (self.b.ins().iconst(types::I32, i as i64), self.b.ins().iconst(types::I32, 0));
         let r = self.call(self.sigs.failed, h_call_failed as usize, &[self.env, pc, zero]).unwrap();
         self.go_on(i, r);
 
-        self.b.switch_to_block(run);
+        self.switch(run);
         let inst = self.b.ins().call_indirect(self.sigs.native, code, &[callee_env]);
         let status = self.b.inst_results(inst)[0];
         let (ok, bad) = (self.b.create_block(), self.b.create_block());
         self.b.ins().brif(status, bad, &[], ok, &[]);
-        self.b.switch_to_block(ok);
+        self.switch(ok);
         self.reload();
         self.jump_next(i);
-        self.b.switch_to_block(bad);
+        self.switch(bad);
         let (pc, one) = (self.b.ins().iconst(types::I32, i as i64), self.b.ins().iconst(types::I32, 1));
         let r = self.call(self.sigs.failed, h_call_failed as usize, &[self.env, pc, one]).unwrap();
         self.go_on(i, r);
@@ -1202,7 +1877,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         let both = self.b.ins().band(nx, ny);
         let fast = self.b.create_block();
         self.b.ins().brif(both, fast, &[], slow, &[]);
-        self.b.switch_to_block(fast);
+        self.switch(fast);
         (self.num_of(xa), self.num_of(ya))
     }
 
@@ -1219,7 +1894,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let n = self.is_tag(t, TAG_NUM);
                 let fast = self.b.create_block();
                 self.b.ins().brif(n, fast, &[], slow, &[]);
-                self.b.switch_to_block(fast);
+                self.switch(fast);
                 let x = self.num_of(xa);
                 (x, self.b.ins().f64const(y))
             }
@@ -1243,7 +1918,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                         let is_zero = self.b.ins().fcmp(FloatCC::Equal, y, zero);
                         let fast = self.b.create_block();
                         self.b.ins().brif(is_zero, slow, &[], fast, &[]);
-                        self.b.switch_to_block(fast);
+                        self.switch(fast);
                         self.b.ins().fdiv(x, y)
                     }
                 };
@@ -1263,7 +1938,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let both = self.b.ins().band(fx, fy);
                 let conv = self.b.create_block();
                 self.b.ins().brif(both, conv, &[], slow, &[]);
-                self.b.switch_to_block(conv);
+                self.switch(conv);
                 let xi = self.b.ins().fcvt_to_sint_sat(types::I64, x);
                 let yi = self.b.ins().fcvt_to_sint_sat(types::I64, y);
                 // 0 fails and -1 may overflow: the interpreter's.
@@ -1271,7 +1946,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 let odd = self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, y1, 1);
                 let fast = self.b.create_block();
                 self.b.ins().brif(odd, slow, &[], fast, &[]);
-                self.b.switch_to_block(fast);
+                self.switch(fast);
                 let r = self.b.ins().srem(xi, yi);
                 let r = self.b.ins().fcvt_from_sint(types::F64, r);
                 self.store_num(d, r);
@@ -1304,7 +1979,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             let slow = self.slow_block(i);
             let fast = self.b.create_block();
             self.b.ins().brif(u, slow, &[], fast, &[]);
-            self.b.switch_to_block(fast);
+            self.switch(fast);
             t
         } else {
             t
@@ -1315,16 +1990,226 @@ impl<'a, 'b> Gen<'a, 'b> {
         let plain = self.b.create_block();
         self.b.ins().brif(counted, shared, &[], plain, &[]);
 
-        self.b.switch_to_block(shared);
-        let d = self.addr(dst);
-        self.call(self.sigs.two_ptr, h_clone_into as usize, &[d, s]);
+        self.switch(shared);
+        if self.inline_rc {
+            self.retain_counted(s);
+            let p = self.payload_of(s);
+            let d = self.addr(dst);
+            self.store(d, t, p);
+        } else {
+            let d = self.addr(dst);
+            self.call(self.sigs.two_ptr, h_clone_into as usize, &[d, s]);
+        }
         self.jump_next(i);
 
-        self.b.switch_to_block(plain);
+        self.switch(plain);
         let p = self.payload_of(s);
         let d = self.addr(dst);
         self.store(d, t, p);
         self.jump_next(i);
+    }
+
+    /// Copies the value at `s` to `d` (one more reference to a heap value).
+    fn copy_value(&mut self, s: V, d: V) {
+        let t = self.tag_of(s);
+        let p = self.payload_of(s);
+        let off = self.b.ins().iadd_imm(t, -(tag::STR as i64));
+        let counted = self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, off, (tag::RESOURCE - tag::STR) as i64);
+        let (shared, done) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(counted, shared, &[], done, &[]);
+        self.switch(shared);
+        if self.inline_rc {
+            self.retain_counted(s);
+            self.b.ins().jump(done, &[]);
+            self.switch(done);
+            self.store(d, t, p);
+        } else {
+            let (after, plain) = (self.b.create_block(), done);
+            self.call(self.sigs.two_ptr, h_clone_into as usize, &[d, s]);
+            self.b.ins().jump(after, &[]);
+            self.switch(plain);
+            self.store(d, t, p);
+            self.b.ins().jump(after, &[]);
+            self.switch(after);
+        }
+    }
+
+    /// `'나'`: the frame's object when it has one (else `h_op`).
+    fn self_or(&mut self, i: usize, dst: Reg) {
+        let fallback = self.direct_block(i);
+        let fp = self.b.ins().load(self.ptr, flags(), self.vm, (OFF_FRAMES + OFF_PTR) as i32);
+        let off = self.b.ins().imul_imm(self.fi, FRAME_SIZE as i64);
+        let f = self.b.ins().iadd(fp, off);
+        let this = self.b.ins().iadd_imm(f, F_THIS as i64);
+        let t = self.tag_of(this);
+        let none = self.is_tag(t, TAG_UNDEF);
+        let go = self.b.create_block();
+        self.b.ins().brif(none, fallback, &[], go, &[]);
+        self.switch(go);
+        let d = self.addr(At::Reg(dst));
+        self.copy_value(this, d);
+        self.jump_next(i);
+    }
+
+    /// The property that instruction `i`'s cache knows, of the object in
+    /// register `obj`: its value's address, or `fallback`.
+    fn cached_prop(&mut self, i: usize, obj: Reg, name: u32, fallback: Block) -> V {
+        let ic = self.b.ins().iconst(self.ptr, unsafe { self.ics.add(i) } as i64);
+        let oa = self.addr(At::Reg(obj));
+        let t = self.tag_of(oa);
+        let is_obj = self.is_tag(t, tag::OBJECT as i64);
+        let a = self.b.create_block();
+        self.b.ins().brif(is_obj, a, &[], fallback, &[]);
+        self.switch(a);
+        let p = self.payload_of(oa);
+        let class = self.b.ins().load(types::I32, flags(), p, OFF_OBJ_CLASS as i32);
+        let cached = self.b.ins().load(types::I32, MemFlags::new(), ic, 0);
+        let same = self.b.ins().icmp(IntCC::Equal, class, cached);
+        let b = self.b.create_block();
+        self.b.ins().brif(same, b, &[], fallback, &[]);
+        self.switch(b);
+        let pos = self.b.ins().load(types::I32, MemFlags::new(), ic, 4);
+        let pos = self.b.ins().uextend(types::I64, pos);
+        let props = self.off_props as i32;
+        let items = self.b.ins().load(self.ptr, flags(), p, props + OFF_PTR as i32);
+        let len = self.b.ins().load(types::I64, flags(), p, props + OFF_LEN as i32);
+        let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, pos, len);
+        let c = self.b.create_block();
+        self.b.ins().brif(inside, c, &[], fallback, &[]);
+        self.switch(c);
+        let off = self.b.ins().imul_imm(pos, PROP_SIZE as i64);
+        let e = self.b.ins().iadd(items, off);
+        let n = self.b.ins().load(types::I32, flags(), e, PROP_NAME as i32);
+        let hit = self.b.ins().icmp_imm(IntCC::Equal, n, name as i64);
+        let d = self.b.create_block();
+        self.b.ins().brif(hit, d, &[], fallback, &[]);
+        self.switch(d);
+        self.b.ins().iadd_imm(e, PROP_VALUE as i64)
+    }
+
+    /// A block for when the cache does not know the value in `obj`: a
+    /// dictionary goes on to the key (`'표'의 "가"`, the next instruction),
+    /// anything else to `fallback`.
+    fn dict_goes_on(&mut self, i: usize, obj: Reg, fallback: Block) -> Block {
+        let cur = self.b.current_block().unwrap();
+        let blk = self.b.create_block();
+        self.switch(blk);
+        let oa = self.addr(At::Reg(obj));
+        let t = self.tag_of(oa);
+        let dict = self.is_tag(t, tag::DICT as i64);
+        let next = self.next(i);
+        self.b.ins().brif(dict, next, &[], fallback, &[]);
+        self.switch(cur);
+        blk
+    }
+
+    /// A property read (`'점'의 '가로'`): from where the cache says it is.
+    fn member(&mut self, i: usize, dst: Reg, obj: Reg, name: u32, skip: u32) {
+        let fallback = self.direct_block(i);
+        let fallback = self.dict_goes_on(i, obj, fallback);
+        let v = self.cached_prop(i, obj, name, fallback);
+        self.check_ic_access(i, obj, fallback);
+        let d = self.addr(At::Reg(dst));
+        self.copy_value(v, d);
+        let skip = self.blocks[skip as usize];
+        self.b.ins().jump(skip, &[]);
+    }
+
+    /// Goes on when the cache of instruction `i` says anyone may use the
+    /// member of the object in `obj`, or (1) the running frame is a method,
+    /// or (2) a method of that object; else to `fallback`.
+    fn check_ic_access(&mut self, i: usize, obj: Reg, fallback: Block) {
+        let ic = self.b.ins().iconst(self.ptr, unsafe { self.ics.add(i) } as i64);
+        let access = self.b.ins().load(types::I32, MemFlags::new(), ic, 12);
+        let (checks, read) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(access, checks, &[], read, &[]);
+        self.switch(checks);
+        let fp = self.b.ins().load(self.ptr, flags(), self.vm, (OFF_FRAMES + OFF_PTR) as i32);
+        let off = self.b.ins().imul_imm(self.fi, FRAME_SIZE as i64);
+        let f = self.b.ins().iadd(fp, off);
+        let this_tag = self.b.ins().load(types::I32, flags(), f, F_THIS as i32);
+        let has_this = self.b.ins().icmp_imm(IntCC::NotEqual, this_tag, TAG_UNDEF);
+        let this_p = self.b.ins().load(types::I64, flags(), f, F_THIS as i32 + 8);
+        let oa = self.addr(At::Reg(obj));
+        let obj_p = self.payload_of(oa);
+        let same = self.b.ins().icmp(IntCC::Equal, this_p, obj_p);
+        let protected = self.b.ins().icmp_imm(IntCC::Equal, access, 1);
+        let ok = self.b.ins().bor(protected, same);
+        let ok = self.b.ins().band(ok, has_this);
+        self.b.ins().brif(ok, read, &[], fallback, &[]);
+        self.switch(read);
+    }
+
+    /// Before a method call: an object of the class the cache knows, whose
+    /// method the running code may call (else `h_op` checks it all).
+    fn method_prep(&mut self, i: usize, obj: Reg) {
+        let fallback = self.direct_block(i);
+        let ic = self.b.ins().iconst(self.ptr, unsafe { self.ics.add(i) } as i64);
+        let oa = self.addr(At::Reg(obj));
+        let t = self.tag_of(oa);
+        let is_obj = self.is_tag(t, tag::OBJECT as i64);
+        let a = self.b.create_block();
+        self.b.ins().brif(is_obj, a, &[], fallback, &[]);
+        self.switch(a);
+        let p = self.payload_of(oa);
+        let class = self.b.ins().load(types::I32, flags(), p, OFF_OBJ_CLASS as i32);
+        let cached = self.b.ins().load(types::I32, MemFlags::new(), ic, 0);
+        let same = self.b.ins().icmp(IntCC::Equal, class, cached);
+        let b = self.b.create_block();
+        self.b.ins().brif(same, b, &[], fallback, &[]);
+        self.switch(b);
+        self.check_ic_access(i, obj, fallback);
+        self.jump_next(i);
+    }
+
+    /// A variable whose first place is register `r`: its value when it has
+    /// one (else `h_op` looks further).
+    fn get_var_reg(&mut self, i: usize, dst: Reg, r: Reg) {
+        let fallback = self.direct_block(i);
+        let s = self.addr(At::Reg(r));
+        let t = self.tag_of(s);
+        let undef = self.is_tag(t, TAG_UNDEF);
+        let go = self.b.create_block();
+        self.b.ins().brif(undef, fallback, &[], go, &[]);
+        self.switch(go);
+        let d = self.addr(At::Reg(dst));
+        self.copy_value(s, d);
+        self.jump_next(i);
+    }
+
+    /// A property write: to where the cache says it is, when the value is
+    /// what the field's type takes.
+    fn set_member(&mut self, i: usize, obj: Reg, val: Reg, name: u32, skip: u32) {
+        let fallback = self.direct_block(i);
+        let fallback = self.dict_goes_on(i, obj, fallback);
+        let v = self.cached_prop(i, obj, name, fallback);
+        let ic = self.b.ins().iconst(self.ptr, unsafe { self.ics.add(i) } as i64);
+        let check = self.b.ins().load(types::I32, MemFlags::new(), ic, 8);
+        let va = self.addr(At::Reg(val));
+        let t = self.tag_of(va);
+        // Which tag the check wants (none for 0), or 비어있음.
+        let want = {
+            let (n, s_, b_) = (
+                self.b.ins().iconst(types::I32, TAG_NUM),
+                self.b.ins().iconst(types::I32, tag::STR as i64),
+                self.b.ins().iconst(types::I32, TAG_BOOL),
+            );
+            let is1 = self.b.ins().icmp_imm(IntCC::Equal, check, 1);
+            let is2 = self.b.ins().icmp_imm(IntCC::Equal, check, 2);
+            let x = self.b.ins().select(is2, s_, b_);
+            self.b.ins().select(is1, n, x)
+        };
+        let any = self.b.ins().icmp_imm(IntCC::Equal, check, 0);
+        let fits = self.b.ins().icmp(IntCC::Equal, t, want);
+        let null = self.is_tag(t, TAG_NULL);
+        let ok = self.b.ins().bor(any, fits);
+        let ok = self.b.ins().bor(ok, null);
+        let go = self.b.create_block();
+        self.b.ins().brif(ok, go, &[], fallback, &[]);
+        self.switch(go);
+        self.copy_value(va, v);
+        let skip = self.blocks[skip as usize];
+        self.b.ins().jump(skip, &[]);
     }
 
     /// `dst = take(src)` (the register is left undefined).
@@ -1362,15 +2247,9 @@ fn number_types(prog: &Program) -> impl Iterator<Item = u32> + '_ {
 /// hand it to the interpreter.
 fn native(op: &Op, prog: &Program) -> bool {
     match *op {
-        Op::LoadK { k, .. } => matches!(prog.consts[k as usize].tag(), tag::NUM | tag::BOOL | tag::NULL),
+        Op::LoadK { .. } => true,
         Op::BinK { k, .. } | Op::CmpKJump { k, .. } => prog.consts[k as usize].as_num().is_some(),
-        Op::Update { var, op, .. } => {
-            matches!(op, BinOp::Add | BinOp::Sub)
-                && matches!(
-                    prog.vars[var as usize].slots.as_slice(),
-                    [Slot { loc: Loc::Reg(_) | Loc::Global(_), meta: None | Some(Loc::Reg(_) | Loc::Global(_)) }]
-                )
-        }
+        Op::Update { .. } => true,
         Op::LoadNull { .. }
         | Op::LoadBool { .. }
         | Op::Move { .. }
@@ -1395,7 +2274,28 @@ fn native(op: &Op, prog: &Program) -> bool {
         | Op::Call { .. }
         | Op::ArgGiven { .. }
         | Op::Return { .. }
-        | Op::ReturnNull => true,
+        | Op::ReturnNull
+        | Op::CallMethod { .. }
+        | Op::GetVar { .. }
+        | Op::Decl { .. }
+        | Op::Assign { .. }
+        | Op::SelfOr { .. }
+        | Op::GetThis { .. }
+        | Op::Member { .. }
+        | Op::Index { .. }
+        | Op::IndexK { .. }
+        | Op::SetIndex { .. }
+        | Op::SetIndexK { .. }
+        | Op::SetMember { .. }
+        | Op::MethodPrep { .. }
+        | Op::Format { .. }
+        | Op::Concat { .. }
+        | Op::IterNext { .. }
+        | Op::ListCheck { .. }
+        | Op::ListPush { .. }
+        | Op::NewObj { .. }
+        | Op::InitField { .. }
+        | Op::CallCtor { .. } => true,
         _ => false,
     }
 }

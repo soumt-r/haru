@@ -6,14 +6,14 @@ use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 
 #[repr(C)]
-pub(super) struct Stack<T> {
-    pub(super) ptr: *mut T,
-    pub(super) len: usize,
-    pub(super) cap: usize,
+pub(crate) struct Stack<T> {
+    pub(crate) ptr: *mut T,
+    pub(crate) len: usize,
+    pub(crate) cap: usize,
 }
 
 impl<T> Stack<T> {
-    pub(super) fn with_capacity(n: usize) -> Stack<T> {
+    pub(crate) fn with_capacity(n: usize) -> Stack<T> {
         let mut v = ManuallyDrop::new(Vec::with_capacity(n));
         Stack { ptr: v.as_mut_ptr(), len: v.len(), cap: v.capacity() }
     }
@@ -39,7 +39,7 @@ impl<T> Stack<T> {
     }
 
     #[inline]
-    pub(super) fn push(&mut self, v: T) {
+    pub(crate) fn push(&mut self, v: T) {
         if self.len < self.cap {
             unsafe { self.ptr.add(self.len).write(v) };
             self.len += 1;
@@ -49,7 +49,7 @@ impl<T> Stack<T> {
     }
 
     #[inline]
-    pub(super) fn pop(&mut self) -> Option<T> {
+    pub(crate) fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
             return None;
         }
@@ -58,18 +58,23 @@ impl<T> Stack<T> {
     }
 
     #[inline]
-    pub(super) fn truncate(&mut self, len: usize) {
+    pub(crate) fn truncate(&mut self, len: usize) {
         self.edit(|s| s.truncate(len));
     }
 
-    pub(super) fn extend(&mut self, items: impl IntoIterator<Item = T>) {
+    pub(crate) fn extend(&mut self, items: impl IntoIterator<Item = T>) {
         self.edit(|s| s.extend(items));
+    }
+
+    /// Takes everything out.
+    pub(crate) fn take_all(&mut self) -> Vec<T> {
+        self.edit(std::mem::take)
     }
 }
 
 impl<T: Clone> Stack<T> {
     #[inline]
-    pub(super) fn resize(&mut self, len: usize, v: T) {
+    pub(crate) fn resize(&mut self, len: usize, v: T) {
         self.edit(|s| s.resize(len, v));
     }
 }
@@ -86,6 +91,12 @@ impl<T> DerefMut for Stack<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl<T> Default for Stack<T> {
+    fn default() -> Stack<T> {
+        Stack::with_capacity(0)
     }
 }
 

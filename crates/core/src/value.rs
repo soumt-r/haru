@@ -43,7 +43,65 @@ pub struct DictObj {
 /// Hana, so not a fixed layout). Keys are symbols (`crate::symbol`).
 pub struct ObjObj {
     pub class: u32,
-    pub props: RefCell<Map<u32, Value>>,
+    pub props: RefCell<Props>,
+}
+
+/// An object's properties in the order they were first set: a class's
+/// field initializers run in declaration order, so a field sits at the same
+/// place in every object of the class. Objects have few properties, so a
+/// search through the names beats hashing them (and needs no table). The
+/// layout is fixed (`Stack`, `Prop`): compiled code reads and writes a
+/// property at the place it saw it last (an inline cache).
+#[derive(Default)]
+#[repr(transparent)]
+pub struct Props(pub(crate) crate::stack::Stack<Prop>);
+
+#[repr(C)]
+pub struct Prop {
+    pub name: u32,
+    pub value: Value,
+}
+
+impl Props {
+    pub fn with_capacity(n: usize) -> Props {
+        Props(crate::stack::Stack::with_capacity(n))
+    }
+
+    #[inline]
+    pub fn get(&self, name: &u32) -> Option<&Value> {
+        self.0.iter().find(|p| p.name == *name).map(|p| &p.value)
+    }
+
+    /// Where a property is (for an inline cache).
+    #[inline]
+    pub fn position(&self, name: u32) -> Option<usize> {
+        self.0.iter().position(|p| p.name == name)
+    }
+
+    #[inline]
+    pub fn contains_key(&self, name: &u32) -> bool {
+        self.0.iter().any(|p| p.name == *name)
+    }
+
+    /// Sets a property (a new one goes last); the old value if there was one.
+    #[inline]
+    pub fn insert(&mut self, name: u32, v: Value) -> Option<Value> {
+        match self.0.iter_mut().find(|p| p.name == name) {
+            Some(p) => Some(std::mem::replace(&mut p.value, v)),
+            None => {
+                self.0.push(Prop { name, value: v });
+                None
+            }
+        }
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &Value> {
+        self.0.iter().map(|p| &p.value)
+    }
+
+    pub fn drain(&mut self) -> impl Iterator<Item = (u32, Value)> {
+        self.0.take_all().into_iter().map(|p| (p.name, p.value))
+    }
 }
 
 /// A native object (a resource): the object a module gave and its kind,
@@ -122,7 +180,12 @@ impl Value {
     }
 
     pub fn object(class: u32) -> Value {
-        let r = Rc::new(ObjObj { class, props: RefCell::new(Map::default()) });
+        Value::object_with(class, 0)
+    }
+
+    /// A new object with room for `fields` properties.
+    pub fn object_with(class: u32, fields: usize) -> Value {
+        let r = Rc::new(ObjObj { class, props: RefCell::new(Props::with_capacity(fields)) });
         crate::gc::track_object(&r);
         Value::heap(tag::OBJECT, r)
     }

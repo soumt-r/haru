@@ -22,6 +22,7 @@ haru-pkg-http-server = { path = "../../packages/http_server" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 sha2 = "0.10"
+mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 haru-example-greet = { path = "../../examples/greet" }

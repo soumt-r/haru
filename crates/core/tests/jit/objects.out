@@ -1,0 +1,20 @@
+4531500
+4000
+1
+글자 가로
+2000
+문자
+TypeError: '가로'에는 '숫자' 타입만 담을 수 있어요. '문자열' 값이 들어왔어요.
+2000
+AccessViolationError: '세로' 속성은 상속된 클래스 전용(protected)이라 외부에서 부를 수 없어요.
+AccessViolationError: '비밀' 속성은 내부 전용(private)이라 외부에서 부를 수 없어요.
+7
+AccessViolationError: '비밀' 속성은 내부 전용(private)이라 외부에서 부를 수 없어요.
+15000
+1500
+1500
+1500
+ConstantAssignmentError: 상수 '고정글'의 값은 변경할 수 없어요.
+TypeError: '숫자들'에는 '(숫자)목록' 타입만 담을 수 있어요. '목록' 값이 들어왔어요.
+1500
+1125750

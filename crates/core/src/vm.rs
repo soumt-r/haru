@@ -211,9 +211,7 @@ pub struct Vm<'p> {
 
 #[cfg(feature = "jit")]
 mod jit;
-mod stack;
-
-use stack::Stack;
+use crate::stack::Stack;
 
 impl<'p> Vm<'p> {
     pub fn new(prog: &'p Program) -> Vm<'p> {
@@ -347,6 +345,10 @@ impl<'p> Vm<'p> {
             }
         };
         self.flush();
+        #[cfg(feature = "jit")]
+        if self.jit.is_some() {
+            jit::report_stats();
+        }
         result
     }
 
@@ -397,6 +399,42 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+    }
+
+    /// `'x'에 "..."를 더하자` with strings in registers `a` (the variable as
+    /// read) and `b`: appends to the variable's string in place when nothing
+    /// else holds it. False (nothing done) when `a` is no longer the
+    /// variable's value; errors come before anything changes.
+    fn append_update(&mut self, fi: usize, var: u32, a: Reg, b: Reg) -> Flow<bool> {
+        let base = self.frames[fi].base;
+        let v = &self.prog.vars[var as usize];
+        let Some(slot @ Slot { loc: Loc::Reg(_) | Loc::Global(_), .. }) = self.find(v, fi) else {
+            return Ok(false);
+        };
+        if !self.get(slot.loc, fi).same_object(&self.stack[base + a as usize]) {
+            return Ok(false);
+        }
+        // The result is a string: check it as the value read.
+        let (declared, constant) = self.meta(slot, fi);
+        if declared != 0 {
+            self.check_type_sym(VARIABLE_TYPE, v.name, declared, &self.stack[base + a as usize])?;
+        }
+        if constant {
+            return Err(err(CONSTANT).str_arg(self.name(v.name)).into());
+        }
+        self.stack[base + a as usize] = Value::UNDEF;
+        let piece = std::mem::replace(&mut self.stack[base + b as usize], Value::UNDEF);
+        let target = match slot.loc {
+            Loc::Reg(r) => &mut self.stack[base + r as usize],
+            Loc::Global(g) => &mut self.globals[g as usize],
+            Loc::This(_) => unreachable!(),
+        };
+        let piece = piece.as_str().unwrap();
+        if !target.append_in_place(piece) {
+            let joined = format!("{}{piece}", target.as_str().unwrap());
+            *target = Value::string(joined);
+        }
+        Ok(true)
     }
 
     /// Hands a signal to the innermost handler or loop of the running frame
@@ -919,33 +957,8 @@ impl<'p> Vm<'p> {
                         tri!(self.assign(var, fi, v));
                     }
                     Op::Update { var, a, b, op } => {
-                        if op == BinOp::Add && reg!(a).tag() == tag::STR && reg!(b).tag() == tag::STR {
-                            let v = &prog.vars[var as usize];
-                            if let Some(slot @ Slot { loc: Loc::Reg(_) | Loc::Global(_), .. }) = self.find(v, fi) {
-                                if self.get(slot.loc, fi).same_object(&reg!(a)) {
-                                    // The result is a string: check it as the value read.
-                                    let (declared, constant) = self.meta(slot, fi);
-                                    if declared != 0 {
-                                        tri!(self.check_type_sym(VARIABLE_TYPE, v.name, declared, &reg!(a)));
-                                    }
-                                    if constant {
-                                        fail!(err(CONSTANT).str_arg(self.name(v.name)));
-                                    }
-                                    reg!(a) = Value::UNDEF;
-                                    let piece = std::mem::replace(&mut reg!(b), Value::UNDEF);
-                                    let target = match slot.loc {
-                                        Loc::Reg(r) => &mut self.stack[base + r as usize],
-                                        Loc::Global(g) => &mut self.globals[g as usize],
-                                        Loc::This(_) => unreachable!(),
-                                    };
-                                    let piece = piece.as_str().unwrap();
-                                    if !target.append_in_place(piece) {
-                                        let joined = format!("{}{piece}", target.as_str().unwrap());
-                                        *target = Value::string(joined);
-                                    }
-                                    continue;
-                                }
-                            }
+                        if op == BinOp::Add && reg!(a).tag() == tag::STR && reg!(b).tag() == tag::STR && tri!(self.append_update(fi, var, a, b)) {
+                            continue;
                         }
                         let result = match (reg!(a).as_num(), reg!(b).as_num(), op) {
                             (Some(x), Some(y), BinOp::Add) => boxed(x + y),
@@ -1504,7 +1517,7 @@ impl<'p> Vm<'p> {
                     // ---- classes
                     Op::NewObj { dst, class } => match { crate::gc::safe_point(); self.class(class) } {
                         Some(c) if c.is_abstract => fail!(err(INSTANTIATE_ABSTRACT).str_arg(self.name(class))),
-                        Some(_) => reg!(dst) = Value::object(class),
+                        Some(c) => reg!(dst) = Value::object_with(class, c.field_types.len()),
                         None if self.namespaces[self.ns as usize].interfaces.contains(&class) => {
                             fail!(err(INSTANTIATE_INTERFACE).str_arg(self.name(class)))
                         }
