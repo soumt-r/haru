@@ -17,6 +17,17 @@ fn break_in_a_function_is_an_error_there() {
     assert_eq!(hari(src), "1\n런타임 오류: IllegalBreakError: '반복을 끝내자'는 반복 안에서만 쓸 수 있어요.\n");
 }
 
+/// A member's key that cannot be computed reports its own error (strings
+/// and lists, reads and list writes); a string's key that is no number is
+/// MemberAccessOnString.
+#[test]
+fn member_keys_report_their_own_errors() {
+    assert_eq!(hari("'x'를 \"가나\"로 정하자\n('x'의 없는이름)을 출력하자\n"), "런타임 오류: ReferenceError: '없는이름' 변수를 찾을 수 없어요.\n");
+    assert_eq!(hari("'x'를 \"가나\"로 정하자\n('x'의 \"a\")을 출력하자\n"), "런타임 오류: MemberAccessError: 문자열에는 이렇게 멤버로 접근할 수 없어요.\n");
+    assert_eq!(hari("'x'를 [1, 2]로 정하자\n('x'의 '없는이름')을 출력하자\n"), "런타임 오류: ReferenceError: '없는이름' 변수를 찾을 수 없어요.\n");
+    assert_eq!(hari("'x'를 [1, 2]로 정하자\n'x'의 (1 / 0)을 9로 정하자\n"), "런타임 오류: DivideByZeroError: 0으로 나눌 수 없어요.\n");
+}
+
 #[test]
 fn a_function_declared_in_a_block_is_never_found() {
     let src = "만약 참 라면:\n    <안쪽>을 만들자 ():\n        \"안쪽\"을 출력하자\n<안쪽>()을 실행하자\n";
@@ -55,7 +66,7 @@ fn values_print_like_hana() {
 "#;
     assert_eq!(
         hari(src),
-        "[1, 2]\n{3: 참, a: 2, b: 1}\n1\n3.5\n0.30000000000000004\n1000000000000000000000\n3.5\n값: [1, 2] 3\n0\n런타임 오류: TypeError: 목록의 위치(인덱스)는 숫자여야 해요.\n"
+        "[1, 2]\n{3: 참, a: 2, b: 1}\n1\n3.5\n0.30000000000000004\n1000000000000000000000\n3.5\n값: [1, 2] 3\n0\n런타임 오류: ReferenceError: '없는변수' 변수를 찾을 수 없어요.\n"
     );
 }
 

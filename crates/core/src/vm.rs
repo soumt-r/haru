@@ -1372,13 +1372,10 @@ impl<'p> Vm<'p> {
                         let (o, v) = (reg!(obj).clone(), reg!(val).clone());
                         tri!(self.set_index(&o, prog.consts[k as usize].clone(), v));
                     }
-                    Op::IndexFail { obj, key } => {
+                    Op::IndexFail { key, .. } => {
+                        // A key that cannot be computed reports its own error.
                         let pending = self.take_pending(fi, key);
-                        match reg!(obj).tag() {
-                            tag::LIST => fail!(err(LIST_INDEX_NUMBER)),
-                            tag::STR => fail!(err(MEMBER_ON_STRING)),
-                            _ => fail!(pending),
-                        }
+                        fail!(pending);
                     }
                     Op::SetMember { obj, val, name, skip } => {
                         let o = reg!(obj).clone();
@@ -1418,7 +1415,11 @@ impl<'p> Vm<'p> {
                         tri!(self.set_index(&o, k, v));
                     }
                     Op::SetIndexFail { obj, val, name, key, skip } => {
-                        self.take_pending(fi, key);
+                        let pending = self.take_pending(fi, key);
+                        // A list's key that cannot be computed reports its own error.
+                        if reg!(obj).tag() == tag::LIST {
+                            fail!(pending);
+                        }
                         if let Some(d) = reg!(obj).as_dict() {
                             if name != NONE {
                                 d.map.borrow_mut().insert(Key(Value::str(self.name(name))), reg!(val).clone());
@@ -2103,7 +2104,7 @@ impl<'p> Vm<'p> {
                         None => Err(err(STRING_INDEX_RANGE)),
                     }
                 }
-                None => Err(err(MEMBER_UNSUPPORTED).str_arg("string")),
+                None => Err(err(MEMBER_ON_STRING)),
             },
         }
     }
