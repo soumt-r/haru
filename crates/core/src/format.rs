@@ -84,11 +84,11 @@ pub fn write_value(out: &mut String, v: &Value, lang: &Lang, depth: usize) {
             out.push_str(v.as_resource().unwrap().name(lang.name));
             out.push_str(lang.object_format.1);
         }
-        // Go's `%v` of Hana's *ClassReference.
+        // A class used as a value ([동물]) shows the way its objects do.
         crate::value::CLASS => {
-            out.push_str("&{");
+            out.push_str(lang.object_format.0);
             out.push_str(crate::symbol::name(v.as_class().unwrap()));
-            out.push('}');
+            out.push_str(lang.object_format.1);
         }
         _ => out.push('?'),
     }
