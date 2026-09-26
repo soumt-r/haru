@@ -12,19 +12,31 @@
 //! back and go on in the ordinary code at that very instruction, which does
 //! what the interpreter does. So the copy never decides anything itself
 //! that the ordinary code would not.
+//!
+//! A number is held as an `f64` (its bits only matter for other values), and
+//! what is certainly a number or a boolean at each instruction (`analyze`:
+//! nothing is known at the loop head, a guard that passed or a result
+//! written makes it known) is not checked again.
 
 use std::collections::HashMap;
 
 use super::*;
 
+/// What is certainly in some places: their tags.
+type Known = HashMap<At, i64>;
+
 /// A loop that gets a copy: its instructions `head..=last`.
 pub(super) struct Region {
     pub(super) head: usize,
     last: usize,
-    /// The registers and globals it uses, and what they are held in (the
-    /// tag, and the payload's bits).
+    /// The registers and globals it uses, and what they are held in: the
+    /// tag, the payload's bits, and the number (when the tag says one).
     slots: Vec<At>,
-    vars: HashMap<At, (Variable, Variable)>,
+    vars: HashMap<At, (Variable, Variable, Variable)>,
+    /// What is certain before each instruction (None: never reached).
+    known: Vec<Option<Known>>,
+    /// That of the instruction being compiled.
+    cur: Known,
     /// The meta slots of the typed variables it updates (checked on entry).
     metas: Vec<At>,
     /// The copy's block of each instruction.
@@ -139,9 +151,158 @@ impl Gen<'_, '_> {
                 }
             }
         }
-        let vars = slots.iter().map(|&at| (at, (self.b.declare_var(types::I32), self.b.declare_var(types::I64)))).collect();
+        let vars = slots
+            .iter()
+            .map(|&at| (at, (self.b.declare_var(types::I32), self.b.declare_var(types::I64), self.b.declare_var(types::F64))))
+            .collect();
         let spec = (head..=last).map(|_| self.b.create_block()).collect();
-        Region { head, last, slots, vars, metas, spec, exits: HashMap::new() }
+        let known = self.analyze(head, last);
+        Region { head, last, slots, vars, known, cur: Known::new(), metas, spec, exits: HashMap::new() }
+    }
+
+    /// What is certain before each instruction of `head..=last`: a forward
+    /// pass to a fixed point, keeping what every way in agrees on. Nothing is
+    /// known at the head (values come in from memory).
+    fn analyze(&self, head: usize, last: usize) -> Vec<Option<Known>> {
+        let mut state: Vec<Option<Known>> = vec![None; last - head + 1];
+        state[0] = Some(Known::new());
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for pc in head..=last {
+                let Some(before) = state[pc - head].clone() else { continue };
+                for (succ, after) in self.after(pc, before) {
+                    if !(head..=last).contains(&succ) {
+                        continue;
+                    }
+                    let merged = match &state[succ - head] {
+                        None => after,
+                        Some(old) => old.iter().filter(|(at, t)| after.get(at) == Some(t)).map(|(a, t)| (*a, *t)).collect(),
+                    };
+                    if state[succ - head].as_ref() != Some(&merged) {
+                        state[succ - head] = Some(merged);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        state
+    }
+
+    /// Where instruction `pc` goes on, with what is certain there.
+    fn after(&self, pc: usize, mut k: Known) -> Vec<(usize, Known)> {
+        use At::{Global as G, Reg as R};
+        fn copy(k: &mut Known, dst: At, src: At) {
+            match k.get(&src).copied() {
+                Some(t) => k.insert(dst, t),
+                None => k.remove(&dst),
+            };
+        }
+        let target = |var: u32| match self.prog.vars[var as usize].slots[0].loc {
+            Loc::Reg(r) => R(r),
+            Loc::Global(g) => G(g),
+            Loc::This(_) => unreachable!(),
+        };
+        let next = pc + 1;
+        match self.proto.code[pc] {
+            Op::LoadK { dst, k: c } => {
+                let t = match self.prog.consts[c as usize].tag() {
+                    tag::NUM => TAG_NUM,
+                    tag::BOOL => TAG_BOOL,
+                    _ => TAG_NULL,
+                };
+                k.insert(R(dst), t);
+            }
+            Op::LoadNull { dst } => {
+                k.insert(R(dst), TAG_NULL);
+            }
+            Op::LoadBool { dst, .. } => {
+                k.insert(R(dst), TAG_BOOL);
+            }
+            Op::Move { dst, src } => copy(&mut k, R(dst), R(src)),
+            Op::GetReg { dst, slot, .. } => copy(&mut k, R(dst), R(slot)),
+            Op::GetGlobal { dst, slot, .. } => copy(&mut k, R(dst), G(slot)),
+            Op::SetReg { slot, src } => {
+                if slot != src {
+                    copy(&mut k, R(slot), R(src));
+                    k.insert(R(src), TAG_UNDEF);
+                }
+            }
+            Op::SetGlobal { slot, src } => {
+                copy(&mut k, G(slot), R(src));
+                k.insert(R(src), TAG_UNDEF);
+            }
+            Op::Bin { op, dst, a, b } => {
+                k.insert(R(a), TAG_NUM);
+                k.insert(R(b), TAG_NUM);
+                k.insert(R(dst), if op.is_comparison() { TAG_BOOL } else { TAG_NUM });
+            }
+            Op::BinK { op, dst, a, .. } => {
+                k.insert(R(a), TAG_NUM);
+                k.insert(R(dst), if op.is_comparison() { TAG_BOOL } else { TAG_NUM });
+            }
+            Op::Eq { dst, .. } => {
+                k.insert(R(dst), TAG_BOOL);
+            }
+            Op::EqK { dst, a, .. } => {
+                k.insert(R(a), TAG_NUM);
+                k.insert(R(dst), TAG_BOOL);
+            }
+            Op::Truth { dst, src } => {
+                k.insert(R(src), TAG_BOOL);
+                k.insert(R(dst), TAG_BOOL);
+            }
+            Op::Jump { to } => return vec![(to as usize, k)],
+            Op::JumpIfFalse { cond, to } | Op::JumpIfTrue { cond, to } => {
+                k.insert(R(cond), TAG_BOOL);
+                return vec![(next, k.clone()), (to as usize, k)];
+            }
+            Op::CmpJump { a, b, to, .. } => {
+                k.insert(R(a), TAG_NUM);
+                k.insert(R(b), TAG_NUM);
+                return vec![(next, k.clone()), (to as usize, k)];
+            }
+            Op::CmpKJump { a, to, .. } => {
+                k.insert(R(a), TAG_NUM);
+                return vec![(next, k.clone()), (to as usize, k)];
+            }
+            Op::EqJump { to, .. } => return vec![(pc + 2, k.clone()), (to as usize, k)],
+            Op::EqKJump { a, to, .. } => {
+                k.insert(R(a), TAG_NUM);
+                return vec![(pc + 2, k.clone()), (to as usize, k)];
+            }
+            Op::RangePrep { start, end, step } => {
+                for at in [start, end, step] {
+                    k.insert(R(at), TAG_NUM);
+                }
+            }
+            Op::RangeTest { exit, .. } => return vec![(next, k.clone()), (exit as usize, k)],
+            Op::RangeStep { v, .. } => {
+                k.insert(R(v), TAG_NUM);
+            }
+            Op::RangeNext { v, body, .. } => {
+                k.insert(R(v), TAG_NUM);
+                return vec![(next, k.clone()), (body as usize, k)];
+            }
+            Op::Boxed { .. } => {}
+            Op::Undef { from, to } => {
+                for r in from..to {
+                    k.insert(R(r), TAG_UNDEF);
+                }
+            }
+            Op::Update { var, a, b, .. } => {
+                k.insert(R(a), TAG_NUM);
+                k.insert(R(b), TAG_NUM);
+                k.insert(target(var), TAG_NUM);
+            }
+            Op::UpdateK { var, skip, .. } => {
+                let mut taken = k.clone();
+                taken.insert(target(var), TAG_NUM);
+                return vec![(skip as usize, taken), (next, k)];
+            }
+            _ => {}
+        }
+        vec![(next, k)]
     }
 
     /// At the loop head in the ordinary code: into the copy when its values
@@ -184,9 +345,11 @@ impl Gen<'_, '_> {
             let a = self.addr(at);
             let t = self.tag_of(a);
             let p = self.payload_of(a);
-            let (tv, bv) = r.vars[&at];
+            let f = self.num_of(a);
+            let (tv, bv, fv) = r.vars[&at];
             self.b.def_var(tv, t);
             self.b.def_var(bv, p);
+            self.b.def_var(fv, f);
         }
         let first = r.spec[0];
         self.b.ins().jump(first, &[]);
@@ -197,6 +360,7 @@ impl Gen<'_, '_> {
         for pc in r.head..=r.last {
             let blk = r.spec[pc - r.head];
             self.switch(blk);
+            r.cur = r.known[pc - r.head].clone().unwrap_or_default();
             self.spec_op(r, pc);
         }
         // The ways out, each writing the variables back.
@@ -204,9 +368,14 @@ impl Gen<'_, '_> {
         for (pc, blk) in exits {
             self.switch(blk);
             for &at in &r.slots {
-                let (tv, bv) = r.vars[&at];
+                let (tv, bv, fv) = r.vars[&at];
                 let t = self.b.use_var(tv);
-                let bits = self.b.use_var(bv);
+                // A number's bits are in its f64.
+                let other = self.b.use_var(bv);
+                let f = self.b.use_var(fv);
+                let fbits = self.b.ins().bitcast(types::I64, MemFlags::new(), f);
+                let is_num = self.b.ins().icmp_imm(IntCC::Equal, t, TAG_NUM);
+                let bits = self.b.ins().select(is_num, fbits, other);
                 let a = self.addr(at);
                 let t = self.b.ins().uextend(types::I64, t);
                 self.b.ins().store(flags(), t, a, 0);
@@ -245,21 +414,36 @@ impl Gen<'_, '_> {
     }
 
     fn set(&mut self, r: &Region, at: At, t: V, bits: V) {
-        let (tv, bv) = r.vars[&at];
+        let (tv, bv, _) = r.vars[&at];
         self.b.def_var(tv, t);
         self.b.def_var(bv, bits);
     }
 
+    /// `dst` becomes what `src` holds.
+    fn copy_slot(&mut self, r: &Region, dst: At, src: At) {
+        let (st, sb, sf) = r.vars[&src];
+        let (dt, db, df) = r.vars[&dst];
+        let (t, b, f) = (self.b.use_var(st), self.b.use_var(sb), self.b.use_var(sf));
+        self.b.def_var(dt, t);
+        self.b.def_var(db, b);
+        self.b.def_var(df, f);
+    }
+
     fn set_const(&mut self, r: &Region, at: At, t: i64, bits: i64) {
+        if t == TAG_NUM {
+            let n = self.b.ins().f64const(f64::from_bits(bits as u64));
+            return self.set_num(r, at, n);
+        }
         let t = self.b.ins().iconst(types::I32, t);
         let bits = self.b.ins().iconst(types::I64, bits);
         self.set(r, at, t, bits);
     }
 
     fn set_num(&mut self, r: &Region, at: At, n: V) {
+        let (tv, _, fv) = r.vars[&at];
         let t = self.b.ins().iconst(types::I32, TAG_NUM);
-        let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), n);
-        self.set(r, at, t, bits);
+        self.b.def_var(tv, t);
+        self.b.def_var(fv, n);
     }
 
     fn set_bool(&mut self, r: &Region, at: At, c: V) {
@@ -269,8 +453,7 @@ impl Gen<'_, '_> {
     }
 
     fn num(&mut self, r: &Region, at: At) -> V {
-        let bits = self.bv(r, at);
-        self.b.ins().bitcast(types::F64, MemFlags::new(), bits)
+        self.b.use_var(r.vars[&at].2)
     }
 
     /// Goes on in a new block when `cond`, else leaves at `pc`.
@@ -281,19 +464,31 @@ impl Gen<'_, '_> {
         self.switch(go);
     }
 
+    /// Whether `at` holds a `want` (a constant when that is certain).
     fn is(&mut self, r: &Region, at: At, want: i64) -> V {
+        if let Some(&t) = r.cur.get(&at) {
+            return self.b.ins().iconst(types::I8, (t == want) as i64);
+        }
         let t = self.tv(r, at);
         self.b.ins().icmp_imm(IntCC::Equal, t, want)
     }
 
-    /// Both numbers (their values), else leaving at `pc`.
+    fn known(&self, r: &Region, at: At, want: i64) -> bool {
+        r.cur.get(&at) == Some(&want)
+    }
+
+    /// Both numbers (their values), else leaving at `pc`; what is certainly a
+    /// number is not checked.
     fn nums(&mut self, r: &mut Region, pc: usize, a: At, b: Option<At>) -> (V, Option<V>) {
-        let mut ok = self.is(r, a, TAG_NUM);
-        if let Some(b) = b {
-            let o = self.is(r, b, TAG_NUM);
-            ok = self.b.ins().band(ok, o);
+        let unsure: Vec<At> = [Some(a), b].into_iter().flatten().filter(|&at| !self.known(r, at, TAG_NUM)).collect();
+        if !unsure.is_empty() {
+            let mut ok = self.is(r, unsure[0], TAG_NUM);
+            for &at in &unsure[1..] {
+                let o = self.is(r, at, TAG_NUM);
+                ok = self.b.ins().band(ok, o);
+            }
+            self.guard(r, pc, ok);
         }
-        self.guard(r, pc, ok);
         let x = self.num(r, a);
         (x, b.map(|b| self.num(r, b)))
     }
@@ -325,8 +520,7 @@ impl Gen<'_, '_> {
                 self.spec_next(r, pc);
             }
             Op::Move { dst, src } => {
-                let (t, bits) = (self.tv(r, R(src)), self.bv(r, R(src)));
-                self.set(r, R(dst), t, bits);
+                self.copy_slot(r, R(dst), R(src));
                 self.spec_next(r, pc);
             }
             Op::GetReg { dst, slot, .. } => self.spec_get(r, pc, dst, R(slot)),
@@ -347,7 +541,15 @@ impl Gen<'_, '_> {
             }
             Op::BinK { op, dst, a, k } => {
                 let (x, _) = self.nums(r, pc, R(a), None);
-                let y = self.b.ins().f64const(self.prog.consts[k as usize].as_num().unwrap());
+                let c = self.prog.consts[k as usize].as_num().unwrap();
+                // Adding or taking a number other than 0 never gives -0.
+                if matches!(op, BinOp::Add | BinOp::Sub) && c != 0.0 {
+                    let y = self.b.ins().f64const(c);
+                    let n = if op == BinOp::Add { self.b.ins().fadd(x, y) } else { self.b.ins().fsub(x, y) };
+                    self.set_num(r, R(dst), n);
+                    return self.spec_next(r, pc);
+                }
+                let y = self.b.ins().f64const(c);
                 self.spec_arith(r, pc, op, dst, x, y);
             }
             Op::Eq { dst, a, b, neg } => {
@@ -375,14 +577,18 @@ impl Gen<'_, '_> {
                     Loc::Global(g) => G(g),
                     Loc::This(_) => unreachable!(),
                 };
-                let is_num = self.is(r, target, TAG_NUM);
-                let (go, next) = (self.b.create_block(), self.to(r, pc + 1));
-                self.b.ins().brif(is_num, go, &[], next, &[]);
-                self.switch(go);
+                if !self.known(r, target, TAG_NUM) {
+                    let is_num = self.is(r, target, TAG_NUM);
+                    let (go, next) = (self.b.create_block(), self.to(r, pc + 1));
+                    self.b.ins().brif(is_num, go, &[], next, &[]);
+                    self.switch(go);
+                }
                 let x = self.num(r, target);
-                let y = self.b.ins().f64const(self.prog.consts[k as usize].as_num().unwrap());
+                let c = self.prog.consts[k as usize].as_num().unwrap();
+                let y = self.b.ins().f64const(c);
                 let n = if op == BinOp::Add { self.b.ins().fadd(x, y) } else { self.b.ins().fsub(x, y) };
-                let n = self.boxed(n);
+                // Adding or taking a number other than 0 never gives -0.
+                let n = if c != 0.0 { n } else { self.boxed(n) };
                 self.set_num(r, target, n);
                 let skip = self.to(r, skip as usize);
                 self.b.ins().jump(skip, &[]);
@@ -421,10 +627,11 @@ impl Gen<'_, '_> {
                 self.b.ins().brif(c, past, &[], to, &[]);
             }
             Op::Truth { dst, src } => {
-                let ok = self.is(r, R(src), TAG_BOOL);
-                self.guard(r, pc, ok);
-                let (t, bits) = (self.tv(r, R(src)), self.bv(r, R(src)));
-                self.set(r, R(dst), t, bits);
+                if !self.known(r, R(src), TAG_BOOL) {
+                    let ok = self.is(r, R(src), TAG_BOOL);
+                    self.guard(r, pc, ok);
+                }
+                self.copy_slot(r, R(dst), R(src));
                 self.spec_next(r, pc);
             }
             Op::Jump { to } => {
@@ -433,8 +640,10 @@ impl Gen<'_, '_> {
             }
             Op::JumpIfFalse { cond, to } | Op::JumpIfTrue { cond, to } => {
                 let on_true = matches!(self.proto.code[pc], Op::JumpIfTrue { .. });
-                let ok = self.is(r, R(cond), TAG_BOOL);
-                self.guard(r, pc, ok);
+                if !self.known(r, R(cond), TAG_BOOL) {
+                    let ok = self.is(r, R(cond), TAG_BOOL);
+                    self.guard(r, pc, ok);
+                }
                 let bits = self.bv(r, R(cond));
                 let (to, next) = (self.to(r, to as usize), self.to(r, pc + 1));
                 if on_true {
@@ -500,14 +709,10 @@ impl Gen<'_, '_> {
                 self.spec_next(r, pc);
             }
             Op::Boxed { dst } => {
-                let is_num = self.is(r, R(dst), TAG_NUM);
+                // The f64 matters only when the tag says a number.
                 let n = self.num(r, R(dst));
                 let boxed = self.boxed(n);
-                let boxed = self.b.ins().bitcast(types::I64, MemFlags::new(), boxed);
-                let old = self.bv(r, R(dst));
-                let bits = self.b.ins().select(is_num, boxed, old);
-                let t = self.tv(r, R(dst));
-                self.set(r, R(dst), t, bits);
+                self.b.def_var(r.vars[&R(dst)].2, boxed);
                 self.spec_next(r, pc);
             }
             Op::Undef { from, to } => {
@@ -536,18 +741,18 @@ impl Gen<'_, '_> {
     /// `GetReg` / `GetGlobal`: an undefined variable leaves (the ordinary
     /// code reports it).
     fn spec_get(&mut self, r: &mut Region, pc: usize, dst: Reg, src: At) {
-        let t = self.tv(r, src);
-        let defined = self.b.ins().icmp_imm(IntCC::NotEqual, t, TAG_UNDEF);
-        self.guard(r, pc, defined);
-        let (t, bits) = (self.tv(r, src), self.bv(r, src));
-        self.set(r, At::Reg(dst), t, bits);
+        if !matches!(r.cur.get(&src), Some(&t) if t != TAG_UNDEF) {
+            let t = self.tv(r, src);
+            let defined = self.b.ins().icmp_imm(IntCC::NotEqual, t, TAG_UNDEF);
+            self.guard(r, pc, defined);
+        }
+        self.copy_slot(r, At::Reg(dst), src);
         self.spec_next(r, pc);
     }
 
     /// `dst = take(src)`.
     fn spec_take(&mut self, r: &Region, dst: At, src: Reg) {
-        let (t, bits) = (self.tv(r, At::Reg(src)), self.bv(r, At::Reg(src)));
-        self.set(r, dst, t, bits);
+        self.copy_slot(r, dst, At::Reg(src));
         self.set_const(r, At::Reg(src), TAG_UNDEF, 0);
     }
 
