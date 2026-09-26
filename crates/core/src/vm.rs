@@ -199,6 +199,9 @@ pub struct Vm<'p> {
     init_name: u32,
     pub output: Output,
     last_flush: std::time::Instant,
+    /// When `run` finished the program, before writing out what it printed
+    /// (what `haru run --time` reports, as Hana's timing does).
+    pub finished: Option<std::time::Instant>,
     /// The next line of input; `None` at the end (reads as an empty line).
     pub read_line: Box<dyn FnMut() -> Option<String>>,
     /// Native code for functions, when the JIT is on.
@@ -243,6 +246,7 @@ impl<'p> Vm<'p> {
             init_name: symbol::intern("__init__"),
             output: Output::Stdout(Vec::new()),
             last_flush: std::time::Instant::now(),
+            finished: None,
             read_line: Box::new(|| None),
             #[cfg(feature = "jit")]
             jit: None,
@@ -344,6 +348,7 @@ impl<'p> Vm<'p> {
                 },
             }
         };
+        self.finished = Some(std::time::Instant::now());
         self.flush();
         #[cfg(feature = "jit")]
         if self.jit.is_some() {

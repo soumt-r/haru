@@ -86,7 +86,9 @@ fn run_here(path: &Path, time: bool, extra: Vec<Bundled>, files: &'static [(&'st
         }
     });
     let result = vm.run();
-    let done = Instant::now();
+    // Up to the end of the program, not the final write of its output (as
+    // Hana times it).
+    let done = vm.finished.unwrap_or_else(Instant::now);
 
     let code = match result {
         Ok(()) => ExitCode::SUCCESS,
