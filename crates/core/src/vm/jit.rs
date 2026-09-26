@@ -241,6 +241,11 @@ impl Jit {
         let isa_with = |opt: &str| {
             let mut flags = settings::builder();
             flags.set("opt_level", opt).ok()?;
+            if opt == "none" {
+                if let Ok(r) = std::env::var("HARU_JIT_REGALLOC") {
+                    flags.set("regalloc_algorithm", &r).ok()?;
+                }
+            }
             flags.set("enable_verifier", "false").ok()?;
             flags.set("use_colocated_libcalls", "false").ok()?;
             flags.set("is_pic", "false").ok()?;
@@ -441,6 +446,9 @@ impl Jit {
         } else {
             self.module.define_function(id, &mut self.ctx).map_err(|e| format!("{e:?}"))
         };
+        if std::env::var_os("HARU_JIT_PASSES").is_some() {
+            eprintln!("{}: {}", proto.name, cranelift_codegen::timing::take_current());
+        }
         if dump {
             if let Some(code) = self.ctx.compiled_code().and_then(|c| c.vcode.as_ref()) {
                 eprintln!("{code}");
@@ -584,6 +592,12 @@ mod stats {
 
 pub(super) fn report_stats() {
     stats::report();
+}
+
+/// Whether to print the IR each instruction compiles to (HARU_JIT_IRSTATS).
+fn ir_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("HARU_JIT_IRSTATS").is_some())
 }
 
 /// The instruction at `pc` of frame `fi`, by name (for the counts).
@@ -1112,6 +1126,31 @@ unsafe extern "C" fn h_return_null(env: *mut Env) -> u32 {
     }
 }
 
+/// Releases `n` values from `p` on (a frame's registers going away).
+unsafe extern "C" fn h_release_regs(p: *mut Value, n: usize) {
+    for i in 0..n {
+        std::ptr::drop_in_place(p.add(i));
+    }
+}
+
+/// Makes `n` registers from `p` on undefined (releasing what they held).
+unsafe extern "C" fn h_undef_regs(p: *mut Value, n: usize) {
+    for i in 0..n {
+        *p.add(i) = Value::UNDEF;
+    }
+}
+
+/// Fills `n` fresh registers from `p` on with undefined (nothing was there).
+unsafe extern "C" fn h_fill_undef(p: *mut Value, n: usize) {
+    for i in 0..n {
+        p.add(i).write(Value::UNDEF);
+    }
+}
+
+/// Up to how many registers the code handles one by one (more: a helper's
+/// loop, which compiles to much less).
+const UNROLL: i64 = 3;
+
 unsafe extern "C" fn h_drop(v: *mut Value) {
     stats::count(|| "h_drop".to_string());
     std::ptr::drop_in_place(v);
@@ -1164,6 +1203,7 @@ struct Sigs {
     env_only: SigRef,
     one_ptr: SigRef,
     two_ptr: SigRef,
+    ptr_len: SigRef,
 }
 
 struct Gen<'a, 'b> {
@@ -1187,6 +1227,12 @@ struct Gen<'a, 'b> {
     globals: V,
     blocks: Vec<Block>,
     dispatch: Block,
+    /// Hands the instruction at its pc (the parameter) to the interpreter
+    /// and goes where it says: every instruction's way out, shared.
+    stepper: Block,
+    /// `h_op`, else the interpreter, for the instruction at its pc: the
+    /// shared way out of a fast path that did not hold.
+    director: Block,
     trap: Block,
     sigs: Sigs,
 }
@@ -1229,12 +1275,17 @@ impl<'a, 'b> Gen<'a, 'b> {
             env_only: sig(&[ptr], Some(types::I32)),
             one_ptr: sig(&[ptr], None),
             two_ptr: sig(&[ptr, ptr], None),
+            ptr_len: sig(&[ptr, ptr], None),
         };
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         let blocks: Vec<Block> = proto.code.iter().map(|_| b.create_block()).collect();
         let dispatch = b.create_block();
         b.append_block_param(dispatch, types::I32);
+        let stepper = b.create_block();
+        b.append_block_param(stepper, types::I32);
+        let director = b.create_block();
+        b.append_block_param(director, types::I32);
         let trap = b.create_block();
         b.switch_to_block(entry);
         let env = b.block_params(entry)[0];
@@ -1261,6 +1312,8 @@ impl<'a, 'b> Gen<'a, 'b> {
             globals,
             blocks,
             dispatch,
+            stepper,
+            director,
             trap,
             sigs,
         };
@@ -1292,12 +1345,20 @@ impl<'a, 'b> Gen<'a, 'b> {
                 self.enter_region(r, ordinary);
                 self.switch(ordinary);
             }
+            let before = self.b.func.dfg.num_insts();
             self.op(i);
+            if ir_stats() {
+                let name = format!("{:?}", self.proto.code[i]);
+                let name = name.split([' ', '{']).next().unwrap_or("").to_string();
+                eprintln!("irstat {} {}", name, self.b.func.dfg.num_insts() - before);
+            }
         }
         for r in &mut regions {
             self.emit_region(r);
         }
         let has_loops = !regions.is_empty();
+        self.emit_stepper();
+        self.emit_director();
         self.emit_dispatch();
         self.switch(self.trap);
         self.b.ins().trap(TrapCode::unwrap_user(1));
@@ -1391,8 +1452,26 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// Hands instruction `i` to the interpreter and goes where it says.
     fn step(&mut self, i: usize) {
         let pc = self.b.ins().iconst(types::I32, i as i64);
+        let stepper = self.stepper;
+        self.b.ins().jump(stepper, &[BlockArg::Value(pc)]);
+    }
+
+    fn emit_director(&mut self) {
+        self.switch(self.director);
+        let pc = self.b.block_params(self.director)[0];
+        let r = self.call(self.sigs.step, h_op as usize, &[self.env, pc]).unwrap();
+        let is_slow = self.b.ins().icmp_imm(IntCC::Equal, r, SLOW as i64);
+        let (stepper, dispatch) = (self.stepper, self.dispatch);
+        self.b.ins().brif(is_slow, stepper, &[BlockArg::Value(pc)], dispatch, &[BlockArg::Value(r)]);
+    }
+
+    fn emit_stepper(&mut self) {
+        self.switch(self.stepper);
+        let pc = self.b.block_params(self.stepper)[0];
         let r = self.call(self.sigs.step, h_step as usize, &[self.env, pc]).unwrap();
-        self.go_on(i, r);
+        self.reload();
+        let dispatch = self.dispatch;
+        self.b.ins().jump(dispatch, &[BlockArg::Value(r)]);
     }
 
     /// After a helper answered `r` for instruction `i`.
@@ -1545,11 +1624,17 @@ impl<'a, 'b> Gen<'a, 'b> {
                 self.jump_next(i);
             }
             Op::Undef { from, to } => {
-                for r in from..to {
-                    let a = self.addr(At::Reg(r));
-                    let t = self.b.ins().iconst(types::I64, TAG_UNDEF);
-                    let p = self.b.ins().iconst(types::I64, 0);
-                    self.store(a, t, p);
+                if (to - from) as i64 <= UNROLL {
+                    for r in from..to {
+                        let a = self.addr(At::Reg(r));
+                        let t = self.b.ins().iconst(types::I64, TAG_UNDEF);
+                        let p = self.b.ins().iconst(types::I64, 0);
+                        self.store(a, t, p);
+                    }
+                } else {
+                    let a = self.addr(At::Reg(from));
+                    let n = self.b.ins().iconst(self.ptr, (to - from) as i64);
+                    self.call(self.sigs.ptr_len, h_undef_regs as usize, &[a, n]);
                 }
                 self.jump_next(i);
             }
@@ -1782,9 +1867,14 @@ impl<'a, 'b> Gen<'a, 'b> {
         let nr = self.b.ins().iadd(sp, off);
         let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
         let zero = self.b.ins().iconst(types::I64, 0);
-        for r in 0..nregs {
-            self.b.ins().store(flags(), undef, nr, (r * 16) as i32);
-            self.b.ins().store(flags(), zero, nr, (r * 16 + 8) as i32);
+        if nregs <= 4 * UNROLL {
+            for r in 0..nregs {
+                self.b.ins().store(flags(), undef, nr, (r * 16) as i32);
+                self.b.ins().store(flags(), zero, nr, (r * 16 + 8) as i32);
+            }
+        } else {
+            let n = self.b.ins().iconst(ptr, nregs);
+            self.call(self.sigs.ptr_len, h_fill_undef as usize, &[nr, n]);
         }
         for (k, q) in callee.params.iter().enumerate().take(argc as usize) {
             let a = self.addr(At::Reg(b + k as Reg));
@@ -1905,9 +1995,15 @@ impl<'a, 'b> Gen<'a, 'b> {
             None => (self.b.ins().iconst(types::I64, TAG_NULL), self.b.ins().iconst(types::I64, 0)),
         };
         // The registers go (as `truncate` drops them).
-        for r in 0..self.proto.nregs {
-            let a = self.addr(At::Reg(r));
-            self.release(a);
+        if self.proto.nregs as i64 <= UNROLL {
+            for r in 0..self.proto.nregs {
+                let a = self.addr(At::Reg(r));
+                self.release(a);
+            }
+        } else {
+            let a = self.addr(At::Reg(0));
+            let n = self.b.ins().iconst(self.ptr, self.proto.nregs as i64);
+            self.call(self.sigs.ptr_len, h_release_regs as usize, &[a, n]);
         }
         // A method's object.
         let this = self.b.ins().iadd_imm(f, F_THIS as i64);
@@ -2005,7 +2101,9 @@ impl<'a, 'b> Gen<'a, 'b> {
         let cur = self.b.current_block().unwrap();
         let blk = self.b.create_block();
         self.switch(blk);
-        self.direct(i);
+        let pc = self.b.ins().iconst(types::I32, i as i64);
+        let director = self.director;
+        self.b.ins().jump(director, &[BlockArg::Value(pc)]);
         self.switch(cur);
         blk
     }
