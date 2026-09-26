@@ -812,7 +812,7 @@ impl Gen<'_, '_> {
             self.writeback(r, At::Reg(base + k));
         }
         let slow = self.exit(r, pc);
-        let status = self.call_core(dst, proto, base, argc, slow);
+        let status = self.call_core(pc + 1, dst, proto, base, argc, slow);
         let (ok, bad) = (self.b.create_block(), self.b.create_block());
         self.b.ins().brif(status, bad, &[], ok, &[]);
 
@@ -849,6 +849,8 @@ impl Gen<'_, '_> {
     /// others (not used by the copy) are released.
     fn spec_return(&mut self, r: &mut Region, pc: usize, src: Option<Reg>) {
         let out = self.exit(r, pc);
+        // A call made without a frame returns in the ordinary code.
+        self.if_framed(out);
         let (vm, ptr) = (self.vm, self.ptr);
         let flen = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_LEN) as i32);
         let fp = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_PTR) as i32);

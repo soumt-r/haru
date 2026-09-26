@@ -57,7 +57,35 @@ pub(super) struct Env {
     /// Where the code starts: 0, or the pc of a loop the interpreter was
     /// running when the function became hot.
     start: usize,
+    /// The caller's, when compiled code called this directly (else null).
+    caller: *mut Env,
+    /// 1: this call's frame is in `vm.frames`. 0: compiled code called it
+    /// without one (`fast_call`): the frame is made from the fields below
+    /// only when something needs it (`h_materialize`).
+    materialized: usize,
+    proto: usize,
+    ret: usize,
+    depth: usize,
+    ns: usize,
+    /// Where this call goes on after the call it is making (its frame's pc).
+    pc: usize,
 }
+
+impl Env {
+    /// The `Env` of a call whose frame is in `vm.frames` at `fi`.
+    fn framed(vm: *mut Vm<'static>, regs: *mut Value, globals: *mut Value, fi: usize, argc: usize, base: usize, start: usize, caller: *mut Env) -> Env {
+        Env { regs, globals, vm, fi, argc, base, start, caller, materialized: 1, proto: 0, ret: 0, depth: 0, ns: 0, pc: 0 }
+    }
+}
+
+const E_CALLER: i32 = mem::offset_of!(Env, caller) as i32;
+const E_MATERIALIZED: i32 = mem::offset_of!(Env, materialized) as i32;
+const E_PROTO: i32 = mem::offset_of!(Env, proto) as i32;
+const E_RET: i32 = mem::offset_of!(Env, ret) as i32;
+const E_DEPTH: i32 = mem::offset_of!(Env, depth) as i32;
+const E_NS: i32 = mem::offset_of!(Env, ns) as i32;
+const E_PC: i32 = mem::offset_of!(Env, pc) as i32;
+const E_BASE: i32 = mem::offset_of!(Env, base) as i32;
 
 /// `Env`'s size, for the callee's one in a caller's native frame.
 const ENV_SIZE: u32 = mem::size_of::<Env>() as u32;
@@ -65,9 +93,7 @@ const ENV_SIZE: u32 = mem::size_of::<Env>() as u32;
 impl Env {
     unsafe fn refresh(&mut self) {
         let vm = &mut *self.vm;
-        if let Some(f) = vm.frames.get(self.fi) {
-            self.regs = vm.stack.as_mut_ptr().add(f.base);
-        }
+        self.regs = vm.stack.as_mut_ptr().add(self.base);
         self.globals = vm.globals.as_mut_ptr();
     }
 }
@@ -83,15 +109,9 @@ pub(super) enum Done {
 /// Runs the compiled code of frame `fi` (the running frame) from `start`.
 pub(super) fn invoke(vm: &mut Vm, code: Code, fi: usize, start: usize) -> Done {
     let base = vm.frames[fi].base;
-    let mut env = Env {
-        regs: unsafe { vm.stack.as_mut_ptr().add(base) },
-        globals: vm.globals.as_mut_ptr(),
-        vm: vm as *mut Vm as *mut Vm<'static>,
-        fi,
-        argc: vm.frames[fi].argc as usize,
-        base,
-        start,
-    };
+    let argc = vm.frames[fi].argc as usize;
+    let regs = unsafe { vm.stack.as_mut_ptr().add(base) };
+    let mut env = Env::framed(vm as *mut Vm as *mut Vm<'static>, regs, vm.globals.as_mut_ptr(), fi, argc, base, start, std::ptr::null_mut());
     match unsafe { code(&mut env) } {
         S_RETURNED => Done::Returned,
         S_END => Done::End,
@@ -614,6 +634,38 @@ fn op_name(vm: &Vm, fi: usize, pc: u32) -> String {
 
 // ---- helpers the compiled code calls
 
+/// Makes the frames of the calls compiled code made without one (this
+/// call's and its callers' up to one that has its frame), oldest first:
+/// from here on everything sees them as the interpreter made them.
+unsafe extern "C" fn h_materialize(env: *mut Env) {
+    let mut chain = Vec::new();
+    let mut e = env;
+    while !e.is_null() && (*e).materialized == 0 {
+        chain.push(e);
+        e = (*e).caller;
+    }
+    for &e in chain.iter().rev() {
+        let e = &mut *e;
+        let vm = &mut *e.vm;
+        debug_assert_eq!(vm.frames.len(), e.fi);
+        vm.frames.push(Frame {
+            proto: e.proto as u32,
+            pc: e.pc,
+            base: e.base,
+            argc: e.argc as u16,
+            depth: e.depth as u32,
+            counted: true,
+            ret: e.ret as Reg,
+            post: Post::Value,
+            this: Value::UNDEF,
+            self_class: NONE,
+            ns: e.ns as u32,
+            pending: None,
+        });
+        e.materialized = 1;
+    }
+}
+
 unsafe extern "C" fn h_step(env: *mut Env, pc: u32) -> u32 {
     let env = &mut *env;
     let vm = &mut *env.vm;
@@ -663,15 +715,7 @@ unsafe extern "C" fn h_call_start(env: *mut Env, pc: u32, callee: *mut Env) -> u
     match vm.call_plain(proto, base + b as usize, argc, dst) {
         Ok(()) => {
             let f = vm.frames.last().unwrap();
-            *callee = Env {
-                regs: vm.stack.as_mut_ptr().add(f.base),
-                globals: vm.globals.as_mut_ptr(),
-                vm: env.vm,
-                fi: fi + 1,
-                argc: argc as usize,
-                base: f.base,
-                start: 0,
-            };
+            *callee = Env::framed(env.vm, vm.stack.as_mut_ptr().add(f.base), vm.globals.as_mut_ptr(), fi + 1, argc as usize, f.base, 0, env);
             code as usize
         }
         Err(s) => {
@@ -1099,15 +1143,7 @@ unsafe extern "C" fn h_ctor_start(env: *mut Env, pc: u32, callee: *mut Env) -> u
     match vm.call_proto(proto, base + b as usize, argc, obj, o, class, Post::Discard, true) {
         Ok(()) => {
             let f = vm.frames.last().unwrap();
-            *callee = Env {
-                regs: vm.stack.as_mut_ptr().add(f.base),
-                globals: vm.globals.as_mut_ptr(),
-                vm: env.vm,
-                fi: fi + 1,
-                argc: argc as usize,
-                base: f.base,
-                start: 0,
-            };
+            *callee = Env::framed(env.vm, vm.stack.as_mut_ptr().add(f.base), vm.globals.as_mut_ptr(), fi + 1, argc as usize, f.base, 0, env);
             code as usize
         }
         Err(s) => {
@@ -1152,15 +1188,7 @@ unsafe extern "C" fn h_method_start(env: *mut Env, pc: u32, callee: *mut Env) ->
     match vm.call_proto(proto, base + b as usize, argc, dst, this, class, Post::Value, true) {
         Ok(()) => {
             let f = vm.frames.last().unwrap();
-            *callee = Env {
-                regs: vm.stack.as_mut_ptr().add(f.base),
-                globals: vm.globals.as_mut_ptr(),
-                vm: env.vm,
-                fi: fi + 1,
-                argc: argc as usize,
-                base: f.base,
-                start: 0,
-            };
+            *callee = Env::framed(env.vm, vm.stack.as_mut_ptr().add(f.base), vm.globals.as_mut_ptr(), fi + 1, argc as usize, f.base, 0, env);
             code as usize
         }
         Err(s) => {
@@ -1298,17 +1326,11 @@ const OFF_PTR: usize = mem::offset_of!(Stack<Value>, ptr);
 const OFF_LEN: usize = mem::offset_of!(Stack<Value>, len);
 const OFF_CAP: usize = mem::offset_of!(Stack<Value>, cap);
 const FRAME_SIZE: usize = mem::size_of::<Frame>();
-const F_PROTO: usize = mem::offset_of!(Frame, proto);
-const F_PC: usize = mem::offset_of!(Frame, pc);
 const F_BASE: usize = mem::offset_of!(Frame, base);
-const F_ARGC: usize = mem::offset_of!(Frame, argc);
-const F_DEPTH: usize = mem::offset_of!(Frame, depth);
 const F_COUNTED: usize = mem::offset_of!(Frame, counted);
 const F_RET: usize = mem::offset_of!(Frame, ret);
 const F_POST: usize = mem::offset_of!(Frame, post);
 const F_THIS: usize = mem::offset_of!(Frame, this);
-const F_SELF_CLASS: usize = mem::offset_of!(Frame, self_class);
-const F_NS: usize = mem::offset_of!(Frame, ns);
 const F_PENDING: usize = mem::offset_of!(Frame, pending);
 const OFF_OBJ_CLASS: usize = mem::offset_of!(ObjObj, class);
 const PROP_SIZE: usize = mem::size_of::<crate::value::Prop>();
@@ -1542,6 +1564,22 @@ impl<'a, 'b> Gen<'a, 'b> {
     }
 
     fn call(&mut self, sig: SigRef, f: usize, args: &[V]) -> Option<V> {
+        // Helpers that work on the running frame: it must be there.
+        let needs_frame = [
+            h_step as usize,
+            h_op as usize,
+            h_call as usize,
+            h_call_start as usize,
+            h_method_start as usize,
+            h_ctor_start as usize,
+            h_call_failed as usize,
+            h_return as usize,
+            h_return_null as usize,
+            h_bin as usize,
+        ];
+        if needs_frame.contains(&f) {
+            self.ensure_frame();
+        }
         let callee = self.b.ins().iconst(self.ptr, f as i64);
         let inst = self.b.ins().call_indirect(sig, callee, args);
         self.b.inst_results(inst).first().copied()
@@ -1559,6 +1597,27 @@ impl<'a, 'b> Gen<'a, 'b> {
             payload
         };
         self.b.ins().store(flags(), payload, a, 8);
+    }
+
+    /// Makes this call's frame (and its callers') if compiled code called it
+    /// without one.
+    fn ensure_frame(&mut self) {
+        let m = self.b.ins().load(types::I64, flags(), self.env, E_MATERIALIZED);
+        let (make, go) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(m, go, &[], make, &[]);
+        self.switch(make);
+        let f = self.b.ins().iconst(self.ptr, h_materialize as usize as i64);
+        self.b.ins().call_indirect(self.sigs.one_ptr, f, &[self.env]);
+        self.b.ins().jump(go, &[]);
+        self.switch(go);
+    }
+
+    /// Goes on in a new block when this call has its frame, else to `no`.
+    fn if_framed(&mut self, no: Block) {
+        let m = self.b.ins().load(types::I64, flags(), self.env, E_MATERIALIZED);
+        let go = self.b.create_block();
+        self.b.ins().brif(m, go, &[], no, &[]);
+        self.switch(go);
     }
 
     fn store_num(&mut self, a: V, n: V) {
@@ -2018,7 +2077,7 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// helpers' way, which does all of it again.
     fn fast_call(&mut self, i: usize, dst: Reg, proto: u32, b: Reg, argc: u16) {
         let slow = self.b.create_block();
-        let status = self.call_core(dst, proto, b, argc, slow);
+        let status = self.call_core(i + 1, dst, proto, b, argc, slow);
         let (ok, bad) = (self.b.create_block(), self.b.create_block());
         self.b.ins().brif(status, bad, &[], ok, &[]);
         self.switch(ok);
@@ -2036,7 +2095,7 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// The native call of `fast_call` up to the callee's status (in the
     /// current block): anything unusual goes to `slow` before anything
     /// changed. The arguments are read from (and moved out of) memory.
-    pub(super) fn call_core(&mut self, dst: Reg, proto: u32, b: Reg, argc: u16, slow: Block) -> V {
+    pub(super) fn call_core(&mut self, resume: usize, dst: Reg, proto: u32, b: Reg, argc: u16, slow: Block) -> V {
         let callee = &self.prog.protos[proto as usize];
         let nregs = callee.nregs as i64;
         let entry = self.b.ins().iconst(self.ptr, unsafe { self.table.add(proto as usize) } as i64);
@@ -2054,12 +2113,8 @@ impl<'a, 'b> Gen<'a, 'b> {
         let scap = self.b.ins().load(ptr, flags(), vm, (OFF_STACK + OFF_CAP) as i32);
         let need = self.b.ins().iadd_imm(slen, nregs);
         let room = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, need, scap);
-        let flen = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_LEN) as i32);
-        let fcap = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_CAP) as i32);
-        let froom = self.b.ins().icmp(IntCC::UnsignedLessThan, flen, fcap);
-        let both = self.b.ins().band(room, froom);
         let go = self.b.create_block();
-        self.b.ins().brif(both, go, &[], slow, &[]);
+        self.b.ins().brif(room, go, &[], slow, &[]);
 
         // Nothing can fail from here on.
         self.switch(go);
@@ -2094,32 +2149,15 @@ impl<'a, 'b> Gen<'a, 'b> {
         }
         self.b.ins().store(flags(), need, vm, (OFF_STACK + OFF_LEN) as i32);
 
-        let fp = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_PTR) as i32);
-        let foff = self.b.ins().imul_imm(flen, FRAME_SIZE as i64);
-        let f = self.b.ins().iadd(fp, foff);
+        // No frame: what it would hold goes into the callee's Env, and the
+        // frame is made from it only if something needs it. This call's
+        // own pc (where it goes on) is kept for the same reason.
         let depth = self.b.ins().load(types::I32, flags(), vm, OFF_DEPTH as i32);
+        let depth = self.b.ins().uextend(types::I64, depth);
         let ns = self.b.ins().load(types::I32, flags(), vm, OFF_NS as i32);
-        let v = self.b.ins().iconst(types::I32, proto as i64);
-        self.b.ins().store(flags(), v, f, F_PROTO as i32);
-        self.b.ins().store(flags(), zero, f, F_PC as i32);
-        self.b.ins().store(flags(), slen, f, F_BASE as i32);
-        let v = self.b.ins().iconst(types::I16, argc as i64);
-        self.b.ins().store(flags(), v, f, F_ARGC as i32);
-        self.b.ins().store(flags(), depth, f, F_DEPTH as i32);
-        let v = self.b.ins().iconst(types::I8, 1);
-        self.b.ins().store(flags(), v, f, F_COUNTED as i32);
-        let v = self.b.ins().iconst(types::I16, dst as i64);
-        self.b.ins().store(flags(), v, f, F_RET as i32);
-        let v = self.b.ins().iconst(types::I32, 0);
-        self.b.ins().store(flags(), v, f, F_POST as i32);
-        self.b.ins().store(flags(), undef, f, F_THIS as i32);
-        self.b.ins().store(flags(), zero, f, F_THIS as i32 + 8);
-        let v = self.b.ins().iconst(types::I32, NONE as i64);
-        self.b.ins().store(flags(), v, f, F_SELF_CLASS as i32);
-        self.b.ins().store(flags(), ns, f, F_NS as i32);
-        self.b.ins().store(flags(), zero, f, F_PENDING as i32);
-        let flen1 = self.b.ins().iadd_imm(flen, 1);
-        self.b.ins().store(flags(), flen1, vm, (OFF_FRAMES + OFF_LEN) as i32);
+        let ns = self.b.ins().uextend(types::I64, ns);
+        let resume = self.b.ins().iconst(types::I64, resume as i64);
+        self.b.ins().store(flags(), resume, self.env, E_PC);
 
         let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, ENV_SIZE, 3));
         let ce = self.b.ins().stack_addr(ptr, slot, 0);
@@ -2129,8 +2167,76 @@ impl<'a, 'b> Gen<'a, 'b> {
         for (off, v) in [(0, nr), (8, globals), (16, vm), (24, fi1), (32, argcv), (40, slen), (48, zero)] {
             self.b.ins().store(flags(), v, ce, off);
         }
+        let protov = self.b.ins().iconst(types::I64, proto as i64);
+        let retv = self.b.ins().iconst(types::I64, dst as i64);
+        for (off, v) in [(E_CALLER, self.env), (E_MATERIALIZED, zero), (E_PROTO, protov), (E_RET, retv), (E_DEPTH, depth), (E_NS, ns), (E_PC, zero)] {
+            self.b.ins().store(flags(), v, ce, off);
+        }
         let inst = self.b.ins().call_indirect(self.sigs.native, code, &[ce]);
         self.b.inst_results(inst)[0]
+    }
+
+    /// The value `돌려주자` gives (taken out of its register), when it fits
+    /// the return type without a closer look (else to `slow`).
+    fn return_value(&mut self, src: Option<Reg>, slow: Block) -> (V, V) {
+        match src {
+            Some(src) => {
+                let va = self.addr(At::Reg(src));
+                match self.simple_type(self.proto.return_type) {
+                    Some(tags) => self.check_tags(va, tags, slow),
+                    None => {
+                        self.b.ins().jump(slow, &[]);
+                        let dead = self.b.create_block();
+                        self.switch(dead);
+                    }
+                }
+                let vt = self.b.ins().load(types::I64, flags(), va, 0);
+                let vp = self.b.ins().load(types::I64, flags(), va, 8);
+                let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
+                self.b.ins().store(flags(), undef, va, 0);
+                (vt, vp)
+            }
+            // 비어있음 fits every return type.
+            None => (self.b.ins().iconst(types::I64, TAG_NULL), self.b.ins().iconst(types::I64, 0)),
+        }
+    }
+
+    /// The registers go (as `truncate` drops them).
+    fn release_regs(&mut self) {
+        if self.proto.nregs as i64 <= UNROLL {
+            for r in 0..self.proto.nregs {
+                let a = self.addr(At::Reg(r));
+                self.release(a);
+            }
+        } else {
+            let a = self.addr(At::Reg(0));
+            let n = self.b.ins().iconst(self.ptr, self.proto.nregs as i64);
+            self.call(self.sigs.ptr_len, h_release_regs as usize, &[a, n]);
+        }
+    }
+
+    /// The return of a call compiled code made without a frame: a plain
+    /// call (it wants the value, no object, nothing caught), so the
+    /// registers go and the value lands in the caller's register.
+    fn frameless_return(&mut self, src: Option<Reg>, slow: Block) {
+        let (vm, ptr, env) = (self.vm, self.ptr, self.env);
+        let (vt, vp) = self.return_value(src, slow);
+        self.release_regs();
+        let d = self.b.ins().load(types::I32, flags(), vm, OFF_DEPTH as i32);
+        let d = self.b.ins().iadd_imm(d, -1);
+        self.b.ins().store(flags(), d, vm, OFF_DEPTH as i32);
+        let base = self.b.ins().load(ptr, flags(), env, E_BASE);
+        self.b.ins().store(flags(), base, vm, (OFF_STACK + OFF_LEN) as i32);
+        let ret = self.b.ins().load(ptr, flags(), env, E_RET);
+        let caller = self.b.ins().load(ptr, flags(), env, E_CALLER);
+        let cbase = self.b.ins().load(ptr, flags(), caller, E_BASE);
+        let slot = self.b.ins().iadd(cbase, ret);
+        let slot = self.b.ins().ishl_imm(slot, 4);
+        let sp = self.b.ins().load(ptr, flags(), vm, (OFF_STACK + OFF_PTR) as i32);
+        let dst = self.b.ins().iadd(sp, slot);
+        self.store(dst, vt, vp);
+        let r = self.b.ins().iconst(types::I32, S_RETURNED as i64);
+        self.b.ins().return_(&[r]);
     }
 
     /// `돌려주자`: the frame of a call that only wants the value ends here
@@ -2139,6 +2245,12 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// closer) goes through `finish_call`.
     fn return_op(&mut self, src: Option<Reg>) {
         let slow = self.b.create_block();
+        let (framed, frameless) = (self.b.create_block(), self.b.create_block());
+        let m = self.b.ins().load(types::I64, flags(), self.env, E_MATERIALIZED);
+        self.b.ins().brif(m, framed, &[], frameless, &[]);
+        self.switch(frameless);
+        self.frameless_return(src, slow);
+        self.switch(framed);
         let (vm, ptr) = (self.vm, self.ptr);
         let flen = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_LEN) as i32);
         let fp = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_PTR) as i32);
@@ -2163,37 +2275,8 @@ impl<'a, 'b> Gen<'a, 'b> {
         let fast = self.b.create_block();
         self.b.ins().brif(ok, fast, &[], slow, &[]);
         self.switch(fast);
-        let (vt, vp) = match src {
-            Some(src) => {
-                let va = self.addr(At::Reg(src));
-                match self.simple_type(self.proto.return_type) {
-                    Some(tags) => self.check_tags(va, tags, slow),
-                    None => {
-                        self.b.ins().jump(slow, &[]);
-                        let dead = self.b.create_block();
-                        self.switch(dead);
-                    }
-                }
-                let vt = self.b.ins().load(types::I64, flags(), va, 0);
-                let vp = self.b.ins().load(types::I64, flags(), va, 8);
-                let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
-                self.b.ins().store(flags(), undef, va, 0);
-                (vt, vp)
-            }
-            // 비어있음 fits every return type.
-            None => (self.b.ins().iconst(types::I64, TAG_NULL), self.b.ins().iconst(types::I64, 0)),
-        };
-        // The registers go (as `truncate` drops them).
-        if self.proto.nregs as i64 <= UNROLL {
-            for r in 0..self.proto.nregs {
-                let a = self.addr(At::Reg(r));
-                self.release(a);
-            }
-        } else {
-            let a = self.addr(At::Reg(0));
-            let n = self.b.ins().iconst(self.ptr, self.proto.nregs as i64);
-            self.call(self.sigs.ptr_len, h_release_regs as usize, &[a, n]);
-        }
+        let (vt, vp) = self.return_value(src, slow);
+        self.release_regs();
         // A method's object.
         let this = self.b.ins().iadd_imm(f, F_THIS as i64);
         self.release(this);
@@ -2642,6 +2725,7 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// `'나'`: the frame's object when it has one (else `h_op`).
     fn self_or(&mut self, i: usize, dst: Reg) {
         let fallback = self.direct_block(i);
+        self.if_framed(fallback);
         let fp = self.b.ins().load(self.ptr, flags(), self.vm, (OFF_FRAMES + OFF_PTR) as i32);
         let off = self.b.ins().imul_imm(self.fi, FRAME_SIZE as i64);
         let f = self.b.ins().iadd(fp, off);
@@ -2776,6 +2860,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         let (checks, read) = (self.b.create_block(), self.b.create_block());
         self.b.ins().brif(access, checks, &[], read, &[]);
         self.switch(checks);
+        self.if_framed(fallback);
         let fp = self.b.ins().load(self.ptr, flags(), self.vm, (OFF_FRAMES + OFF_PTR) as i32);
         let off = self.b.ins().imul_imm(self.fi, FRAME_SIZE as i64);
         let f = self.b.ins().iadd(fp, off);

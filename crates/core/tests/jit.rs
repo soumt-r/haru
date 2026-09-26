@@ -59,3 +59,11 @@ fn collections() {
 fn calls_and_errors() {
     check("calls_and_errors", include_str!("jit/calls_and_errors.hr"), include_str!("jit/calls_and_errors.out"));
 }
+
+/// Calls compiled code makes without frames: an error several calls deep
+/// (caught outside, or by a caller in the middle), methods and other
+/// helpers inside them, the depth limit, loops of such calls.
+#[test]
+fn lazy_frames() {
+    check("lazy_frames", include_str!("jit/lazy_frames.hr"), include_str!("jit/lazy_frames.out"));
+}
