@@ -1371,8 +1371,14 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
                     let at = self.emit(Op::Jump { to: 0 });
                     self.loops.last_mut().unwrap().breaks.push(at);
                 }
-                _ => {
+                // A loop of this function, past `마무리는 항상` blocks.
+                Some(_) => {
                     self.emit(Op::Break);
+                }
+                // No loop: Hana's `IllegalBreakError`, where it runs (spec 4.4).
+                None => {
+                    let k = self.c.str_const("IllegalBreakError.IllegalBreak");
+                    self.emit(Op::Fail { k, args: [NONE; 3] });
                 }
             },
             Stmt::Throw(e) => {

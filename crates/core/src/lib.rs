@@ -62,6 +62,11 @@ pub fn syntax_report(diags: &[haru_syntax::Diagnostic], lang: &lang::Lang) -> (&
 /// Runs a program with no input and returns what it printed, followed by the
 /// CLI's error line when it failed (for tests).
 pub fn run_to_string(source: &str, lang: &'static lang::Lang) -> String {
+    run_to_string_with(source, lang, false)
+}
+
+/// `run_to_string`, with the JIT on (`jit`) or off.
+pub fn run_to_string_with(source: &str, lang: &'static lang::Lang, jit: bool) -> String {
     let (program, diags) = haru_syntax::parse(source, lang.syntax);
     if !diags.is_empty() {
         let (label, messages) = syntax_report(&diags, lang);
@@ -72,6 +77,9 @@ pub fn run_to_string(source: &str, lang: &'static lang::Lang) -> String {
         Err(u) => return format!("unsupported: {}", u.0),
     };
     let mut vm = vm::Vm::new(&compiled);
+    if jit {
+        vm.enable_jit_at(0);
+    }
     vm.output = vm::Output::Capture(String::new());
     let result = vm.run();
     let vm::Output::Capture(mut out) = std::mem::replace(&mut vm.output, vm::Output::Capture(String::new())) else {

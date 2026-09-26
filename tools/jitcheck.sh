@@ -5,8 +5,11 @@
 #
 #   tools/jitcheck.sh <haru binary> <corpus dir> [jobs]
 #
+# Functions are compiled as soon as they run unless HARU_JIT_HOT says
+# after how many calls and loop turns (the default of `haru run` is 1000).
 # Mismatches are listed in <corpus>/jitcheck.txt.
 set -uo pipefail
+export HARU_JIT_HOT="${HARU_JIT_HOT:-0}"
 haru="$(realpath "$1")" dir="$2" jobs="${3:-8}"
 
 check() {

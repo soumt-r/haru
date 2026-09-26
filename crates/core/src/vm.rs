@@ -110,8 +110,10 @@ impl From<RuntimeError> for Signal {
 
 type Flow<T> = Result<T, Signal>;
 
-/// What the caller does with a frame's result.
+/// What the caller does with a frame's result. (`repr(u32)`: compiled
+/// code writes `Value`, the first, as 0.)
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 enum Post {
     Value,
     /// Constructors and setters.
@@ -143,6 +145,8 @@ enum ModState {
     Loaded,
 }
 
+/// A running function. Compiled code reads and writes some fields.
+#[repr(C)]
 struct Frame {
     proto: u32,
     pc: usize,
@@ -161,8 +165,9 @@ struct Frame {
     self_class: u32,
     /// The namespace the code runs in.
     ns: u32,
-    /// What handlers of this frame caught, by handler index.
-    pending: Vec<(u32, Signal)>,
+    /// What handlers of this frame caught, by handler index (none: `None`,
+    /// which compiled code writes as a null pointer).
+    pending: Option<Box<Vec<(u32, Signal)>>>,
 }
 
 /// Where printed text goes.
@@ -175,8 +180,8 @@ pub struct Vm<'p> {
     prog: &'p Program,
     lang: &'static Lang,
     globals: Vec<Value>,
-    stack: Vec<Value>,
-    frames: Vec<Frame>,
+    stack: Stack<Value>,
+    frames: Stack<Frame>,
     depth: u32,
     namespaces: Vec<Namespace>,
     /// The running frame's namespace (kept in step with the frame).
@@ -206,6 +211,9 @@ pub struct Vm<'p> {
 
 #[cfg(feature = "jit")]
 mod jit;
+mod stack;
+
+use stack::Stack;
 
 impl<'p> Vm<'p> {
     pub fn new(prog: &'p Program) -> Vm<'p> {
@@ -214,8 +222,8 @@ impl<'p> Vm<'p> {
             prog,
             lang: prog.lang,
             globals: prog.globals.clone(),
-            stack: Vec::with_capacity(1024),
-            frames: Vec::new(),
+            stack: Stack::with_capacity(1024),
+            frames: Stack::with_capacity(64),
             depth: 0,
             namespaces: vec![Namespace::of(&prog.modules[0])],
             ns: 0,
@@ -245,16 +253,30 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// Runs functions as native code (compiled when first called). Returns
-    /// whether the JIT is available on this machine.
+    /// Runs functions as native code once they are hot (`HARU_JIT_HOT`
+    /// calls and loop turns, 1000 by default). Returns whether the JIT is
+    /// available on this machine.
     #[cfg(feature = "jit")]
     pub fn enable_jit(&mut self) -> bool {
-        self.jit = jit::Jit::new(self.prog.protos.len()).map(Box::new);
+        let threshold = std::env::var("HARU_JIT_HOT").ok().and_then(|n| n.parse().ok()).unwrap_or(1000);
+        self.enable_jit_at(threshold)
+    }
+
+    /// `enable_jit`, compiling a function after `threshold` calls and loop
+    /// turns (0: when it first runs).
+    #[cfg(feature = "jit")]
+    pub fn enable_jit_at(&mut self, threshold: u32) -> bool {
+        self.jit = jit::Jit::new(self.prog.protos.len(), threshold).map(Box::new);
         self.jit.is_some()
     }
 
     #[cfg(not(feature = "jit"))]
     pub fn enable_jit(&mut self) -> bool {
+        false
+    }
+
+    #[cfg(not(feature = "jit"))]
+    pub fn enable_jit_at(&mut self, _threshold: u32) -> bool {
         false
     }
 
@@ -311,7 +333,7 @@ impl<'p> Vm<'p> {
             this: Value::UNDEF,
             self_class: NONE,
             ns: 0,
-            pending: Vec::new(),
+            pending: None,
         });
         let result = loop {
             match self.exec() {
@@ -397,8 +419,9 @@ impl<'p> Vm<'p> {
                 frame.pc = h.target as usize;
                 self.depth = frame.depth + h.open_calls;
                 let key = i as u32;
-                frame.pending.retain(|(k, _)| *k != key);
-                frame.pending.push((key, signal));
+                let pending = frame.pending.get_or_insert_with(Default::default);
+                pending.retain(|(k, _)| *k != key);
+                pending.push((key, signal));
                 Ok(())
             }
             (_, Some(l)) => {
@@ -643,7 +666,7 @@ impl<'p> Vm<'p> {
             }
             let depth = self.depth;
             let ns = self.ns;
-            self.frames.push(Frame { proto: proto_id, pc: 0, base, argc, depth, counted, ret, post, this, self_class, ns, pending: Vec::new() });
+            self.frames.push(Frame { proto: proto_id, pc: 0, base, argc, depth, counted, ret, post, this, self_class, ns, pending: None });
             return Ok(());
         }
         if argc as usize > nparams {
@@ -665,7 +688,7 @@ impl<'p> Vm<'p> {
         }
         let depth = self.depth;
         let ns = self.ns;
-            self.frames.push(Frame { proto: proto_id, pc: 0, base, argc, depth, counted, ret, post, this, self_class, ns, pending: Vec::new() });
+            self.frames.push(Frame { proto: proto_id, pc: 0, base, argc, depth, counted, ret, post, this, self_class, ns, pending: None });
         Ok(())
     }
 
@@ -757,9 +780,10 @@ impl<'p> Vm<'p> {
         self.exec_mode::<false>()
     }
 
-    /// The loop. `STEP`: runs only the running frame's instruction at its pc
-    /// and returns (with the frame's pc after it, or a callee's frame started
-    /// or the frame gone); compiled code runs what it has no code for so.
+    /// The loop. `STEP`: runs the running frame's instructions from its pc
+    /// until one compiled code does itself and returns (with the frame's pc
+    /// there, or a callee's frame started or the frame gone); compiled code
+    /// runs what it has no code for so.
     fn exec_mode<const STEP: bool>(&mut self) -> Flow<()> {
         let prog = self.prog;
         let mut entered = false;
@@ -777,7 +801,7 @@ impl<'p> Vm<'p> {
             if !STEP && self.jit.is_some() && self.frames[fi].pc == 0 {
                 // A function starting: as native code when it has some.
                 if let Some(code) = self.jit_code(self.frames[fi].proto) {
-                    match jit::invoke(self, code, fi) {
+                    match jit::invoke(self, code, fi, 0) {
                         jit::Done::Returned => continue 'frames,
                         jit::Done::End => return Ok(()),
                         jit::Done::Failed(s) => return Err(s),
@@ -834,7 +858,11 @@ impl<'p> Vm<'p> {
             let mut stepped = false;
             loop {
                 if STEP {
-                    if stepped {
+                    #[cfg(feature = "jit")]
+                    let back = stepped && self.jit_takes_back(self.frames[fi].proto, pc);
+                    #[cfg(not(feature = "jit"))]
+                    let back = stepped;
+                    if back {
                         self.frames[fi].pc = pc;
                         return Ok(());
                     }
@@ -970,7 +998,22 @@ impl<'p> Vm<'p> {
                         }
                     }
                     Op::UnknownOp { k } => fail!(err(UNKNOWN_OPERATOR).arg(prog.consts[k as usize].clone())),
-                    Op::Jump { to } => pc = to as usize,
+                    Op::Jump { to } => {
+                        // A loop turning: the function may be hot enough to go
+                        // on as native code from here.
+                        #[cfg(feature = "jit")]
+                        if !STEP && (to as usize) < pc && self.jit.is_some() {
+                            if let Some(code) = self.jit_code(self.frames[fi].proto) {
+                                self.frames[fi].pc = to as usize;
+                                match jit::invoke(self, code, fi, to as usize) {
+                                    jit::Done::Returned => continue 'frames,
+                                    jit::Done::End => return Ok(()),
+                                    jit::Done::Failed(s) => return Err(s),
+                                }
+                            }
+                        }
+                        pc = to as usize;
+                    }
                     Op::CmpJump { op, a, b, to } => {
                         let (x, y) = (&reg!(a), &reg!(b));
                         let t = match (x.as_num(), y.as_num()) {
@@ -1446,7 +1489,7 @@ impl<'p> Vm<'p> {
                     Op::Fail { k, args } => {
                         let code = prog.consts[k as usize].as_str().unwrap().to_string();
                         let mut e = err(&code);
-                        for a in args {
+                        for a in args.into_iter().filter(|&a| a != NONE) {
                             e = e.arg(prog.consts[a as usize].clone());
                         }
                         fail!(e);
@@ -1662,7 +1705,7 @@ impl<'p> Vm<'p> {
                         fail!(RuntimeError::thrown(v));
                     }
                     Op::CatchIs { key, class, to } => {
-                        let fits = self.frames[fi].pending.iter().any(|(k, s)| {
+                        let fits = self.frames[fi].pending.iter().flat_map(|p| p.iter()).any(|(k, s)| {
                             *k == key
                                 && matches!(s, Signal::Error(e) if e.thrown_value().and_then(|v| v.as_object()).is_some_and(|o| {
                                     o.class == class || self.class(o.class).is_some_and(|c| c.lineage.contains(&class))
@@ -1719,7 +1762,7 @@ impl<'p> Vm<'p> {
             this: Value::UNDEF,
             self_class: NONE,
             ns,
-            pending: Vec::new(),
+            pending: None,
         });
         Ok(())
     }
@@ -1899,7 +1942,7 @@ impl<'p> Vm<'p> {
     }
 
     fn take_pending(&mut self, fi: usize, key: u32) -> Signal {
-        let pending = &mut self.frames[fi].pending;
+        let pending = self.frames[fi].pending.get_or_insert_with(Default::default);
         match pending.iter().position(|(k, _)| *k == key) {
             Some(i) => pending.remove(i).1,
             None => Signal::Error(err(UNSUPPORTED).str_arg("lost signal")),

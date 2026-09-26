@@ -19,7 +19,7 @@ use std::mem;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{types, AbiParam, BlockArg, InstBuilder, JumpTableData, MemFlags, Signature, TrapCode};
-use cranelift_codegen::ir::{Block, SigRef, Value as V};
+use cranelift_codegen::ir::{Block, SigRef, StackSlotData, StackSlotKind, Value as V};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -47,7 +47,17 @@ pub(super) struct Env {
     globals: *mut Value,
     vm: *mut Vm<'static>,
     fi: usize,
+    /// How many arguments the call passed.
+    argc: usize,
+    /// The frame's first register on the stack.
+    base: usize,
+    /// Where the code starts: 0, or the pc of a loop the interpreter was
+    /// running when the function became hot.
+    start: usize,
 }
+
+/// `Env`'s size, for the callee's one in a caller's native frame.
+const ENV_SIZE: u32 = mem::size_of::<Env>() as u32;
 
 impl Env {
     unsafe fn refresh(&mut self) {
@@ -67,14 +77,17 @@ pub(super) enum Done {
     Failed(Signal),
 }
 
-/// Runs the compiled code of frame `fi` (the running frame, at its start).
-pub(super) fn invoke(vm: &mut Vm, code: Code, fi: usize) -> Done {
+/// Runs the compiled code of frame `fi` (the running frame) from `start`.
+pub(super) fn invoke(vm: &mut Vm, code: Code, fi: usize, start: usize) -> Done {
     let base = vm.frames[fi].base;
     let mut env = Env {
         regs: unsafe { vm.stack.as_mut_ptr().add(base) },
         globals: vm.globals.as_mut_ptr(),
         vm: vm as *mut Vm as *mut Vm<'static>,
         fi,
+        argc: vm.frames[fi].argc as usize,
+        base,
+        start,
     };
     match unsafe { code(&mut env) } {
         S_RETURNED => Done::Returned,
@@ -90,6 +103,15 @@ enum State {
 }
 
 pub(super) struct Jit {
+    /// Each function's code, or 0 (not compiled): what compiled calls read.
+    table: Box<[usize]>,
+    /// Calls and loop turns of each function not compiled yet; it is
+    /// compiled once they pass `threshold`.
+    counts: Vec<u32>,
+    threshold: u32,
+    /// For each compiled function, which instructions its code does itself:
+    /// the interpreter, running some for it, goes on until one of those.
+    natives: Vec<Box<[bool]>>,
     module: JITModule,
     ctx: Context,
     fctx: FunctionBuilderContext,
@@ -97,25 +119,66 @@ pub(super) struct Jit {
 }
 
 impl Jit {
-    pub(super) fn new(protos: usize) -> Option<Jit> {
+    pub(super) fn new(protos: usize, threshold: u32) -> Option<Jit> {
         let mut flags = settings::builder();
-        flags.set("opt_level", "speed").ok()?;
+        // Quicker compiles: the code mostly moves values in memory, which the
+        // optimizer gains nothing on. (The single-pass register allocator
+        // compiles faster still, but its code runs twice as long.)
+        flags.set("opt_level", "none").ok()?;
+        flags.set("enable_verifier", "false").ok()?;
         flags.set("use_colocated_libcalls", "false").ok()?;
         flags.set("is_pic", "false").ok()?;
         let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
         let module = JITModule::new(JITBuilder::with_isa(isa, cranelift_module::default_libcall_names()));
         let ctx = module.make_context();
-        Some(Jit { module, ctx, fctx: FunctionBuilderContext::new(), states: (0..protos).map(|_| State::Untried).collect() })
+        // Compiled code writes `Post::Value` as 0.
+        if unsafe { *(&Post::Value as *const Post as *const u32) } != 0 {
+            return None;
+        }
+        Some(Jit {
+            table: vec![0; protos].into_boxed_slice(),
+            counts: vec![0; protos],
+            threshold,
+            natives: (0..protos).map(|_| Box::default()).collect(),
+            module,
+            ctx,
+            fctx: FunctionBuilderContext::new(),
+            states: (0..protos).map(|_| State::Untried).collect(),
+        })
     }
 
+    /// A function's code, counting one call or loop turn of it: compiled
+    /// once it is hot.
     fn code(&mut self, id: u32, prog: &Program) -> Option<Code> {
         match self.states[id as usize] {
             State::Ready(c) => Some(c),
             State::Failed => None,
             State::Untried => {
+                let n = &mut self.counts[id as usize];
+                *n += 1;
+                if *n <= self.threshold {
+                    return None;
+                }
+                // Code that is mostly what the interpreter does anyway gains
+                // nothing for the time compiling takes (unless everything is
+                // to be compiled: threshold 0).
+                let proto = &prog.protos[id as usize];
+                if self.threshold > 0 && proto.code.iter().filter(|op| native(op, prog)).count() * 10 < proto.code.len() * 6 {
+                    self.states[id as usize] = State::Failed;
+                    return None;
+                }
+                let started = std::time::Instant::now();
                 let c = self.compile(&prog.protos[id as usize], prog);
+                if std::env::var_os("HARU_JIT_DEBUG").is_some() {
+                    let p = &prog.protos[id as usize];
+                    eprintln!("jit: {} ({} ops): {:?}{}", p.name, p.code.len(), started.elapsed(), if c.is_none() { " failed" } else { "" });
+                }
                 self.states[id as usize] = match c {
-                    Some(c) => State::Ready(c),
+                    Some(c) => {
+                        self.table[id as usize] = c as usize;
+                        self.natives[id as usize] = prog.protos[id as usize].code.iter().map(|op| native(op, prog)).collect();
+                        State::Ready(c)
+                    }
                     None => State::Failed,
                 };
                 c
@@ -136,7 +199,17 @@ impl Jit {
         let id = self.module.declare_anonymous_function(&self.ctx.func.signature).ok()?;
         {
             let b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
-            Gen::new(b, ptr, cc, proto, prog).build();
+            Gen::new(b, ptr, cc, proto, prog, self.table.as_ptr()).build();
+        }
+        if std::env::var_os("HARU_JIT_DEBUG").is_some() {
+            eprintln!(
+                "  {} blocks, {} insts, {} regs, {}/{} ops native",
+                self.ctx.func.dfg.num_blocks(),
+                self.ctx.func.dfg.num_insts(),
+                proto.nregs,
+                proto.code.iter().filter(|op| native(op, prog)).count(),
+                proto.code.len()
+            );
         }
         if let Err(e) = self.module.define_function(id, &mut self.ctx) {
             if std::env::var_os("HARU_JIT_DEBUG").is_some() {
@@ -153,6 +226,13 @@ impl Jit {
 }
 
 impl Vm<'_> {
+    /// Whether the interpreter, running instructions for compiled code,
+    /// hands back at `pc` of `proto`.
+    #[inline]
+    pub(super) fn jit_takes_back(&self, proto: u32, pc: usize) -> bool {
+        self.jit.as_ref().is_none_or(|j| j.natives[proto as usize].get(pc).copied().unwrap_or(true))
+    }
+
     pub(super) fn jit_code(&mut self, proto: u32) -> Option<Code> {
         let prog = self.prog;
         self.jit.as_mut()?.code(proto, prog)
@@ -192,16 +272,25 @@ impl Vm<'_> {
 
     /// Runs the frame above `fi` (just started) until it is gone.
     fn jit_run_callee(&mut self, fi: usize) -> Flow<()> {
+        let proto = self.frames[fi + 1].proto;
         let saved = self.stop_at;
         self.stop_at = fi + 1;
-        let proto = self.frames[fi + 1].proto;
-        let mut r = match self.jit_code(proto) {
-            Some(code) => match invoke(self, code, fi + 1) {
+        let r = match self.jit_code(proto) {
+            Some(code) => match invoke(self, code, fi + 1, 0) {
                 Done::Returned | Done::End => Ok(()),
                 Done::Failed(s) => Err(s),
             },
             None => self.exec(),
         };
+        self.stop_at = saved;
+        self.jit_finish_callee(fi, r)
+    }
+
+    /// The rest of a callee's run after `r`: an error it let out still
+    /// unwinds its frame (not frame `fi`'s).
+    fn jit_finish_callee(&mut self, fi: usize, mut r: Flow<()>) -> Flow<()> {
+        let saved = self.stop_at;
+        self.stop_at = fi + 1;
         let r = loop {
             match r {
                 Ok(()) => break Ok(()),
@@ -246,10 +335,61 @@ unsafe extern "C" fn h_call(env: *mut Env, pc: u32) -> u32 {
     next
 }
 
+/// A call's fast start: when the callee has native code, starts its frame
+/// and fills `callee` for it, returning the code. 0: the callee has none
+/// (nothing done); 1: starting it failed (the signal kept).
+unsafe extern "C" fn h_call_start(env: *mut Env, pc: u32, callee: *mut Env) -> usize {
+    let env = &mut *env;
+    let vm = &mut *env.vm;
+    let fi = env.fi;
+    let frame = &vm.frames[fi];
+    let base = frame.base;
+    let Op::Call { dst, proto, base: b, argc } = vm.prog.protos[frame.proto as usize].code[pc as usize] else {
+        unreachable!()
+    };
+    let Some(code) = vm.jit_code(proto) else {
+        return 0;
+    };
+    vm.frames[fi].pc = pc as usize + 1;
+    match vm.call_plain(proto, base + b as usize, argc, dst) {
+        Ok(()) => {
+            let f = vm.frames.last().unwrap();
+            *callee = Env {
+                regs: vm.stack.as_mut_ptr().add(f.base),
+                globals: vm.globals.as_mut_ptr(),
+                vm: env.vm,
+                fi: fi + 1,
+                argc: argc as usize,
+                base: f.base,
+                start: 0,
+            };
+            code as usize
+        }
+        Err(s) => {
+            vm.jit_signal = Some(s);
+            env.refresh();
+            1
+        }
+    }
+}
+
+/// After a fast call at `pc` failed: to start (`started` 0) or in the callee.
+unsafe extern "C" fn h_call_failed(env: *mut Env, pc: u32, started: u32) -> u32 {
+    let env = &mut *env;
+    let vm = &mut *env.vm;
+    let fi = env.fi;
+    vm.frames[fi].pc = pc as usize + 1;
+    let s = vm.jit_signal.take().expect("a failed call keeps its signal");
+    let r = if started != 0 { vm.jit_finish_callee(fi, Err(s)) } else { Err(s) };
+    let next = vm.jit_resume(fi, r);
+    env.refresh();
+    next
+}
+
 unsafe extern "C" fn h_return(env: *mut Env, src: u32) -> u32 {
     let env = &mut *env;
     let vm = &mut *env.vm;
-    let v = mem::replace(&mut *env.regs.add(src as usize), Value::UNDEF);
+    let v = mem::replace(&mut vm.stack[env.base + src as usize], Value::UNDEF);
     match vm.finish_call(v, false) {
         Ok(()) => S_RETURNED,
         Err(s) => {
@@ -274,21 +414,6 @@ unsafe extern "C" fn h_return_null(env: *mut Env) -> u32 {
     }
 }
 
-/// `Op::Enter` when it cannot fail (else 1: the interpreter reports it).
-unsafe extern "C" fn h_enter(env: *mut Env) -> u32 {
-    let vm = &mut *(*env).vm;
-    if vm.depth >= MAX_CALL_DEPTH {
-        return 1;
-    }
-    vm.depth += 1;
-    0
-}
-
-unsafe extern "C" fn h_leave(env: *mut Env) {
-    let vm = &mut *(*env).vm;
-    vm.depth -= 1;
-}
-
 unsafe extern "C" fn h_drop(v: *mut Value) {
     std::ptr::drop_in_place(v);
 }
@@ -299,6 +424,28 @@ unsafe extern "C" fn h_clone_into(dst: *mut Value, src: *const Value) {
 
 // ---- code generation
 
+// Where compiled code finds what it reads and writes directly.
+const OFF_STACK: usize = mem::offset_of!(Vm<'static>, stack);
+const OFF_FRAMES: usize = mem::offset_of!(Vm<'static>, frames);
+const OFF_DEPTH: usize = mem::offset_of!(Vm<'static>, depth);
+const OFF_NS: usize = mem::offset_of!(Vm<'static>, ns);
+const OFF_PTR: usize = mem::offset_of!(Stack<Value>, ptr);
+const OFF_LEN: usize = mem::offset_of!(Stack<Value>, len);
+const OFF_CAP: usize = mem::offset_of!(Stack<Value>, cap);
+const FRAME_SIZE: usize = mem::size_of::<Frame>();
+const F_PROTO: usize = mem::offset_of!(Frame, proto);
+const F_PC: usize = mem::offset_of!(Frame, pc);
+const F_BASE: usize = mem::offset_of!(Frame, base);
+const F_ARGC: usize = mem::offset_of!(Frame, argc);
+const F_DEPTH: usize = mem::offset_of!(Frame, depth);
+const F_COUNTED: usize = mem::offset_of!(Frame, counted);
+const F_RET: usize = mem::offset_of!(Frame, ret);
+const F_POST: usize = mem::offset_of!(Frame, post);
+const F_THIS: usize = mem::offset_of!(Frame, this);
+const F_SELF_CLASS: usize = mem::offset_of!(Frame, self_class);
+const F_NS: usize = mem::offset_of!(Frame, ns);
+const F_PENDING: usize = mem::offset_of!(Frame, pending);
+
 const TAG_NULL: i64 = tag::NULL as i64;
 const TAG_BOOL: i64 = tag::BOOL as i64;
 const TAG_NUM: i64 = tag::NUM as i64;
@@ -307,8 +454,10 @@ const TAG_UNDEF: i64 = crate::value::UNDEF as i64;
 struct Sigs {
     step: SigRef,
     ret: SigRef,
+    start: SigRef,
+    failed: SigRef,
+    native: SigRef,
     env_only: SigRef,
-    env_void: SigRef,
     one_ptr: SigRef,
     two_ptr: SigRef,
 }
@@ -319,6 +468,11 @@ struct Gen<'a, 'b> {
     proto: &'a Proto,
     prog: &'a Program,
     env: V,
+    /// The VM, the frame's index and its first register's offset (bytes).
+    vm: V,
+    fi: V,
+    base_off: V,
+    table: *const usize,
     regs: Variable,
     globals: Variable,
     blocks: Vec<Block>,
@@ -339,7 +493,14 @@ fn flags() -> MemFlags {
 }
 
 impl<'a, 'b> Gen<'a, 'b> {
-    fn new(mut b: FunctionBuilder<'b>, ptr: types::Type, cc: cranelift_codegen::isa::CallConv, proto: &'a Proto, prog: &'a Program) -> Self {
+    fn new(
+        mut b: FunctionBuilder<'b>,
+        ptr: types::Type,
+        cc: cranelift_codegen::isa::CallConv,
+        proto: &'a Proto,
+        prog: &'a Program,
+        table: *const usize,
+    ) -> Self {
         let mut sig = |params: &[types::Type], ret: Option<types::Type>| {
             let mut s = Signature::new(cc);
             s.params.extend(params.iter().map(|t| AbiParam::new(*t)));
@@ -349,8 +510,10 @@ impl<'a, 'b> Gen<'a, 'b> {
         let sigs = Sigs {
             step: sig(&[ptr, types::I32], Some(types::I32)),
             ret: sig(&[ptr, types::I32], Some(types::I32)),
+            start: sig(&[ptr, types::I32, ptr], Some(ptr)),
+            failed: sig(&[ptr, types::I32, types::I32], Some(types::I32)),
+            native: sig(&[ptr], Some(types::I32)),
             env_only: sig(&[ptr], Some(types::I32)),
-            env_void: sig(&[ptr], None),
             one_ptr: sig(&[ptr], None),
             two_ptr: sig(&[ptr, ptr], None),
         };
@@ -362,12 +525,20 @@ impl<'a, 'b> Gen<'a, 'b> {
         let trap = b.create_block();
         b.switch_to_block(entry);
         let env = b.block_params(entry)[0];
+        let vm = b.ins().load(ptr, flags(), env, 16);
+        let fi = b.ins().load(ptr, flags(), env, 24);
+        let base = b.ins().load(ptr, flags(), env, 40);
+        let base_off = b.ins().ishl_imm(base, 4);
         let regs = b.declare_var(ptr);
         let globals = b.declare_var(ptr);
-        let mut g = Gen { b, ptr, proto, prog, env, regs, globals, blocks, dispatch, trap, sigs };
+        let g0 = b.ins().load(ptr, flags(), env, 8);
+        b.def_var(globals, g0);
+        let mut g = Gen { b, ptr, proto, prog, env, vm, fi, base_off, table, regs, globals, blocks, dispatch, trap, sigs };
         g.reload();
-        let first = g.blocks[0];
-        g.b.ins().jump(first, &[]);
+        let start = g.b.ins().load(types::I64, flags(), g.env, 48);
+        let at = g.b.ins().ireduce(types::I32, start);
+        let (first, dispatch) = (g.blocks[0], g.dispatch);
+        g.b.ins().brif(start, dispatch, &[BlockArg::Value(at)], first, &[]);
         g
     }
 
@@ -387,10 +558,9 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// The registers' and globals' addresses, again (after a helper that may
     /// have moved the stack).
     fn reload(&mut self) {
-        let r = self.b.ins().load(self.ptr, flags(), self.env, 0);
+        let sp = self.b.ins().load(self.ptr, flags(), self.vm, (OFF_STACK + OFF_PTR) as i32);
+        let r = self.b.ins().iadd(sp, self.base_off);
         self.b.def_var(self.regs, r);
-        let g = self.b.ins().load(self.ptr, flags(), self.env, 8);
-        self.b.def_var(self.globals, g);
     }
 
     fn addr(&mut self, at: At) -> V {
@@ -559,12 +729,49 @@ impl<'a, 'b> Gen<'a, 'b> {
                 None => self.step(i),
             },
             Op::Update { var, a, b, op } if matches!(op, BinOp::Add | BinOp::Sub) => {
-                let target = match self.prog.vars[var as usize].slots.as_slice() {
-                    [Slot { loc: Loc::Reg(r), meta: None }] => At::Reg(*r),
-                    [Slot { loc: Loc::Global(g), meta: None }] => At::Global(*g),
+                let (target, meta) = match self.prog.vars[var as usize].slots.as_slice() {
+                    [Slot { loc: Loc::Reg(r), meta }] => (At::Reg(*r), *meta),
+                    [Slot { loc: Loc::Global(g), meta }] => (At::Global(*g), *meta),
                     _ => return self.step(i),
                 };
                 let slow = self.slow_block(i);
+                if let Some(m) = meta {
+                    // A declared type or 고정: a number fits when the type is
+                    // none, a number or anything, and it is not a constant.
+                    let m = match m {
+                        Loc::Reg(r) => At::Reg(r),
+                        Loc::Global(g) => At::Global(g),
+                        Loc::This(_) => return self.step(i),
+                    };
+                    let ma = self.addr(m);
+                    let t = self.tag_of(ma);
+                    let is_num = self.is_tag(t, TAG_NUM);
+                    let (typed, untyped) = (self.b.create_block(), self.b.create_block());
+                    let not_num = self.b.create_block();
+                    self.b.ins().brif(is_num, typed, &[], not_num, &[]);
+                    self.b.switch_to_block(not_num);
+                    // Undefined or null: no type.
+                    let u = self.is_tag(t, TAG_UNDEF);
+                    let n = self.is_tag(t, TAG_NULL);
+                    let none = self.b.ins().bor(u, n);
+                    self.b.ins().brif(none, untyped, &[], slow, &[]);
+                    self.b.switch_to_block(typed);
+                    let v = self.num_of(ma);
+                    let mut ok = None;
+                    for id in number_types(self.prog) {
+                        let k = self.b.ins().f64const((id * 2) as f64);
+                        let c = self.b.ins().fcmp(FloatCC::Equal, v, k);
+                        ok = Some(match ok {
+                            Some(o) => self.b.ins().bor(o, c),
+                            None => c,
+                        });
+                    }
+                    match ok {
+                        Some(ok) => self.b.ins().brif(ok, untyped, &[], slow, &[]),
+                        None => self.b.ins().jump(slow, &[]),
+                    };
+                    self.b.switch_to_block(untyped);
+                }
                 let (xa, ya) = (self.addr(At::Reg(a)), self.addr(At::Reg(b)));
                 let (x, y) = self.both_nums(xa, ya, slow);
                 let r = if op == BinOp::Add { self.b.ins().fadd(x, y) } else { self.b.ins().fsub(x, y) };
@@ -679,30 +886,307 @@ impl<'a, 'b> Gen<'a, 'b> {
             }
             Op::Enter => {
                 let slow = self.slow_block(i);
-                let r = self.call(self.sigs.env_only, h_enter as usize, &[self.env]).unwrap();
-                let next = self.next(i);
-                self.b.ins().brif(r, slow, &[], next, &[]);
-            }
-            Op::Leave => {
-                self.call(self.sigs.env_void, h_leave as usize, &[self.env]);
+                let d = self.b.ins().load(types::I32, flags(), self.vm, OFF_DEPTH as i32);
+                let full = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, d, MAX_CALL_DEPTH as i64);
+                let fast = self.b.create_block();
+                self.b.ins().brif(full, slow, &[], fast, &[]);
+                self.b.switch_to_block(fast);
+                let d = self.b.ins().iadd_imm(d, 1);
+                self.b.ins().store(flags(), d, self.vm, OFF_DEPTH as i32);
                 self.jump_next(i);
             }
-            Op::Call { .. } => {
-                let pc = self.b.ins().iconst(types::I32, i as i64);
-                let r = self.call(self.sigs.step, h_call as usize, &[self.env, pc]).unwrap();
-                self.go_on(i, r);
+            Op::Leave => {
+                let d = self.b.ins().load(types::I32, flags(), self.vm, OFF_DEPTH as i32);
+                let d = self.b.ins().iadd_imm(d, -1);
+                self.b.ins().store(flags(), d, self.vm, OFF_DEPTH as i32);
+                self.jump_next(i);
             }
-            Op::Return { src } => {
-                let s = self.b.ins().iconst(types::I32, src as i64);
-                let r = self.call(self.sigs.ret, h_return as usize, &[self.env, s]).unwrap();
-                self.b.ins().return_(&[r]);
+            Op::Call { dst, proto, base, argc } => match self.inline_call(proto, argc) {
+                true => self.fast_call(i, dst, proto, base, argc),
+                false => self.call_op(i),
+            },
+            Op::ArgGiven { index, skip } => {
+                let argc = self.b.ins().load(types::I64, flags(), self.env, 32);
+                let given = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, argc, index as i64);
+                let (skip, next) = (self.blocks[skip as usize], self.next(i));
+                self.b.ins().brif(given, skip, &[], next, &[]);
             }
+            Op::Return { src } => self.return_op(src),
             Op::ReturnNull => {
                 let r = self.call(self.sigs.env_only, h_return_null as usize, &[self.env]).unwrap();
                 self.b.ins().return_(&[r]);
             }
             _ => self.step(i),
         }
+    }
+
+    /// The tags a type annotation lets through without a closer look.
+    fn simple_type(&self, ty: u32) -> Option<&'static [i64]> {
+        if ty == 0 {
+            return Some(&[]);
+        }
+        match self.prog.types[ty as usize].kind {
+            TypeKind::Any => Some(&[]),
+            TypeKind::Number => Some(&[TAG_NUM, TAG_NULL]),
+            TypeKind::String => Some(&[tag::STR as i64, TAG_NULL]),
+            TypeKind::Boolean => Some(&[TAG_BOOL, TAG_NULL]),
+            _ => None,
+        }
+    }
+
+    /// Whether a call of `proto` with `argc` arguments can start its frame
+    /// here (else the helpers start it).
+    fn inline_call(&self, proto: u32, argc: u16) -> bool {
+        let p = &self.prog.protos[proto as usize];
+        !p.raw_params
+            && argc as usize <= p.params.len()
+            && p.params.iter().take(argc as usize).all(|q| self.simple_type(q.ty).is_some())
+    }
+
+    /// Goes to `slow` unless the tag at `a` is one of `tags` (none: any).
+    fn check_tags(&mut self, a: V, tags: &[i64], slow: Block) {
+        if tags.is_empty() {
+            return;
+        }
+        let t = self.tag_of(a);
+        let mut ok = self.is_tag(t, tags[0]);
+        for &x in &tags[1..] {
+            let o = self.is_tag(t, x);
+            ok = self.b.ins().bor(ok, o);
+        }
+        let fast = self.b.create_block();
+        self.b.ins().brif(ok, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+    }
+
+    /// A call of a function of the program, its frame started here: the
+    /// checks `call_proto` makes, then the frame, then its native code.
+    /// Anything unusual (no code yet, a full stack, a wrong type) takes the
+    /// helpers' way, which does all of it again.
+    fn fast_call(&mut self, i: usize, dst: Reg, proto: u32, b: Reg, argc: u16) {
+        let callee = &self.prog.protos[proto as usize];
+        let nregs = callee.nregs as i64;
+        let slow = self.b.create_block();
+        let entry = self.b.ins().iconst(self.ptr, unsafe { self.table.add(proto as usize) } as i64);
+        let code = self.b.ins().load(self.ptr, MemFlags::new(), entry, 0);
+        let fast = self.b.create_block();
+        self.b.ins().brif(code, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        for (k, q) in callee.params.iter().enumerate().take(argc as usize) {
+            let tags = self.simple_type(q.ty).unwrap();
+            let a = self.addr(At::Reg(b + k as Reg));
+            self.check_tags(a, tags, slow);
+        }
+        let (vm, ptr) = (self.vm, self.ptr);
+        let slen = self.b.ins().load(ptr, flags(), vm, (OFF_STACK + OFF_LEN) as i32);
+        let scap = self.b.ins().load(ptr, flags(), vm, (OFF_STACK + OFF_CAP) as i32);
+        let need = self.b.ins().iadd_imm(slen, nregs);
+        let room = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, need, scap);
+        let flen = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_LEN) as i32);
+        let fcap = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_CAP) as i32);
+        let froom = self.b.ins().icmp(IntCC::UnsignedLessThan, flen, fcap);
+        let both = self.b.ins().band(room, froom);
+        let go = self.b.create_block();
+        self.b.ins().brif(both, go, &[], slow, &[]);
+
+        // Nothing can fail from here on.
+        self.b.switch_to_block(go);
+        let sp = self.b.ins().load(ptr, flags(), vm, (OFF_STACK + OFF_PTR) as i32);
+        let off = self.b.ins().ishl_imm(slen, 4);
+        let nr = self.b.ins().iadd(sp, off);
+        let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        for r in 0..nregs {
+            self.b.ins().store(flags(), undef, nr, (r * 16) as i32);
+            self.b.ins().store(flags(), zero, nr, (r * 16 + 8) as i32);
+        }
+        for (k, q) in callee.params.iter().enumerate().take(argc as usize) {
+            let a = self.addr(At::Reg(b + k as Reg));
+            let t = self.b.ins().load(types::I64, flags(), a, 0);
+            let p = self.b.ins().load(types::I64, flags(), a, 8);
+            self.b.ins().store(flags(), t, nr, q.slot as i32 * 16);
+            self.b.ins().store(flags(), p, nr, q.slot as i32 * 16 + 8);
+            self.b.ins().store(flags(), undef, a, 0);
+            if let Some(m) = q.meta {
+                // The declared type, as `meta_value` writes it.
+                let t = self.b.ins().iconst(types::I64, TAG_NUM);
+                let n = self.b.ins().iconst(types::I64, ((q.ty * 2) as f64).to_bits() as i64);
+                self.b.ins().store(flags(), t, nr, m as i32 * 16);
+                self.b.ins().store(flags(), n, nr, m as i32 * 16 + 8);
+            }
+        }
+        self.b.ins().store(flags(), need, vm, (OFF_STACK + OFF_LEN) as i32);
+
+        let fp = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_PTR) as i32);
+        let foff = self.b.ins().imul_imm(flen, FRAME_SIZE as i64);
+        let f = self.b.ins().iadd(fp, foff);
+        let depth = self.b.ins().load(types::I32, flags(), vm, OFF_DEPTH as i32);
+        let ns = self.b.ins().load(types::I32, flags(), vm, OFF_NS as i32);
+        let v = self.b.ins().iconst(types::I32, proto as i64);
+        self.b.ins().store(flags(), v, f, F_PROTO as i32);
+        self.b.ins().store(flags(), zero, f, F_PC as i32);
+        self.b.ins().store(flags(), slen, f, F_BASE as i32);
+        let v = self.b.ins().iconst(types::I16, argc as i64);
+        self.b.ins().store(flags(), v, f, F_ARGC as i32);
+        self.b.ins().store(flags(), depth, f, F_DEPTH as i32);
+        let v = self.b.ins().iconst(types::I8, 1);
+        self.b.ins().store(flags(), v, f, F_COUNTED as i32);
+        let v = self.b.ins().iconst(types::I16, dst as i64);
+        self.b.ins().store(flags(), v, f, F_RET as i32);
+        let v = self.b.ins().iconst(types::I32, 0);
+        self.b.ins().store(flags(), v, f, F_POST as i32);
+        self.b.ins().store(flags(), undef, f, F_THIS as i32);
+        self.b.ins().store(flags(), zero, f, F_THIS as i32 + 8);
+        let v = self.b.ins().iconst(types::I32, NONE as i64);
+        self.b.ins().store(flags(), v, f, F_SELF_CLASS as i32);
+        self.b.ins().store(flags(), ns, f, F_NS as i32);
+        self.b.ins().store(flags(), zero, f, F_PENDING as i32);
+        let flen1 = self.b.ins().iadd_imm(flen, 1);
+        self.b.ins().store(flags(), flen1, vm, (OFF_FRAMES + OFF_LEN) as i32);
+
+        let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, ENV_SIZE, 3));
+        let ce = self.b.ins().stack_addr(ptr, slot, 0);
+        let globals = self.b.use_var(self.globals);
+        let fi1 = self.b.ins().iadd_imm(self.fi, 1);
+        let argcv = self.b.ins().iconst(ptr, argc as i64);
+        for (off, v) in [(0, nr), (8, globals), (16, vm), (24, fi1), (32, argcv), (40, slen), (48, zero)] {
+            self.b.ins().store(flags(), v, ce, off);
+        }
+        let inst = self.b.ins().call_indirect(self.sigs.native, code, &[ce]);
+        let status = self.b.inst_results(inst)[0];
+        let (ok, bad) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(status, bad, &[], ok, &[]);
+        self.b.switch_to_block(ok);
+        self.reload();
+        self.jump_next(i);
+        self.b.switch_to_block(bad);
+        let (pc, one) = (self.b.ins().iconst(types::I32, i as i64), self.b.ins().iconst(types::I32, 1));
+        let r = self.call(self.sigs.failed, h_call_failed as usize, &[self.env, pc, one]).unwrap();
+        self.go_on(i, r);
+
+        self.b.switch_to_block(slow);
+        self.call_op(i);
+    }
+
+    /// `돌려주자`: a plain call's frame ends here (the caller takes the
+    /// value); anything else (a method's object, a caught signal waiting, a
+    /// caller that wants more than the value, a type to check closer) goes
+    /// through `finish_call`.
+    fn return_op(&mut self, src: Reg) {
+        let slow = self.b.create_block();
+        let (vm, ptr) = (self.vm, self.ptr);
+        let flen = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_LEN) as i32);
+        let fp = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_PTR) as i32);
+        let top = self.b.ins().iadd_imm(flen, -1);
+        let foff = self.b.ins().imul_imm(top, FRAME_SIZE as i64);
+        let f = self.b.ins().iadd(fp, foff);
+        let post = self.b.ins().load(types::I32, flags(), f, F_POST as i32);
+        let pending = self.b.ins().load(ptr, flags(), f, F_PENDING as i32);
+        let this = self.b.ins().load(types::I32, flags(), f, F_THIS as i32);
+        let has_caller = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, flen, 2);
+        let this_ok = self.b.ins().icmp_imm(IntCC::Equal, this, TAG_UNDEF);
+        let post_ok = self.b.ins().icmp_imm(IntCC::Equal, post, 0);
+        let pend_ok = self.b.ins().icmp_imm(IntCC::Equal, pending, 0);
+        let ok = self.b.ins().band(this_ok, post_ok);
+        let ok = self.b.ins().band(ok, pend_ok);
+        let ok = self.b.ins().band(ok, has_caller);
+        let fast = self.b.create_block();
+        self.b.ins().brif(ok, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        let va = self.addr(At::Reg(src));
+        match self.simple_type(self.proto.return_type) {
+            Some(tags) => self.check_tags(va, tags, slow),
+            None => {
+                self.b.ins().jump(slow, &[]);
+                let dead = self.b.create_block();
+                self.b.switch_to_block(dead);
+            }
+        }
+        let vt = self.b.ins().load(types::I64, flags(), va, 0);
+        let vp = self.b.ins().load(types::I64, flags(), va, 8);
+        let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
+        self.b.ins().store(flags(), undef, va, 0);
+        // The registers go (as `truncate` drops them).
+        for r in 0..self.proto.nregs {
+            let a = self.addr(At::Reg(r));
+            self.release(a);
+        }
+        let counted = self.b.ins().load(types::I8, flags(), f, F_COUNTED as i32);
+        let counted = self.b.ins().uextend(types::I32, counted);
+        let d = self.b.ins().load(types::I32, flags(), vm, OFF_DEPTH as i32);
+        let d = self.b.ins().isub(d, counted);
+        self.b.ins().store(flags(), d, vm, OFF_DEPTH as i32);
+        let base = self.b.ins().load(ptr, flags(), f, F_BASE as i32);
+        self.b.ins().store(flags(), base, vm, (OFF_STACK + OFF_LEN) as i32);
+        self.b.ins().store(flags(), top, vm, (OFF_FRAMES + OFF_LEN) as i32);
+        let ret = self.b.ins().load(types::I16, flags(), f, F_RET as i32);
+        let ret = self.b.ins().uextend(ptr, ret);
+        let caller = self.b.ins().iadd_imm(f, -(FRAME_SIZE as i64));
+        let cbase = self.b.ins().load(ptr, flags(), caller, F_BASE as i32);
+        let slot = self.b.ins().iadd(cbase, ret);
+        let slot = self.b.ins().ishl_imm(slot, 4);
+        let sp = self.b.ins().load(ptr, flags(), vm, (OFF_STACK + OFF_PTR) as i32);
+        let dst = self.b.ins().iadd(sp, slot);
+        self.store(dst, vt, vp);
+        let r = self.b.ins().iconst(types::I32, S_RETURNED as i64);
+        self.b.ins().return_(&[r]);
+
+        self.b.switch_to_block(slow);
+        let s = self.b.ins().iconst(types::I32, src as i64);
+        let r = self.call(self.sigs.ret, h_return as usize, &[self.env, s]).unwrap();
+        self.b.ins().return_(&[r]);
+    }
+
+    /// Releases the value at `a` if it holds a reference.
+    fn release(&mut self, a: V) {
+        let t = self.tag_of(a);
+        let t = self.b.ins().iadd_imm(t, -(tag::STR as i64));
+        let counted = self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, t, (tag::RESOURCE - tag::STR) as i64);
+        let (rel, cont) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(counted, rel, &[], cont, &[]);
+        self.b.switch_to_block(rel);
+        self.call(self.sigs.one_ptr, h_drop as usize, &[a]);
+        self.b.ins().jump(cont, &[]);
+        self.b.switch_to_block(cont);
+    }
+
+    /// A call: straight into the callee's native code when it has some.
+    fn call_op(&mut self, i: usize) {
+        let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, ENV_SIZE, 3));
+        let callee_env = self.b.ins().stack_addr(self.ptr, slot, 0);
+        let pc = self.b.ins().iconst(types::I32, i as i64);
+        let code = self.call(self.sigs.start, h_call_start as usize, &[self.env, pc, callee_env]).unwrap();
+        let (none, failed, run) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let not_run = self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, code, 1);
+        let other = self.b.create_block();
+        self.b.ins().brif(not_run, other, &[], run, &[]);
+        self.b.switch_to_block(other);
+        self.b.ins().brif(code, failed, &[], none, &[]);
+
+        // No native code: the interpreter's way.
+        self.b.switch_to_block(none);
+        let pc = self.b.ins().iconst(types::I32, i as i64);
+        let r = self.call(self.sigs.step, h_call as usize, &[self.env, pc]).unwrap();
+        self.go_on(i, r);
+
+        // It did not start.
+        self.b.switch_to_block(failed);
+        let (pc, zero) = (self.b.ins().iconst(types::I32, i as i64), self.b.ins().iconst(types::I32, 0));
+        let r = self.call(self.sigs.failed, h_call_failed as usize, &[self.env, pc, zero]).unwrap();
+        self.go_on(i, r);
+
+        self.b.switch_to_block(run);
+        let inst = self.b.ins().call_indirect(self.sigs.native, code, &[callee_env]);
+        let status = self.b.inst_results(inst)[0];
+        let (ok, bad) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(status, bad, &[], ok, &[]);
+        self.b.switch_to_block(ok);
+        self.reload();
+        self.jump_next(i);
+        self.b.switch_to_block(bad);
+        let (pc, one) = (self.b.ins().iconst(types::I32, i as i64), self.b.ins().iconst(types::I32, 1));
+        let r = self.call(self.sigs.failed, h_call_failed as usize, &[self.env, pc, one]).unwrap();
+        self.go_on(i, r);
     }
 
     fn jump_next(&mut self, i: usize) {
@@ -858,6 +1342,61 @@ impl<'a, 'b> Gen<'a, 'b> {
         let d = self.addr(dst);
         self.store(d, t, p);
         self.jump_next(i);
+    }
+}
+
+/// The type ids a number fits without a closer look (0 is no type).
+fn number_types(prog: &Program) -> impl Iterator<Item = u32> + '_ {
+    std::iter::once(0).chain(
+        prog.types
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, t)| matches!(t.kind, TypeKind::Number | TypeKind::Any))
+            .map(|(i, _)| i as u32)
+            .take(8),
+    )
+}
+
+/// Whether compiled code does `op` itself (in the common case) rather than
+/// hand it to the interpreter.
+fn native(op: &Op, prog: &Program) -> bool {
+    match *op {
+        Op::LoadK { k, .. } => matches!(prog.consts[k as usize].tag(), tag::NUM | tag::BOOL | tag::NULL),
+        Op::BinK { k, .. } | Op::CmpKJump { k, .. } => prog.consts[k as usize].as_num().is_some(),
+        Op::Update { var, op, .. } => {
+            matches!(op, BinOp::Add | BinOp::Sub)
+                && matches!(
+                    prog.vars[var as usize].slots.as_slice(),
+                    [Slot { loc: Loc::Reg(_) | Loc::Global(_), meta: None | Some(Loc::Reg(_) | Loc::Global(_)) }]
+                )
+        }
+        Op::LoadNull { .. }
+        | Op::LoadBool { .. }
+        | Op::Move { .. }
+        | Op::GetReg { .. }
+        | Op::GetGlobal { .. }
+        | Op::SetReg { .. }
+        | Op::SetGlobal { .. }
+        | Op::Bin { .. }
+        | Op::Undef { .. }
+        | Op::Eq { .. }
+        | Op::Truth { .. }
+        | Op::Jump { .. }
+        | Op::JumpIfFalse { .. }
+        | Op::JumpIfTrue { .. }
+        | Op::CmpJump { .. }
+        | Op::RangePrep { .. }
+        | Op::RangeTest { .. }
+        | Op::RangeStep { .. }
+        | Op::Boxed { .. }
+        | Op::Enter
+        | Op::Leave
+        | Op::Call { .. }
+        | Op::ArgGiven { .. }
+        | Op::Return { .. }
+        | Op::ReturnNull => true,
+        _ => false,
     }
 }
 

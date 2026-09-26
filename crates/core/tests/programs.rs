@@ -9,10 +9,12 @@ fn hari(src: &str) -> String {
     run_to_string(src, &HARI)
 }
 
+/// Spec 4.4: a break with no loop of its own function around it is an
+/// error where it runs; it does not end the caller's loop.
 #[test]
-fn break_in_a_function_ends_the_callers_loop() {
+fn break_in_a_function_is_an_error_there() {
     let src = "<탈출>을 만들자 ():\n    반복을 끝내자\n1부터 5까지 반복하자 ('i'):\n    'i'를 출력하자\n    <탈출>()을 실행하자\n\"루프 뒤\"를 출력하자\n";
-    assert_eq!(hari(src), "1\n루프 뒤\n");
+    assert_eq!(hari(src), "1\n런타임 오류: IllegalBreakError: '반복을 끝내자'는 반복 안에서만 쓸 수 있어요.\n");
 }
 
 #[test]
@@ -23,7 +25,7 @@ fn a_function_declared_in_a_block_is_never_found() {
 
 #[test]
 fn break_and_return_at_the_top_level_are_errors() {
-    assert_eq!(hari("\"전\"을 출력하자\n반복을 끝내자\n"), "전\n런타임 오류: break\n");
+    assert_eq!(hari("\"전\"을 출력하자\n반복을 끝내자\n"), "전\n런타임 오류: IllegalBreakError: '반복을 끝내자'는 반복 안에서만 쓸 수 있어요.\n");
     assert_eq!(hari("\"전\"을 출력하자\n1을 돌려주자\n"), "전\n런타임 오류: return\n");
 }
 

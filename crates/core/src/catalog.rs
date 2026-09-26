@@ -21,6 +21,7 @@ pub static CATALOG: &[(&str, &str, &str, &str)] = &[
     ("FileError.FileFailed", "Could not complete the file operation on '%s'.", "'%s'에 대한 파일 작업을 마치지 못했어요.", "『%s』のファイル操作を完了できません。"),
     ("FileError.FileIsDirectory", "'%s' is a folder, not a file.", "'%s'은(는) 파일이 아니라 폴더예요.", "『%s』はファイルではなくフォルダです。"),
     ("FileError.FileNotFound", "File or folder '%s' not found.", "'%s' 파일이나 폴더를 찾을 수 없어요.", "『%s』というファイルまたはフォルダが見つかりません。"),
+    ("IllegalBreakError.IllegalBreak", "A break can only be used inside a loop.", "'반복을 끝내자'는 반복 안에서만 쓸 수 있어요.", "「繰り返しを終わろう」は繰り返しの中でしか使えません。"),
     ("ImmutableAssignmentError.StringIndex", "A string is immutable, so a character at an index cannot be reassigned.", "문자열은 바꿀 수 없는 값이라서 몇 번째 글자를 다시 정할 수 없어요.", "文字列は変更できない値なので、何番目かの文字を代入し直せません。"),
     ("ImportError.ImportClassConflict", "The class '%[2]s' of '%[1]s' has the same name as a class of '%[3]s'. Give one of them another name when importing it (<name> as <alias>).", "'%[1]s'의 클래스 '%[2]s'와(과) 이름이 같은 클래스가 '%[3]s'에도 있어요. 하나는 가져올 때 <이름>을 <별칭>으로 가져오자로 다른 이름을 붙여 주세요.", "『%[1]s』のクラス『%[2]s』と同じ名前のクラスが、『%[3]s』にもあります。持ってくるときに〈名前〉を〈別名〉に持ってこようで、片方に別の名前を付ける必要があります。"),
     ("ImportError.ImportClassConflictOwn", "The class '%[2]s' of '%[1]s' has the same name as a class this program already has. Give it another name when importing it (<name> as <alias>).", "'%[1]s'의 클래스 '%[2]s'와(과) 이름이 같은 클래스를 이 프로그램이 이미 가지고 있어요. 가져올 때 <이름>을 <별칭>으로 가져오자로 다른 이름을 붙여 주세요.", "『%[1]s』のクラス『%[2]s』と同じ名前のクラスを、このプログラムがすでに持っています。持ってくるときに〈名前〉を〈別名〉に持ってこようで、別の名前を付ける必要があります。"),
