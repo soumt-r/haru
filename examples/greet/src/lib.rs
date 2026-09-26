@@ -2,7 +2,25 @@
 //! (`haru_module_v1_greet`); as an `rlib` it links into a binary through
 //! `greet::haru_entry`. The code is the same either way.
 
+use std::cell::Cell;
+
 use haru_sdk::prelude::*;
+
+/// A resource: a counter the program holds as a value with methods.
+struct Counter {
+    n: Cell<f64>,
+}
+
+thread_local! {
+    /// How many counters this thread has dropped (to watch resources being freed).
+    static DROPPED: Cell<usize> = const { Cell::new(0) };
+}
+
+impl Drop for Counter {
+    fn drop(&mut self) {
+        DROPPED.with(|d| d.set(d.get() + 1));
+    }
+}
 
 fn build(m: &mut Module) {
     m.name("hari", "인사").name("kanade", "挨拶");
@@ -37,6 +55,22 @@ fn build(m: &mut Module) {
     })
     .name("hari", "두번적용")
     .name("kanade", "二回適用");
+
+    // `<계수기>(10)` makes one; `'c'의 <더하기>(5)` and `'c'의 <값>()` use it.
+    let counter = m.resource::<Counter>("counter");
+    counter.name("hari", "계수기").name("kanade", "カウンター");
+    counter
+        .method("add", |c: Res<Counter>, by: f64| {
+            c.n.set(c.n.get() + by);
+            c.n.get()
+        })
+        .name("hari", "더하기")
+        .name("kanade", "足す");
+    counter.method("value", |c: Res<Counter>| c.n.get()).name("hari", "값").name("kanade", "値");
+    m.func("counter", |start: f64| Res::new(Counter { n: Cell::new(start) }))
+        .name("hari", "계수기")
+        .name("kanade", "カウンター");
+    m.func("dropped", || DROPPED.with(Cell::get) as f64).name("hari", "해제된수").name("kanade", "解放数");
 
     m.message("NotNumber", "hari", "{0}번째 원소가 숫자가 아니에요.")
         .message("NotNumber", "kanade", "{0}番目の要素が数ではありません。");

@@ -107,6 +107,7 @@ fn send(method: String, raw_url: &str, body: String, headers: &[(String, String)
         _ => return Err(Error::new("NetworkError.HTTPBadURL").arg(raw_url)),
     };
     access()?;
+    haru_sdk::flush_output();
     let deadline = Instant::now() + DEFAULT_TIMEOUT;
     let (mut method, mut body) = (method, body);
     let mut redirects = 0;

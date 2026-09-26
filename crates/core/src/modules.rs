@@ -65,6 +65,8 @@ impl std::error::Error for LoadError {}
 /// back (the VM implements it).
 pub trait Caller {
     fn call(&mut self, f: &Value, args: &[Value]) -> Result<Value, RuntimeError>;
+    /// Writes out the program's buffered output.
+    fn flush(&mut self) {}
 }
 
 #[derive(Default)]
@@ -72,6 +74,8 @@ pub struct Runtime {
     modules: Vec<LoadedModule>,
     /// (language, module name) -> module index
     by_name: HashMap<(String, String), usize>,
+    /// (resource kind, language or "" for ids, method name) -> the method
+    methods: HashMap<(usize, String, String), FnRef>,
 }
 
 impl Runtime {
@@ -129,6 +133,26 @@ impl Runtime {
             .collect();
 
         let index = self.modules.len();
+        // Resource methods are functions of the module that no name finds.
+        for kind in slice(desc.resources, desc.resources_len) {
+            for f in slice(kind.methods, kind.methods_len) {
+                let func = functions.len();
+                let names = names_of(f.names, f.names_len);
+                let at = FnRef { module: index, func };
+                for (lang, name) in &names {
+                    self.methods.insert((kind as *const _ as usize, lang.clone(), name.clone()), at);
+                }
+                self.methods.insert((kind as *const _ as usize, String::new(), f.id.as_str().to_string()), at);
+                let params = slice(f.params, f.params_len).to_vec();
+                functions.push(LoadedFn {
+                    id: format!("{}.{}", kind.id.as_str(), f.id.as_str()),
+                    names: HashMap::new(),
+                    desc: f,
+                    required: f.required.min(params.len()),
+                    params,
+                });
+            }
+        }
         let names = names_of(desc.names, desc.names_len);
         for (lang, name) in &names {
             self.by_name.insert((lang.clone(), name.clone()), index);
@@ -147,6 +171,12 @@ impl Runtime {
         let m = self.modules.get(module)?;
         let func = *m.by_name.get(&(lang.to_string(), name.to_string()))?;
         Some(FnRef { module, func })
+    }
+
+    /// A resource's method by its name in `lang` (or its id).
+    pub fn resource_method(&self, kind: *const haru_abi::ResourceDesc, lang: &str, name: &str) -> Option<FnRef> {
+        let k = kind as usize;
+        self.methods.get(&(k, lang.to_string(), name.to_string())).or_else(|| self.methods.get(&(k, String::new(), name.to_string()))).copied()
     }
 
     /// A module by its language-neutral id (`timezone`).

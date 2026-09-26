@@ -42,6 +42,31 @@ pub struct ObjObj {
     pub props: RefCell<HashMap<u32, Value>>,
 }
 
+/// A native object (a resource): the object a module gave and its kind,
+/// whose `drop` frees it when the last reference goes.
+pub struct ResObj {
+    pub kind: *const haru_abi::ResourceDesc,
+    pub ptr: *mut std::ffi::c_void,
+}
+
+impl Drop for ResObj {
+    fn drop(&mut self) {
+        unsafe { ((*self.kind).drop)(self.ptr) }
+    }
+}
+
+impl ResObj {
+    /// Its kind's name in a language (its id without one).
+    pub fn name(&self, lang: &str) -> &str {
+        let k = unsafe { &*self.kind };
+        let names = if k.names_len == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(k.names, k.names_len) } };
+        names
+            .iter()
+            .find(|n| unsafe { n.lang.as_str() } == lang)
+            .map_or_else(|| unsafe { k.id.as_str() }, |n| unsafe { n.name.as_str() })
+    }
+}
+
 pub enum FuncObj {
     /// A function of a native module.
     Native { module: usize, func: usize },
@@ -77,11 +102,15 @@ impl Value {
     }
 
     pub fn list(items: Vec<Value>) -> Value {
-        Value::heap(tag::LIST, Rc::new(ListObj { items: RefCell::new(items) }))
+        let r = Rc::new(ListObj { items: RefCell::new(items) });
+        crate::gc::track_list(&r);
+        Value::heap(tag::LIST, r)
     }
 
     pub fn dict(map: HashMap<Key, Value>) -> Value {
-        Value::heap(tag::DICT, Rc::new(DictObj { map: RefCell::new(map) }))
+        let r = Rc::new(DictObj { map: RefCell::new(map) });
+        crate::gc::track_dict(&r);
+        Value::heap(tag::DICT, r)
     }
 
     pub fn func(f: FuncObj) -> Value {
@@ -89,7 +118,17 @@ impl Value {
     }
 
     pub fn object(class: u32) -> Value {
-        Value::heap(tag::OBJECT, Rc::new(ObjObj { class, props: RefCell::new(HashMap::new()) }))
+        let r = Rc::new(ObjObj { class, props: RefCell::new(HashMap::new()) });
+        crate::gc::track_object(&r);
+        Value::heap(tag::OBJECT, r)
+    }
+
+    pub fn resource(kind: *const haru_abi::ResourceDesc, ptr: *mut std::ffi::c_void) -> Value {
+        Value::heap(tag::RESOURCE, Rc::new(ResObj { kind, ptr }))
+    }
+
+    pub fn as_resource(&self) -> Option<&ResObj> {
+        (self.0.tag == tag::RESOURCE).then(|| unsafe { &*(self.0.payload as *const ResObj) })
     }
 
     pub fn class(id: u32) -> Value {
@@ -219,6 +258,7 @@ pub(crate) unsafe fn retain(raw: RawValue) {
         tag::DICT => Rc::increment_strong_count(raw.payload as *const DictObj),
         tag::FUNC => Rc::increment_strong_count(raw.payload as *const FuncObj),
         tag::OBJECT => Rc::increment_strong_count(raw.payload as *const ObjObj),
+        tag::RESOURCE => Rc::increment_strong_count(raw.payload as *const ResObj),
         _ => {}
     }
 }
@@ -232,6 +272,7 @@ pub(crate) unsafe fn release(raw: RawValue) {
         tag::DICT => Rc::decrement_strong_count(raw.payload as *const DictObj),
         tag::FUNC => Rc::decrement_strong_count(raw.payload as *const FuncObj),
         tag::OBJECT => Rc::decrement_strong_count(raw.payload as *const ObjObj),
+        tag::RESOURCE => Rc::decrement_strong_count(raw.payload as *const ResObj),
         _ => {}
     }
 }

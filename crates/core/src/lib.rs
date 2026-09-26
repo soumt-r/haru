@@ -9,6 +9,7 @@ mod catalog;
 pub mod compiler;
 mod dylib;
 mod error;
+pub mod gc;
 pub mod format;
 mod host;
 pub mod lang;
@@ -78,6 +79,22 @@ pub fn run_to_string(source: &str, lang: &'static lang::Lang) -> String {
     };
     if let Err(e) = result {
         out.push_str(&e.report(None, lang));
+        out.push('\n');
+    }
+    out
+}
+
+/// Runs a compiled program with native modules and returns what it printed,
+/// followed by the CLI's error line when it failed (for tests).
+pub fn run_compiled_to_string(compiled: &bytecode::Program, lang: &'static lang::Lang, rt: &Runtime) -> String {
+    let mut vm = vm::Vm::new(compiled).with_runtime(rt);
+    vm.output = vm::Output::Capture(String::new());
+    let result = vm.run();
+    let vm::Output::Capture(mut out) = std::mem::replace(&mut vm.output, vm::Output::Capture(String::new())) else {
+        unreachable!()
+    };
+    if let Err(e) = result {
+        out.push_str(&e.report(Some(rt), lang));
         out.push('\n');
     }
     out

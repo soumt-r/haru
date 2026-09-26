@@ -1,0 +1,14 @@
+# The http_server package: Hari/Kanade entry points (the same as Hana's) over
+# a native module written with haru-sdk. Requests are read on other threads;
+# handlers run on the program's thread while <서버열기> waits.
+[package]
+name = "http_server"
+version = "0.1.0"
+
+[entry]
+hari = "hari/index.hr"
+kanade = "kanade/index.knd"
+
+[native]
+id = "http_server"
+crate = "."

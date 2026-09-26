@@ -61,6 +61,22 @@ impl RuntimeError {
         self.localize(Some(rt), lang_named(lang))
     }
 
+    /// The message without its kind in a locale (0 English, 1 Korean, 2
+    /// Japanese): Hana's `errs.Message`, which a native callback hands on.
+    pub fn plain_message(&self, rt: Option<&Runtime>, locale: usize) -> String {
+        if self.code == "__break" {
+            return "break".into();
+        }
+        let base = if locale == 2 { &crate::lang::KANADE } else { &crate::lang::HARI };
+        let lang = Lang { locale, ..*base };
+        let text = self.localize(rt, &lang);
+        let kind = self.code.split('.').next().unwrap_or("");
+        match text.strip_prefix(&format!("{kind}: ")) {
+            Some(t) if self.module.is_none() && self.code.contains('.') => t.to_string(),
+            _ => text,
+        }
+    }
+
     pub fn localize(&self, rt: Option<&Runtime>, lang: &Lang) -> String {
         // Hana's ThrownError.Error(): an object's 메시지 (or メッセージ), else Go's %v.
         if let Some(v) = self.thrown_value() {

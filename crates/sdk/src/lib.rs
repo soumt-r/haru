@@ -28,10 +28,10 @@ pub use haru_abi as abi;
 use haru_abi::{kind, tag, HostApi, HostCtx, ModuleDesc, RawValue, Status, STATUS_ERROR, STATUS_OK};
 
 mod module;
-pub use module::{FuncEntry, Module};
+pub use module::{FuncEntry, Module, ResourceEntry};
 
 pub mod prelude {
-    pub use crate::{Dict, Error, Func, List, Module, Result, Str, Value};
+    pub use crate::{Dict, Error, Func, List, Module, Res, Result, Str, Value};
 }
 
 static HOST: AtomicPtr<HostApi> = AtomicPtr::new(std::ptr::null_mut());
@@ -54,9 +54,18 @@ pub unsafe fn __entry(host: *const HostApi, id: &str, build: fn(&mut Module)) ->
         return std::ptr::null();
     }
     HOST.store(host as *mut HostApi, Ordering::Release);
+    // One descriptor per module in a process: a second load gets the first
+    // (its resource kinds must stay the ones values point at).
+    static BUILT: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
+    let mut built = BUILT.lock().unwrap();
+    if let Some((_, d)) = built.iter().find(|(i, _)| i == id) {
+        return *d as *const ModuleDesc;
+    }
     let mut m = Module::new(id);
     build(&mut m);
-    m.leak()
+    let desc = m.leak();
+    built.push((id.to_string(), desc as usize));
+    desc
 }
 
 /// Exports a module from a crate. The function is `pub haru_entry` for static
@@ -286,6 +295,26 @@ impl Func {
 }
 
 impl Value {
+    /// Calls the value as a function and catches what it throws: the error's
+    /// message (without its kind) in a locale — 0 English, 1 Korean, 2
+    /// Japanese. The error is then handled, as a program's `일단 해보자` would.
+    pub fn call_catching(&self, args: &[Value], locale: u32) -> std::result::Result<Value, String> {
+        match self.call(args) {
+            Ok(v) => Ok(v),
+            Err(Error(ErrorKind::Pending)) => {
+                let ctx = CTX.with(|c| c.get());
+                let mut out = RawValue::NULL;
+                if unsafe { (host().take_error)(ctx, locale, &mut out) } {
+                    let v = Value(out);
+                    Err(v.as_str().map(|s| s.to_string()).unwrap_or_default())
+                } else {
+                    Err(String::new())
+                }
+            }
+            Err(_) => Err(String::new()),
+        }
+    }
+
     /// Calls the value as a function (the host fails with `NotCallable` when
     /// it is not one). Only valid while the host is calling into this module.
     pub fn call(&self, args: &[Value]) -> Result<Value> {
@@ -301,6 +330,89 @@ impl Value {
         } else {
             Err(Error(ErrorKind::Pending))
         }
+    }
+}
+
+/// Writes out what the program has printed so far. Call it before waiting
+/// (a sleep, the network), so the output does not sit in a buffer meanwhile.
+pub fn flush_output() {
+    let ctx = CTX.with(|c| c.get());
+    if !ctx.is_null() {
+        unsafe { (host().flush)(ctx) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resources
+
+/// The resource kind described for each Rust type, in this library.
+static KINDS: std::sync::Mutex<Vec<(std::any::TypeId, usize)>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn register_kind(t: std::any::TypeId, desc: &'static abi::ResourceDesc) {
+    KINDS.lock().unwrap().push((t, desc as *const _ as usize));
+}
+
+fn kind_of<T: 'static>() -> Option<*const abi::ResourceDesc> {
+    let t = std::any::TypeId::of::<T>();
+    KINDS.lock().unwrap().iter().find(|(k, _)| *k == t).map(|(_, d)| *d as *const abi::ResourceDesc)
+}
+
+/// A resource of kind `T` (see [`Module::resource`]): the program's value,
+/// read as the `T` inside. Use `Cell`/`RefCell` in `T` for what changes.
+pub struct Res<T: 'static> {
+    value: Value,
+    ptr: *const T,
+}
+
+impl<T: 'static> Res<T> {
+    /// A new resource holding `obj`. The kind must be described by this
+    /// module (`m.resource::<T>(...)`).
+    pub fn new(obj: T) -> Result<Res<T>> {
+        let kind = kind_of::<T>().ok_or_else(|| Error::new("UnknownResource"))?;
+        let ptr = Box::into_raw(Box::new(obj));
+        let raw = unsafe { (host().resource_new)(kind, ptr as *mut c_void) };
+        Ok(Res { value: Value(raw), ptr })
+    }
+
+    /// The program's value of it.
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+}
+
+impl<T: 'static> Deref for Res<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // Alive while `value` holds the resource.
+        unsafe { &*self.ptr }
+    }
+}
+
+impl<T: 'static> Clone for Res<T> {
+    fn clone(&self) -> Res<T> {
+        Res { value: self.value.clone(), ptr: self.ptr }
+    }
+}
+
+impl Value {
+    /// This value as a resource of kind `T`.
+    pub fn as_res<T: 'static>(&self) -> Option<Res<T>> {
+        let kind = kind_of::<T>()?;
+        let ptr = unsafe { (host().resource_get)(self.0, kind) } as *const T;
+        (!ptr.is_null()).then(|| Res { value: self.clone(), ptr })
+    }
+}
+
+impl<T: 'static> FromArg for Res<T> {
+    const KIND: u32 = kind::RESOURCE;
+    fn from_arg(raw: RawValue) -> Option<Res<T>> {
+        Value::borrowed(raw).as_res()
+    }
+}
+
+impl<T: 'static> IntoRet for Res<T> {
+    fn into_ret(self) -> Result<Value> {
+        Ok(self.value)
     }
 }
 

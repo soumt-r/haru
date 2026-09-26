@@ -151,6 +151,31 @@ unsafe extern "C" fn dict_keys(dict: RawValue) -> RawValue {
     Value::list(keys).into_raw()
 }
 
+unsafe extern "C" fn resource_new(kind: *const haru_abi::ResourceDesc, ptr: *mut std::ffi::c_void) -> RawValue {
+    Value::resource(kind, ptr).into_raw()
+}
+
+unsafe extern "C" fn resource_get(v: RawValue, kind: *const haru_abi::ResourceDesc) -> *mut std::ffi::c_void {
+    let v = std::mem::ManuallyDrop::new(Value::from_raw(v));
+    match v.as_resource() {
+        Some(r) if std::ptr::eq(r.kind, kind) => r.ptr,
+        _ => std::ptr::null_mut(),
+    }
+}
+
+unsafe extern "C" fn take_error(c: *mut HostCtx, locale: u32, out: *mut RawValue) -> bool {
+    let c = ctx(c);
+    let Some(e) = c.pending.take() else { return false };
+    *out = Value::string(e.plain_message(Some(c.rt), locale as usize)).into_raw();
+    true
+}
+
+unsafe extern "C" fn flush(c: *mut HostCtx) {
+    if let Some(caller) = ctx(c).caller {
+        (*caller).flush();
+    }
+}
+
 unsafe extern "C" fn throw_type(c: *mut HostCtx, index: usize, expected: u32) -> Status {
     ctx(c).pending = Some(type_error(index, expected));
     STATUS_ERROR
@@ -176,4 +201,8 @@ pub(crate) static HOST_API: HostApi = HostApi {
     dict_get,
     dict_set,
     dict_keys,
+    resource_new,
+    resource_get,
+    take_error,
+    flush,
 };

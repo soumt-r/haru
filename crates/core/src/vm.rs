@@ -999,7 +999,7 @@ impl<'p> Vm<'p> {
                                     fail!(err(STATIC_MEMBER_NOT_FOUND).str_arg(self.name(name)));
                                 }
                             }
-                            tag::STR | tag::LIST => {}
+                            tag::STR | tag::LIST | tag::RESOURCE => {}
                             tag::DICT => fail!(err(UNSUPPORTED).str_arg("dictionary method")),
                             _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(type_name_of(&o))),
                         }
@@ -1031,6 +1031,14 @@ impl<'p> Vm<'p> {
                                     ),
                                     None => fail!(err(STATIC_METHOD_NOT_FOUND).str_arg(self.name(name))),
                                 }
+                            }
+                            tag::RESOURCE => {
+                                let args: Vec<Value> = (0..argc as usize).map(|i| reg!(b as usize + i).clone()).collect();
+                                let v = tri!(self.call_resource(&o, self.name(name), &args));
+                                // The method may have called back and grown the stack.
+                                regs = unsafe { self.stack.as_mut_ptr().add(base) };
+                                reg!(dst) = v;
+                                self.depth -= 1;
                             }
                             _ => {
                                 let args: Vec<Value> = (0..argc as usize).map(|i| reg!(b as usize + i).clone()).collect();
@@ -1109,10 +1117,12 @@ impl<'p> Vm<'p> {
                     }
 
                     Op::MakeList { dst, base: b, n } => {
+                        crate::gc::safe_point();
                         let items = (0..n as usize).map(|i| std::mem::replace(&mut reg!(b as usize + i), Value::UNDEF)).collect();
                         reg!(dst) = Value::list(items);
                     }
                     Op::MakeDict { dst, base: b, n } => {
+                        crate::gc::safe_point();
                         let mut map = HashMap::with_capacity(n as usize);
                         for i in 0..n as usize {
                             let k = std::mem::replace(&mut reg!(b as usize + 2 * i), Value::UNDEF);
@@ -1324,7 +1334,7 @@ impl<'p> Vm<'p> {
                     }
 
                     // ---- classes
-                    Op::NewObj { dst, class } => match self.class(class) {
+                    Op::NewObj { dst, class } => match { crate::gc::safe_point(); self.class(class) } {
                         Some(c) if c.is_abstract => fail!(err(INSTANTIATE_ABSTRACT).str_arg(self.name(class))),
                         Some(_) => reg!(dst) = Value::object(class),
                         None if self.namespaces[self.ns as usize].interfaces.contains(&class) => {
@@ -1491,7 +1501,7 @@ impl<'p> Vm<'p> {
                                     fail!(err(STATIC_MEMBER_NOT_FOUND).str_arg(self.name(n)));
                                 }
                             }
-                            tag::STR | tag::LIST => {}
+                            tag::STR | tag::LIST | tag::RESOURCE => {}
                             tag::DICT => fail!(err(UNSUPPORTED).str_arg("dictionary method")),
                             _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(type_name_of(&o))),
                         }
@@ -1937,6 +1947,21 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// A resource's method: the native function, with the resource first.
+    fn call_resource(&mut self, o: &Value, name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+        let r = o.as_resource().unwrap();
+        let rt = self.runtime.ok_or_else(|| err(METHOD_NOT_FOUND).str_arg(name))?;
+        let f = rt.resource_method(r.kind, self.lang.name, name).ok_or_else(|| err(METHOD_NOT_FOUND).str_arg(name))?;
+        let mut all = Vec::with_capacity(args.len() + 1);
+        all.push(o.clone());
+        all.extend_from_slice(args);
+        let caller = self.as_caller();
+        match rt.call_with(f, &all, Some(caller)) {
+            Err(e) if e.code == BREAK_THROUGH => Err(err("break")),
+            r => r,
+        }
+    }
+
     fn call_method(&self, o: &Value, name: &str, target: u32, fi: usize, args: &[Value]) -> Result<Value, RuntimeError> {
         let l = self.lang;
         match o.tag() {
@@ -2008,6 +2033,10 @@ impl<'p> Vm<'p> {
 /// A native function calling a function of the program back (Hana's
 /// `CallFunction`): the function runs to its end, here.
 impl Caller for Vm<'_> {
+    fn flush(&mut self) {
+        Vm::flush(self);
+    }
+
     fn call(&mut self, f: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
         match f.as_func() {
             Some(&FuncObj::User(p)) => {

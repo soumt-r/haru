@@ -67,6 +67,10 @@ pub fn run(path: &Path, time: bool, extra: Vec<Bundled>, files: &'static [(&'sta
             ExitCode::FAILURE
         }
     };
+    if std::env::var_os("HARU_GC_STATS").is_some() {
+        let (runs, freed) = haru_core::gc::stats();
+        eprintln!("gc: {runs} collection(s), {freed} container(s) freed");
+    }
     if time {
         eprintln!("\nparse+compile: {:?}\nrun: {:?}", compiled_at - start, done - compiled_at);
     }

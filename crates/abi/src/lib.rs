@@ -55,6 +55,8 @@ pub mod kind {
     pub const LIST: u32 = 4;
     pub const DICT: u32 = 5;
     pub const FUNC: u32 = 6;
+    /// A resource (any type: the function checks which with `resource_get`).
+    pub const RESOURCE: u32 = 7;
     /// As the only parameter: any number of arguments of any kind, which the
     /// function checks itself (the standard library, to report Hana's errors).
     pub const REST: u32 = 99;
@@ -70,6 +72,7 @@ pub mod kind {
             LIST => tag == super::tag::LIST,
             DICT => tag == super::tag::DICT,
             FUNC => tag == super::tag::FUNC,
+            RESOURCE => tag == super::tag::RESOURCE,
             _ => false,
         }
     }
@@ -196,6 +199,21 @@ pub struct MessageDesc {
     pub template: Str,
 }
 
+/// A kind of native object (a resource): what the program sees as a value
+/// with methods, and what frees it when the last reference goes.
+#[repr(C)]
+pub struct ResourceDesc {
+    /// Language-neutral id, unique in the module (`"connection"`).
+    pub id: Str,
+    pub names: *const Name,
+    pub names_len: usize,
+    /// Frees the object `resource_new` was given.
+    pub drop: unsafe extern "C" fn(ptr: *mut c_void),
+    /// Its methods; each receives the resource as its first argument.
+    pub methods: *const FunctionDesc,
+    pub methods_len: usize,
+}
+
 #[repr(C)]
 pub struct ModuleDesc {
     pub abi_version: u32,
@@ -207,6 +225,8 @@ pub struct ModuleDesc {
     pub functions_len: usize,
     pub messages: *const MessageDesc,
     pub messages_len: usize,
+    pub resources: *const ResourceDesc,
+    pub resources_len: usize,
 }
 
 /// The module entry point.
@@ -270,6 +290,19 @@ pub struct HostApi {
     pub dict_set: unsafe extern "C" fn(dict: RawValue, key: RawValue, value: RawValue),
     /// The keys as a new list (+1), in no particular order.
     pub dict_keys: unsafe extern "C" fn(dict: RawValue) -> RawValue,
+
+    /// A new resource (+1) of a kind this module describes, owning `ptr`
+    /// (freed by the kind's `drop` when the last reference goes).
+    pub resource_new: unsafe extern "C" fn(kind: *const ResourceDesc, ptr: *mut c_void) -> RawValue,
+    /// The object of a resource of that kind (borrowed), or null.
+    pub resource_get: unsafe extern "C" fn(v: RawValue, kind: *const ResourceDesc) -> *mut c_void,
+    /// Takes the error a failed `call` left pending: its message in a locale
+    /// (0 English, 1 Korean, 2 Japanese) as a new string (+1). False when
+    /// there is none. The error is then gone, as if it was caught.
+    pub take_error: unsafe extern "C" fn(ctx: *mut HostCtx, locale: u32, out: *mut RawValue) -> bool,
+    /// Writes out what the program has printed so far: call it before
+    /// waiting (a sleep, a network wait), so the output shows meanwhile.
+    pub flush: unsafe extern "C" fn(ctx: *mut HostCtx),
 }
 
 // Descriptors are built once and only read afterwards.

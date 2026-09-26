@@ -78,6 +78,12 @@ pub fn write_value(out: &mut String, v: &Value, lang: &Lang, depth: usize) {
             out.push_str(name);
             out.push_str(lang.object_format.1);
         }
+        // Haru's own (Hana has no resources): shown like an object of its kind.
+        tag::RESOURCE => {
+            out.push_str(lang.object_format.0);
+            out.push_str(v.as_resource().unwrap().name(lang.name));
+            out.push_str(lang.object_format.1);
+        }
         // Go's `%v` of Hana's *ClassReference.
         crate::value::CLASS => {
             out.push_str("&{");

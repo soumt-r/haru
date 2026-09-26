@@ -50,7 +50,13 @@ pub fn bundled() -> Vec<Bundled> {
             native: Some(timezone::haru_entry),
             unsupported: false,
         },
-        Bundled { name: "http_server", hari: None, kanade: None, native: None, unsupported: true },
+        Bundled {
+            name: "http_server",
+            hari: Some(include_str!("../../../packages/http_server/hari/index.hr")),
+            kanade: Some(include_str!("../../../packages/http_server/kanade/index.knd")),
+            native: Some(http_server::haru_entry),
+            unsupported: false,
+        },
     ]
 }
 

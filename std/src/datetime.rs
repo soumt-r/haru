@@ -192,6 +192,7 @@ fn sleep(args: &[Value]) -> Result<Value> {
     if s.is_nan() || !(0.0..=3600.0).contains(&s) {
         return Err(Error::new("ValueError.SleepRange"));
     }
+    haru_sdk::flush_output();
     // Go's time.Duration is whole nanoseconds.
     std::thread::sleep(std::time::Duration::from_nanos((s * 1e9) as u64));
     Ok(Value::NULL)

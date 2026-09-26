@@ -263,6 +263,7 @@ version = "0.0.1"
 dependencies = [
  "haru-core",
  "haru-example-greet",
+ "haru-pkg-http-server",
  "haru-pkg-timezone",
  "haru-std",
  "haru-syntax",
@@ -284,6 +285,14 @@ name = "haru-example-greet"
 version = "0.0.1"
 dependencies = [
  "haru-sdk",
+]
+
+[[package]]
+name = "haru-pkg-http-server"
+version = "0.1.0"
+dependencies = [
+ "haru-sdk",
+ "socket2",
 ]
 
 [[package]]
@@ -777,6 +786,16 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
 
 [[package]]
 name = "subtle"

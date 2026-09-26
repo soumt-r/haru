@@ -357,6 +357,7 @@ fn connect(args: &[Value]) -> Result<Value> {
     let timeout = if args.len() == 3 { seconds(args, 2)? } else { DEFAULT_TIMEOUT };
     let addr = join_host_port(&host, &port.to_string());
     access()?;
+    haru_sdk::flush_output();
     let stream = dial(&addr, Some(timeout)).map_err(|_| Error::new("NetworkError.SocketConnectFailed").arg(&*addr))?;
     Ok(add(Socket::Conn { conn: Conn::new(stream), timeout: Duration::ZERO }))
 }
@@ -376,6 +377,7 @@ fn listen(args: &[Value]) -> Result<Value> {
 
 fn accept(args: &[Value]) -> Result<Value> {
     exactly(args, 1)?;
+    haru_sdk::flush_output();
     let stream = with_socket(args, 0, |s| {
         let Socket::Listener { ln, timeout } = s else {
             return Err(Error::new("NetworkError.SocketNotListener"));
@@ -416,6 +418,7 @@ fn send(args: &[Value]) -> Result<Value> {
 /// empty text once the other side has closed.
 fn receive(args: &[Value]) -> Result<Value> {
     exactly(args, 2)?;
+    haru_sdk::flush_output();
     with_conn(args, 0, |conn| {
         let n = integer(args, 1)?;
         if n < 1 {
@@ -440,6 +443,7 @@ fn receive(args: &[Value]) -> Result<Value> {
 /// closed and nothing is left.
 fn receive_line(args: &[Value]) -> Result<Value> {
     exactly(args, 1)?;
+    haru_sdk::flush_output();
     with_conn(args, 0, |conn| {
         let (line, ended) = conn.read_until(b'\n').map_err(|e| net_error(&e))?;
         if ended && line.is_empty() {
