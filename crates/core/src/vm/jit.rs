@@ -996,6 +996,49 @@ unsafe extern "C" fn h_op(env: *mut Env, pc: u32) -> u32 {
             *reg(val) = Value::UNDEF;
             next
         }
+        Op::Bin { op, dst, a, b } => {
+            let v = match (reg(a).as_num(), reg(b).as_num()) {
+                (Some(x), Some(y)) => arith(op, x, y),
+                _ => vm.slow_binary(op, reg(a), reg(b)),
+            };
+            match v {
+                Ok(v) => {
+                    *reg(dst) = v;
+                    next
+                }
+                Err(_) => SLOW,
+            }
+        }
+        Op::BinK { op, dst, a, k } => {
+            let c = &prog.consts[k as usize];
+            let v = match (reg(a).as_num(), c.as_num()) {
+                (Some(x), Some(y)) => arith(op, x, y),
+                _ => vm.slow_binary(op, reg(a), c),
+            };
+            match v {
+                Ok(v) => {
+                    *reg(dst) = v;
+                    next
+                }
+                Err(_) => SLOW,
+            }
+        }
+        // A call of a built-in function (`<문자로>`): its result right here.
+        Op::CallName { dst, var, base: b, argc, .. } if var != NONE => {
+            let f = vm.find(&prog.vars[var as usize], fi).map(|s| vm.get(s.loc, fi));
+            let Some(&FuncObj::Builtin(id)) = f.as_ref().and_then(|f| f.as_func()) else {
+                return SLOW;
+            };
+            let args: Vec<Value> = (0..argc).map(|i| reg(b + i).clone()).collect();
+            match builtins::call(id, &args, vm.lang) {
+                Ok(v) => {
+                    *reg(dst) = v;
+                    vm.depth -= 1;
+                    next
+                }
+                Err(_) => SLOW,
+            }
+        }
         Op::EqK { dst, a, k, neg } => {
             if let Some(o) = reg(a).as_object() {
                 if vm.class(o.class).and_then(|c| c.equals).is_some() {
@@ -1182,6 +1225,33 @@ unsafe extern "C" fn h_dict_set(o: *const Value, k: *const Value, v: *const Valu
     0
 }
 
+/// The operators by the index `h_bin` gets.
+const BIN_OPS: [BinOp; 9] = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod, BinOp::Gt, BinOp::Lt, BinOp::Ge, BinOp::Le];
+
+/// `a op b` when they are not two numbers (joining strings): 1 on an error
+/// (the interpreter reports it).
+unsafe extern "C" fn h_bin(env: *mut Env, dst: *mut Value, a: *const Value, b: *const Value, op: u32) -> u32 {
+    let vm = &*(*env).vm;
+    let op = BIN_OPS[op as usize];
+    let v = match ((*a).as_num(), (*b).as_num()) {
+        (Some(x), Some(y)) => arith(op, x, y),
+        _ => vm.slow_binary(op, &*a, &*b),
+    };
+    match v {
+        Ok(v) => {
+            *dst = v;
+            0
+        }
+        Err(_) => 1,
+    }
+}
+
+/// A string's length in characters (`'글'의 '길이'`), `s` a string.
+unsafe extern "C" fn h_str_len(dst: *mut Value, s: *const Value) {
+    let n = (*s).as_str().unwrap().chars().count();
+    *dst = Value::num(n as f64);
+}
+
 /// Releases `n` values from `p` on (a frame's registers going away).
 unsafe extern "C" fn h_release_regs(p: *mut Value, n: usize) {
     for i in 0..n {
@@ -1261,6 +1331,7 @@ struct Sigs {
     two_ptr: SigRef,
     ptr_len: SigRef,
     three_ptr: SigRef,
+    bin: SigRef,
 }
 
 struct Gen<'a, 'b> {
@@ -1336,6 +1407,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             two_ptr: sig(&[ptr, ptr], None),
             ptr_len: sig(&[ptr, ptr], None),
             three_ptr: sig(&[ptr, ptr, ptr], Some(types::I32)),
+            bin: sig(&[ptr, ptr, ptr, ptr, types::I32], Some(types::I32)),
         };
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -1896,7 +1968,8 @@ impl<'a, 'b> Gen<'a, 'b> {
             | Op::ListCheck { .. }
             | Op::ListPush { .. }
             | Op::NewObj { .. }
-            | Op::InitField { .. } => self.direct(i),
+            | Op::InitField { .. }
+            | Op::CallName { .. } => self.direct(i),
             Op::ArgGiven { index, skip } => {
                 let argc = self.b.ins().load(types::I64, flags(), self.env, 32);
                 let given = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, argc, index as i64);
@@ -2310,7 +2383,24 @@ impl<'a, 'b> Gen<'a, 'b> {
     }
 
     fn binary(&mut self, i: usize, op: BinOp, dst: Reg, a: Reg, b: Option<Reg>, k: Option<f64>) {
-        let slow = self.slow_block(i);
+        // Not two numbers (joining strings): `h_bin`; its errors (and those
+        // of the number cases) go to the interpreter.
+        let director = self.direct_block(i);
+        let slow = match b {
+            Some(b) => {
+                let cur = self.b.current_block().unwrap();
+                let blk = self.b.create_block();
+                self.switch(blk);
+                let (d, xa, ya) = (self.addr(At::Reg(dst)), self.addr(At::Reg(a)), self.addr(At::Reg(b)));
+                let op = self.b.ins().iconst(types::I32, BIN_OPS.iter().position(|o| *o == op).unwrap() as i64);
+                let r = self.call(self.sigs.bin, h_bin as usize, &[self.env, d, xa, ya, op]).unwrap();
+                let next = self.next(i);
+                self.b.ins().brif(r, director, &[], next, &[]);
+                self.switch(cur);
+                blk
+            }
+            None => director,
+        };
         let (x, y) = self.operands(a, b, k, slow);
         let d = self.addr(At::Reg(dst));
         match op {
@@ -2577,6 +2667,25 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.b.ins().iadd_imm(e, PROP_VALUE as i64)
     }
 
+    /// A block for `'글'의 길이`: a string's length, else `fallback`.
+    fn str_length(&mut self, dst: Reg, obj: Reg, skip: u32, fallback: Block) -> Block {
+        let cur = self.b.current_block().unwrap();
+        let blk = self.b.create_block();
+        self.switch(blk);
+        let oa = self.addr(At::Reg(obj));
+        let t = self.tag_of(oa);
+        let is_str = self.is_tag(t, tag::STR as i64);
+        let go = self.b.create_block();
+        self.b.ins().brif(is_str, go, &[], fallback, &[]);
+        self.switch(go);
+        let d = self.addr(At::Reg(dst));
+        self.call(self.sigs.two_ptr, h_str_len as usize, &[d, oa]);
+        let skip = self.blocks[skip as usize];
+        self.b.ins().jump(skip, &[]);
+        self.switch(cur);
+        blk
+    }
+
     /// A block for `'목록'의 길이`: a list's length, else `fallback`.
     fn list_length(&mut self, dst: Reg, obj: Reg, skip: u32, fallback: Block) -> Block {
         let cur = self.b.current_block().unwrap();
@@ -2620,6 +2729,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         let fallback = self.direct_block(i);
         let fallback = self.dict_goes_on(i, obj, fallback);
         let fallback = if name == crate::symbol::intern(self.prog.lang.length_word) {
+            let fallback = self.str_length(dst, obj, skip, fallback);
             self.list_length(dst, obj, skip, fallback)
         } else {
             fallback
@@ -2915,7 +3025,8 @@ fn native(op: &Op, prog: &Program) -> bool {
         | Op::ListPush { .. }
         | Op::NewObj { .. }
         | Op::InitField { .. }
-        | Op::CallCtor { .. } => true,
+        | Op::CallCtor { .. }
+        | Op::CallName { .. } => true,
         _ => false,
     }
 }
