@@ -1473,8 +1473,9 @@ impl<'a, 'b> Gen<'a, 'b> {
         for i in 0..self.proto.code.len() {
             let blk = self.blocks[i];
             self.switch(blk);
-            if let Some(r) = regions.iter().find(|r| r.head == i) {
+            if let Some(r) = regions.iter_mut().find(|r| r.head == i) {
                 let ordinary = self.b.create_block();
+                r.ordinary = Some(ordinary);
                 self.enter_region(r, ordinary);
                 self.switch(ordinary);
             }
@@ -1986,25 +1987,13 @@ impl<'a, 'b> Gen<'a, 'b> {
 
     /// The tags a type annotation lets through without a closer look.
     fn simple_type(&self, ty: u32) -> Option<&'static [i64]> {
-        if ty == 0 {
-            return Some(&[]);
-        }
-        match self.prog.types[ty as usize].kind {
-            TypeKind::Any => Some(&[]),
-            TypeKind::Number => Some(&[TAG_NUM, TAG_NULL]),
-            TypeKind::String => Some(&[tag::STR as i64, TAG_NULL]),
-            TypeKind::Boolean => Some(&[TAG_BOOL, TAG_NULL]),
-            _ => None,
-        }
+        simple_type(self.prog, ty)
     }
 
     /// Whether a call of `proto` with `argc` arguments can start its frame
     /// here (else the helpers start it).
     fn inline_call(&self, proto: u32, argc: u16) -> bool {
-        let p = &self.prog.protos[proto as usize];
-        !p.raw_params
-            && argc as usize <= p.params.len()
-            && p.params.iter().take(argc as usize).all(|q| self.simple_type(q.ty).is_some())
+        inline_call(self.prog, proto, argc)
     }
 
     /// Goes to `slow` unless the tag at `a` is one of `tags` (none: any).
@@ -2028,9 +2017,28 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// Anything unusual (no code yet, a full stack, a wrong type) takes the
     /// helpers' way, which does all of it again.
     fn fast_call(&mut self, i: usize, dst: Reg, proto: u32, b: Reg, argc: u16) {
+        let slow = self.b.create_block();
+        let status = self.call_core(dst, proto, b, argc, slow);
+        let (ok, bad) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(status, bad, &[], ok, &[]);
+        self.switch(ok);
+        self.reload();
+        self.jump_next(i);
+        self.switch(bad);
+        let (pc, one) = (self.b.ins().iconst(types::I32, i as i64), self.b.ins().iconst(types::I32, 1));
+        let r = self.call(self.sigs.failed, h_call_failed as usize, &[self.env, pc, one]).unwrap();
+        self.go_on(i, r);
+
+        self.switch(slow);
+        self.call_op(i);
+    }
+
+    /// The native call of `fast_call` up to the callee's status (in the
+    /// current block): anything unusual goes to `slow` before anything
+    /// changed. The arguments are read from (and moved out of) memory.
+    pub(super) fn call_core(&mut self, dst: Reg, proto: u32, b: Reg, argc: u16, slow: Block) -> V {
         let callee = &self.prog.protos[proto as usize];
         let nregs = callee.nregs as i64;
-        let slow = self.b.create_block();
         let entry = self.b.ins().iconst(self.ptr, unsafe { self.table.add(proto as usize) } as i64);
         let code = self.b.ins().load(self.ptr, MemFlags::new(), entry, 0);
         let fast = self.b.create_block();
@@ -2122,19 +2130,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             self.b.ins().store(flags(), v, ce, off);
         }
         let inst = self.b.ins().call_indirect(self.sigs.native, code, &[ce]);
-        let status = self.b.inst_results(inst)[0];
-        let (ok, bad) = (self.b.create_block(), self.b.create_block());
-        self.b.ins().brif(status, bad, &[], ok, &[]);
-        self.switch(ok);
-        self.reload();
-        self.jump_next(i);
-        self.switch(bad);
-        let (pc, one) = (self.b.ins().iconst(types::I32, i as i64), self.b.ins().iconst(types::I32, 1));
-        let r = self.call(self.sigs.failed, h_call_failed as usize, &[self.env, pc, one]).unwrap();
-        self.go_on(i, r);
-
-        self.switch(slow);
-        self.call_op(i);
+        self.b.inst_results(inst)[0]
     }
 
     /// `돌려주자`: the frame of a call that only wants the value ends here
@@ -2995,6 +2991,27 @@ fn number_types(prog: &Program) -> impl Iterator<Item = u32> + '_ {
             .map(|(i, _)| i as u32)
             .take(8),
     )
+}
+
+/// The tags a type annotation lets through without a closer look.
+fn simple_type(prog: &Program, ty: u32) -> Option<&'static [i64]> {
+    if ty == 0 {
+        return Some(&[]);
+    }
+    match prog.types[ty as usize].kind {
+        TypeKind::Any => Some(&[]),
+        TypeKind::Number => Some(&[TAG_NUM, TAG_NULL]),
+        TypeKind::String => Some(&[tag::STR as i64, TAG_NULL]),
+        TypeKind::Boolean => Some(&[TAG_BOOL, TAG_NULL]),
+        _ => None,
+    }
+}
+
+/// Whether a call of `proto` with `argc` arguments can start its frame in
+/// compiled code (`fast_call`).
+fn inline_call(prog: &Program, proto: u32, argc: u16) -> bool {
+    let p = &prog.protos[proto as usize];
+    !p.raw_params && argc as usize <= p.params.len() && p.params.iter().take(argc as usize).all(|q| simple_type(prog, q.ty).is_some())
 }
 
 /// Whether compiled code does `op` itself (in the common case) rather than

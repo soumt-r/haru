@@ -19,3 +19,5 @@ ConstantAssignmentError: 상수 '고정수'의 값은 변경할 수 없어요.
 2000
 0
 NullReferenceError: '+' 연산에는 비어있음 값을 쓸 수 없어요.
+ReferenceError: '없는수' 변수를 찾을 수 없어요.
+DivideByZeroError: 0으로 나눌 수 없어요.

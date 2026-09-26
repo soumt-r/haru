@@ -13,6 +13,13 @@
 //! what the interpreter does. So the copy never decides anything itself
 //! that the ordinary code would not.
 //!
+//! A loop may also call functions of the program and return: a call writes
+//! its arguments back and reads its result, a return pops the frame itself
+//! (the copy's registers hold nothing to release). A copy of a whole
+//! function body was tried: loading and writing back at every call cost what
+//! it saved (fib(30) 40 -> 48ms), the frame's own push and pop being most of
+//! a call.
+//!
 //! A number is held as an `f64` (its bits only matter for other values), and
 //! what is certainly a number or a boolean at each instruction (`analyze`:
 //! nothing is known at the loop head, a guard that passed or a result
@@ -43,6 +50,9 @@ pub(super) struct Region {
     spec: Vec<Block>,
     /// Where the copy leaves for the ordinary code at a pc.
     exits: HashMap<usize, Block>,
+    /// The ordinary code of the head past the way in (a copy leaving at its
+    /// head must not come straight back in).
+    pub(super) ordinary: Option<Block>,
 }
 
 /// Whether the copy can do `op`, and the places it touches.
@@ -82,6 +92,13 @@ fn slots_of(op: &Op, prog: &Program) -> Option<Vec<At>> {
         Op::RangeStep { v, step } => vec![R(v), R(step)],
         Op::RangeNext { v, end, step, .. } => vec![R(v), R(end), R(step)],
         Op::Undef { from, to } => (from..to).map(R).collect(),
+        Op::Enter | Op::Leave | Op::ReturnNull => vec![],
+        Op::Return { src } => vec![R(src)],
+        Op::Call { dst, proto, base, argc } if inline_call(prog, proto, argc) => {
+            let mut v = vec![R(dst)];
+            v.extend((base..base + argc).map(R));
+            v
+        }
         Op::Update { var, a, b, op: BinOp::Add | BinOp::Sub } => match prog.vars[var as usize].slots.as_slice() {
             [Slot { loc, meta }] if matches!(meta, None | Some(Loc::Reg(_) | Loc::Global(_))) => {
                 let target = match loc {
@@ -157,7 +174,7 @@ impl Gen<'_, '_> {
             .collect();
         let spec = (head..=last).map(|_| self.b.create_block()).collect();
         let known = self.analyze(head, last);
-        Region { head, last, slots, vars, known, cur: Known::new(), metas, spec, exits: HashMap::new() }
+        Region { head, last, slots, vars, known, cur: Known::new(), metas, spec, exits: HashMap::new(), ordinary: None }
     }
 
     /// What is certain before each instruction of `head..=last`: a forward
@@ -300,6 +317,14 @@ impl Gen<'_, '_> {
                 taken.insert(target(var), TAG_NUM);
                 return vec![(skip as usize, taken), (next, k)];
             }
+            Op::Call { dst, base, argc, .. } => {
+                // The arguments move to the callee; the result is anything.
+                for r in base..base + argc {
+                    k.insert(R(r), TAG_UNDEF);
+                }
+                k.remove(&R(dst));
+            }
+            Op::Return { .. } | Op::ReturnNull => return vec![],
             _ => {}
         }
         vec![(next, k)]
@@ -367,23 +392,46 @@ impl Gen<'_, '_> {
         let exits: Vec<(usize, Block)> = r.exits.iter().map(|(&pc, &b)| (pc, b)).collect();
         for (pc, blk) in exits {
             self.switch(blk);
-            for &at in &r.slots {
-                let (tv, bv, fv) = r.vars[&at];
-                let t = self.b.use_var(tv);
-                // A number's bits are in its f64.
-                let other = self.b.use_var(bv);
-                let f = self.b.use_var(fv);
-                let fbits = self.b.ins().bitcast(types::I64, MemFlags::new(), f);
-                let is_num = self.b.ins().icmp_imm(IntCC::Equal, t, TAG_NUM);
-                let bits = self.b.ins().select(is_num, fbits, other);
-                let a = self.addr(at);
-                let t = self.b.ins().uextend(types::I64, t);
-                self.b.ins().store(flags(), t, a, 0);
-                self.b.ins().store(flags(), bits, a, 8);
+            for &at in &r.slots.clone() {
+                self.writeback(r, at);
             }
-            let target = self.blocks[pc];
+            let target = match (pc == r.head, r.ordinary) {
+                (true, Some(b)) => b,
+                _ => self.blocks[pc],
+            };
             self.b.ins().jump(target, &[]);
         }
+    }
+
+    /// Writes the value held for `at` to memory.
+    fn writeback(&mut self, r: &Region, at: At) {
+        let (t, bits) = self.value_of(r, at);
+        let a = self.addr(at);
+        let t = self.b.ins().uextend(types::I64, t);
+        self.b.ins().store(flags(), t, a, 0);
+        self.b.ins().store(flags(), bits, a, 8);
+    }
+
+    /// The tag and the payload's bits held for `at` (a number's are in its f64).
+    fn value_of(&mut self, r: &Region, at: At) -> (V, V) {
+        let (tv, bv, fv) = r.vars[&at];
+        let t = self.b.use_var(tv);
+        let other = self.b.use_var(bv);
+        let f = self.b.use_var(fv);
+        let fbits = self.b.ins().bitcast(types::I64, MemFlags::new(), f);
+        let is_num = self.b.ins().icmp_imm(IntCC::Equal, t, TAG_NUM);
+        let bits = self.b.ins().select(is_num, fbits, other);
+        (t, bits)
+    }
+
+    /// Loads what memory holds for `at` into its variables.
+    fn load_slot(&mut self, r: &Region, at: At) {
+        let a = self.addr(at);
+        let (t, p, f) = (self.tag_of(a), self.payload_of(a), self.num_of(a));
+        let (tv, bv, fv) = r.vars[&at];
+        self.b.def_var(tv, t);
+        self.b.def_var(bv, p);
+        self.b.def_var(fv, f);
     }
 
     /// Where the copy goes to run instruction `pc`: its own block inside the
@@ -734,8 +782,156 @@ impl Gen<'_, '_> {
                 self.set_num(r, target, n);
                 self.spec_next(r, pc);
             }
+            Op::Enter => {
+                let d = self.b.ins().load(types::I32, flags(), self.vm, OFF_DEPTH as i32);
+                let fine = self.b.ins().icmp_imm(IntCC::UnsignedLessThan, d, MAX_CALL_DEPTH as i64);
+                self.guard(r, pc, fine);
+                let d = self.b.ins().iadd_imm(d, 1);
+                self.b.ins().store(flags(), d, self.vm, OFF_DEPTH as i32);
+                self.spec_next(r, pc);
+            }
+            Op::Leave => {
+                let d = self.b.ins().load(types::I32, flags(), self.vm, OFF_DEPTH as i32);
+                let d = self.b.ins().iadd_imm(d, -1);
+                self.b.ins().store(flags(), d, self.vm, OFF_DEPTH as i32);
+                self.spec_next(r, pc);
+            }
+            Op::Call { dst, proto, base, argc } => self.spec_call(r, pc, dst, proto, base, argc),
+            Op::Return { src } => self.spec_return(r, pc, Some(src)),
+            Op::ReturnNull => self.spec_return(r, pc, None),
             _ => unreachable!("not an instruction a loop copy does"),
         }
+    }
+
+    /// A call: the arguments go to memory, the ordinary call's native start
+    /// runs (anything unusual leaves here, everything written back), and the
+    /// result comes back into the variables; a result that holds a
+    /// reference leaves after the call (the copy keeps none).
+    fn spec_call(&mut self, r: &mut Region, pc: usize, dst: Reg, proto: u32, base: Reg, argc: u16) {
+        for k in 0..argc {
+            self.writeback(r, At::Reg(base + k));
+        }
+        let slow = self.exit(r, pc);
+        let status = self.call_core(dst, proto, base, argc, slow);
+        let (ok, bad) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(status, bad, &[], ok, &[]);
+
+        // The callee failed: back to the ordinary code with everything in
+        // memory (the arguments were moved out).
+        self.switch(bad);
+        self.reload();
+        for k in 0..argc {
+            self.set_const(r, At::Reg(base + k), TAG_UNDEF, 0);
+        }
+        for &at in &r.slots.clone() {
+            self.writeback(r, at);
+        }
+        let (pcv, one) = (self.b.ins().iconst(types::I32, pc as i64), self.b.ins().iconst(types::I32, 1));
+        let res = self.call(self.sigs.failed, h_call_failed as usize, &[self.env, pcv, one]).unwrap();
+        self.go_on(pc, res);
+
+        self.switch(ok);
+        self.reload();
+        for k in 0..argc {
+            self.set_const(r, At::Reg(base + k), TAG_UNDEF, 0);
+        }
+        self.load_slot(r, At::Reg(dst));
+        let t = self.tv(r, At::Reg(dst));
+        let off = self.b.ins().iadd_imm(t, -(tag::STR as i64));
+        let plain = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, off, (tag::RESOURCE - tag::STR) as i64);
+        self.guard(r, pc + 1, plain);
+        self.spec_next(r, pc);
+    }
+
+    /// `돌려주자` (or the end, `src` None) of a call that only wants the value
+    /// (or nothing): the frame ends here; anything else leaves for the
+    /// ordinary return. The copy's registers hold nothing to release; the
+    /// others (not used by the copy) are released.
+    fn spec_return(&mut self, r: &mut Region, pc: usize, src: Option<Reg>) {
+        let out = self.exit(r, pc);
+        let (vm, ptr) = (self.vm, self.ptr);
+        let flen = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_LEN) as i32);
+        let fp = self.b.ins().load(ptr, flags(), vm, (OFF_FRAMES + OFF_PTR) as i32);
+        let top = self.b.ins().iadd_imm(flen, -1);
+        let foff = self.b.ins().imul_imm(top, FRAME_SIZE as i64);
+        let f = self.b.ins().iadd(fp, foff);
+        let post = self.b.ins().load(types::I32, flags(), f, F_POST as i32);
+        let pending = self.b.ins().load(ptr, flags(), f, F_PENDING as i32);
+        let has_caller = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, flen, 2);
+        let post_ok = match src {
+            Some(_) => self.b.ins().icmp_imm(IntCC::Equal, post, 0),
+            None => self.b.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, post, 1),
+        };
+        let pend_ok = self.b.ins().icmp_imm(IntCC::Equal, pending, 0);
+        let ok = self.b.ins().band(post_ok, pend_ok);
+        let ok = self.b.ins().band(ok, has_caller);
+        let go = self.b.create_block();
+        self.b.ins().brif(ok, go, &[], out, &[]);
+        self.switch(go);
+        let (vt, vp) = match src {
+            Some(src) => {
+                let at = At::Reg(src);
+                match simple_type(self.prog, self.proto.return_type) {
+                    Some(tags) if !tags.is_empty() => {
+                        let mut fits = self.b.ins().iconst(types::I8, 0);
+                        for &want in tags {
+                            let c = self.is(r, at, want);
+                            fits = self.b.ins().bor(fits, c);
+                        }
+                        let fine = self.b.create_block();
+                        self.b.ins().brif(fits, fine, &[], out, &[]);
+                        self.switch(fine);
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.b.ins().jump(out, &[]);
+                        let dead = self.b.create_block();
+                        self.switch(dead);
+                    }
+                }
+                let (t, bits) = self.value_of(r, at);
+                (self.b.ins().uextend(types::I64, t), bits)
+            }
+            None => (self.b.ins().iconst(types::I64, TAG_NULL), self.b.ins().iconst(types::I64, 0)),
+        };
+        // Registers the copy does not use, and a method's object.
+        for reg in 0..self.proto.nregs {
+            if !r.slots.contains(&At::Reg(reg)) {
+                let a = self.addr(At::Reg(reg));
+                self.release(a);
+            }
+        }
+        let this = self.b.ins().iadd_imm(f, F_THIS as i64);
+        self.release(this);
+        let counted = self.b.ins().load(types::I8, flags(), f, F_COUNTED as i32);
+        let counted = self.b.ins().uextend(types::I32, counted);
+        let d = self.b.ins().load(types::I32, flags(), vm, OFF_DEPTH as i32);
+        let d = self.b.ins().isub(d, counted);
+        self.b.ins().store(flags(), d, vm, OFF_DEPTH as i32);
+        let fbase = self.b.ins().load(ptr, flags(), f, F_BASE as i32);
+        self.b.ins().store(flags(), fbase, vm, (OFF_STACK + OFF_LEN) as i32);
+        self.b.ins().store(flags(), top, vm, (OFF_FRAMES + OFF_LEN) as i32);
+        let ret = self.b.ins().load(types::I16, flags(), f, F_RET as i32);
+        let ret = self.b.ins().uextend(ptr, ret);
+        let caller = self.b.ins().iadd_imm(f, -(FRAME_SIZE as i64));
+        let cbase = self.b.ins().load(ptr, flags(), caller, F_BASE as i32);
+        let slot = self.b.ins().iadd(cbase, ret);
+        let slot = self.b.ins().ishl_imm(slot, 4);
+        let sp = self.b.ins().load(ptr, flags(), vm, (OFF_STACK + OFF_PTR) as i32);
+        let dst = self.b.ins().iadd(sp, slot);
+        if src.is_some() {
+            self.store(dst, vt, vp);
+        } else {
+            // Falling off the end: 비어있음 for Post::Value, nothing for Discard.
+            let (put, done) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(post, done, &[], put, &[]);
+            self.switch(put);
+            self.store(dst, vt, vp);
+            self.b.ins().jump(done, &[]);
+            self.switch(done);
+        }
+        let status = self.b.ins().iconst(types::I32, S_RETURNED as i64);
+        self.b.ins().return_(&[status]);
     }
 
     /// `GetReg` / `GetGlobal`: an undefined variable leaves (the ordinary
