@@ -1407,9 +1407,34 @@ impl<'p> Vm<'p> {
                                     let ns = self.load_namespace(m);
                                     enter!(pc - 1, self.push_module(m, ns));
                                 }
-                                tri!(self.bind_file(info, m, fi));
+                                tri!(self.bind_file(info, m, fi, false));
                             }
-                            ImportKind::Std(name) => tri!(self.bind_std(info, name, fi)),
+                            ImportKind::Package(p) => {
+                                // Its native items first (they are bound again
+                                // when the import resumes after the module ran).
+                                tri!(self.bind_natives(info, p, fi));
+                                let prefix = self.lang.native_prefix;
+                                let rest = info.all || info.items.iter().any(|(t, _, _)| !t.starts_with(prefix));
+                                if rest {
+                                    match &p.source {
+                                        &PackageSource::Module(m) => {
+                                            if self.module_state[m as usize] == ModState::Unloaded {
+                                                let ns = self.load_namespace(m);
+                                                enter!(pc - 1, self.push_module(m, ns));
+                                            }
+                                            tri!(self.bind_file(info, m, fi, true));
+                                        }
+                                        PackageSource::Fail(code, args) => {
+                                            let mut e = err(code);
+                                            for a in args {
+                                                e = e.str_arg(a);
+                                            }
+                                            fail!(e);
+                                        }
+                                        PackageSource::None => tri!(self.bind_package(info, p, fi)),
+                                    }
+                                }
+                            }
                         }
                     }
                     Op::InitFieldsDyn { obj } => {
@@ -1612,12 +1637,24 @@ impl<'p> Vm<'p> {
     }
 
     /// Binds what an import of a file module asks for (Hana's `bindImports`).
-    fn bind_file(&mut self, info: &ImportInfo, m: u32, fi: usize) -> Result<(), RuntimeError> {
+    /// Binds from a module that has run (`skip_native`: a package's native
+    /// items are bound already).
+    fn bind_file(&mut self, info: &ImportInfo, m: u32, fi: usize, skip_native: bool) -> Result<(), RuntimeError> {
         let prog = self.prog;
         let module = &prog.modules[m as usize];
         let there = self.module_ns[m as usize].unwrap();
         self.bring_types(info, there)?;
         let here = self.ns as usize;
+        // The native functions the module holds come along (Hana's injectNatives).
+        for (name, slot) in &info.leaks {
+            if let Some(&g) = module.globals.get(name) {
+                let v = self.globals[g as usize].clone();
+                if !v.is_undef() {
+                    self.store(*slot, fi, v);
+                }
+            }
+        }
+        let prefix = self.lang.native_prefix;
         if info.all {
             for (name, proto) in &module.all_functions {
                 self.store(info.all_slots[name], fi, Value::func(FuncObj::User(*proto)));
@@ -1632,6 +1669,9 @@ impl<'p> Vm<'p> {
             }
         }
         for (target, bind, slot) in &info.items {
+            if skip_native && target.starts_with(prefix) {
+                continue;
+            }
             let target_sym = symbol::intern(target);
             let bind_sym = symbol::intern(bind);
             // A variable of the module (a built-in, an import of its own, ...).
@@ -1668,14 +1708,47 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
-    /// Binds functions of a standard module (Hana's core native modules).
-    fn bind_std(&mut self, info: &ImportInfo, name: &str, fi: usize) -> Result<(), RuntimeError> {
+    /// A package's `<네이티브_이름>` items: functions of its native module by id.
+    fn bind_natives(&mut self, info: &ImportInfo, p: &PackageImport, fi: usize) -> Result<(), RuntimeError> {
+        let prefix = self.lang.native_prefix;
+        for (target, _, slot) in &info.items {
+            let Some(id) = target.strip_prefix(prefix) else { continue };
+            let m = match &p.native {
+                Ok(m) => *m,
+                Err((code, args)) => {
+                    let mut e = err(code);
+                    for a in args {
+                        e = e.str_arg(a);
+                    }
+                    return Err(e);
+                }
+            };
+            let rt = self.runtime.ok_or_else(|| err(IMPORT_PACKAGE).str_arg(&info.source))?;
+            match rt.function_by_id(m, id) {
+                Some(f) => self.store(*slot, fi, rt.function_value(f)),
+                None => return Err(err("ImportError.ImportNativeFunctionNotFound").str_arg(&info.source).str_arg(id)),
+            }
+        }
+        Ok(())
+    }
+
+    /// A standard module or a native package without a source entry point:
+    /// its functions by their names in the language (or their ids).
+    fn bind_package(&mut self, info: &ImportInfo, p: &PackageImport, fi: usize) -> Result<(), RuntimeError> {
         let lang = self.lang.name;
-        let Some(rt) = self.runtime else {
-            return Err(err(IMPORT_PACKAGE).str_arg(name));
-        };
-        let Some(m) = rt.module(lang, name) else {
-            return Err(err(IMPORT_PACKAGE).str_arg(name));
+        let prefix = self.lang.native_prefix;
+        let not_found = || err(IMPORT_PACKAGE).str_arg(&info.source);
+        let (rt, m) = match (self.runtime, &p.native) {
+            (Some(rt), Ok(m)) => (rt, *m),
+            // A package whose native module cannot be used says why.
+            (_, Err((code, args))) if code != "ImportError.ImportDLLNotFound" => {
+                let mut e = err(code);
+                for a in args {
+                    e = e.str_arg(a);
+                }
+                return Err(e);
+            }
+            _ => return Err(not_found()),
         };
         if info.all {
             for (fname, slot) in &info.all_slots {
@@ -1685,9 +1758,12 @@ impl<'p> Vm<'p> {
             }
         }
         for (target, _, slot) in &info.items {
-            match rt.function(m, lang, target) {
+            if target.starts_with(prefix) {
+                continue;
+            }
+            match rt.function(m, lang, target).or_else(|| rt.function_by_id(m, target)) {
                 Some(f) => self.store(*slot, fi, rt.function_value(f)),
-                None => return Err(err(IMPORT_TARGET).str_arg(name).str_arg(target)),
+                None => return Err(err(IMPORT_TARGET).str_arg(&info.source).str_arg(target)),
             }
         }
         Ok(())

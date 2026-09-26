@@ -472,10 +472,29 @@ pub struct ModuleInfo {
 pub enum ImportKind {
     /// A file module.
     File(u32),
-    /// A standard module by its name in the importer's language.
-    Std(String),
+    /// A standard module or a package.
+    Package(PackageImport),
     /// An import that fails when it runs (a missing or unreadable file...).
     Fail { code: String, args: Vec<String> },
+}
+
+/// A `[모듈]` import, resolved the way Hana resolves one: `<네이티브_이름>`
+/// items from its native module, the rest from its source entry point for
+/// the language, or else from the native module's own names.
+pub struct PackageImport {
+    /// Its native module in the runtime, or the error a native item meets.
+    pub native: Result<usize, (String, Vec<String>)>,
+    /// A standard module (only those can be listed by `전부` in Hana).
+    pub core: bool,
+    pub source: PackageSource,
+}
+
+pub enum PackageSource {
+    /// The compiled entry point for the importer's language.
+    Module(u32),
+    /// There is one, but it cannot be used (another language only, a syntax error...).
+    Fail(String, Vec<String>),
+    None,
 }
 
 /// One `가져오자` statement.
@@ -490,4 +509,7 @@ pub struct ImportInfo {
     pub all_slots: HashMap<String, Loc>,
     /// Classes the statement renames (their conflicts are not errors).
     pub aliased: HashSet<u32>,
+    /// Native functions the module has as variables, which come along with
+    /// any import of it (Hana's `injectNatives`): (name, where it goes here).
+    pub leaks: Vec<(String, Loc)>,
 }

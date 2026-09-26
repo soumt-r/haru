@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "haru_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "haru"
 path = "src/main.rs"
@@ -13,6 +17,10 @@ path = "src/main.rs"
 haru-core.workspace = true
 haru-syntax.workspace = true
 haru-std.workspace = true
+haru-pkg-timezone = { path = "../../packages/timezone" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+sha2 = "0.10"
 
 [dev-dependencies]
 haru-example-greet = { path = "../../examples/greet" }

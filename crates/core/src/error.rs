@@ -87,7 +87,7 @@ impl RuntimeError {
             };
         }
         if let Ok(i) = CATALOG.binary_search_by(|e| e.0.cmp(self.code.as_str())) {
-            let entry = CATALOG[i];
+            let entry = haru_wording(self.code.as_str()).unwrap_or(CATALOG[i]);
             let template = match lang.locale {
                 1 => entry.2,
                 2 => entry.3,
@@ -247,5 +247,19 @@ fn kind_name(k: u32, lang: &str) -> &'static str {
         kind::DICT => if kanade { "辞書" } else { "사전" },
         kind::FUNC => if kanade { "関数" } else { "함수" },
         _ => if kanade { "何でも" } else { "아무거나" },
+    }
+}
+
+/// Hana's messages that name Hana's own tools, as Haru words them (the
+/// packages are Haru's: `haru install`, not `hana install`).
+fn haru_wording(code: &str) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+    match code {
+        "ImportError.ImportPackageNotInstalled" => Some((
+            "ImportError.ImportPackageNotInstalled",
+            "Package '[%s]' is not installed. 'haru install' downloads it.",
+            "패키지 '[%s]'가 설치되어 있지 않아요. 'haru install'로 내려받을 수 있어요.",
+            "パッケージ『[%s]』がインストールされていません。「haru install」でダウンロードできます。",
+        )),
+        _ => None,
     }
 }

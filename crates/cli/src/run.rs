@@ -8,11 +8,14 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use haru_core::vm::{codes, Vm};
-use haru_core::{compiler, lang, syntax_report, Runtime};
+use haru_core::{compiler, lang, syntax_report};
 
-pub fn run(path: &Path, time: bool) -> ExitCode {
+use crate::packages::{Bundled, Resolver};
+
+pub fn run(path: &Path, time: bool, extra: Vec<Bundled>, files: &'static [(&'static str, &'static str)]) -> ExitCode {
     let lang = lang::for_path(path);
-    let source = match std::fs::read_to_string(path) {
+    let embedded = files.iter().find(|(p, _)| Path::new(p) == path).map(|(_, t)| t.to_string());
+    let source = match embedded.map_or_else(|| std::fs::read_to_string(path), Ok) {
         Ok(s) => s,
         Err(e) => {
             println!("{}: {e}", path.display());
@@ -30,11 +33,8 @@ pub fn run(path: &Path, time: bool) -> ExitCode {
         }
         return ExitCode::FAILURE;
     }
-    let mut rt = Runtime::new();
-    for entry in haru_std::MODULES {
-        rt.load_static(*entry).expect("the standard library loads");
-    }
-    let compiled = match compiler::compile(&program, lang, &haru_std::lookup) {
+    let resolver = Resolver::new(crate::packages::std_runtime(), extra, files);
+    let compiled = match compiler::compile(&program, lang, &resolver) {
         Ok(c) => c,
         Err(u) => {
             eprintln!("haru: not supported yet: {}", u.0);
@@ -43,6 +43,7 @@ pub fn run(path: &Path, time: bool) -> ExitCode {
     };
     let compiled_at = Instant::now();
 
+    let rt = resolver.rt.borrow();
     let mut vm = Vm::new(&compiled).with_runtime(&rt);
     let stdin = std::io::stdin();
     vm.read_line = Box::new(move || {

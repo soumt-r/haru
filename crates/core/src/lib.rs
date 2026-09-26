@@ -18,6 +18,7 @@ pub mod value;
 pub mod vm;
 
 pub use dylib::library_file_name;
+pub use haru_abi::EntryFn;
 pub use error::RuntimeError;
 pub use modules::{FnRef, FunctionInfo, LoadError, ModuleInfo, Runtime};
 pub use value::Value;
@@ -65,7 +66,7 @@ pub fn run_to_string(source: &str, lang: &'static lang::Lang) -> String {
         let (label, messages) = syntax_report(&diags, lang);
         return format!("{label}:\n{}", messages.iter().map(|m| format!("  - {m}\n")).collect::<String>());
     }
-    let compiled = match compiler::compile(&program, lang, &|_, _| None) {
+    let compiled = match compiler::compile(&program, lang, &compiler::NoPackages) {
         Ok(c) => c,
         Err(u) => return format!("unsupported: {}", u.0),
     };
@@ -88,7 +89,7 @@ pub fn run_source(source: &str, lang: &'static lang::Lang) -> Result<(), RunErro
     if !diags.is_empty() {
         return Err(RunError::Syntax(diags));
     }
-    let compiled = compiler::compile(&program, lang, &|_, _| None).map_err(|u| RunError::Unsupported(u.0))?;
+    let compiled = compiler::compile(&program, lang, &compiler::NoPackages).map_err(|u| RunError::Unsupported(u.0))?;
     let mut vm = vm::Vm::new(&compiled);
     let stdin = std::io::stdin();
     vm.read_line = Box::new(move || {

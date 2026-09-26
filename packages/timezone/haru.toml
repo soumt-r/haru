@@ -1,0 +1,13 @@
+# The timezone package: Hari/Kanade entry points (the same as Hana's) over a
+# native module written with haru-sdk.
+[package]
+name = "timezone"
+version = "0.1.0"
+
+[entry]
+hari = "hari/index.hr"
+kanade = "kanade/index.knd"
+
+[native]
+id = "timezone"
+crate = "."

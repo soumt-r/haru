@@ -134,6 +134,27 @@ fn send(method: String, raw_url: &str, body: String, headers: &[(String, String)
     answer(resp)
 }
 
+/// A GET for tools (`haru install` fetching a prebuilt library): the body,
+/// redirects followed, at most 32MB.
+pub fn fetch(url: &str) -> std::result::Result<Vec<u8>, String> {
+    let mut u = Url::parse(url).filter(|u| (u.scheme == "http" || u.scheme == "https") && !u.hostname().is_empty()).ok_or("not an http(s) address")?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    for _ in 0..=MAX_REDIRECTS {
+        let resp = round_trip("GET", &u, "", &[], deadline).map_err(|f| match f {
+            Fail::TooLarge => "too large".to_string(),
+            _ => "the request failed".to_string(),
+        })?;
+        match resp.first("Location") {
+            Some(loc) if matches!(resp.status, 301 | 302 | 303 | 307 | 308) => {
+                u = u.join(&loc).ok_or("a bad redirect")?;
+            }
+            _ if resp.status == 200 => return Ok(resp.body),
+            _ => return Err(format!("status {}", resp.status)),
+        }
+    }
+    Err("too many redirects".into())
+}
+
 fn answer(resp: Response) -> Result<Value> {
     let headers = Dict::new();
     for (name, values) in &resp.header {

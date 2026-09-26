@@ -29,6 +29,7 @@ pub mod names;
 
 pub use file::deny_files;
 pub use net::deny_net;
+pub use http::fetch;
 
 use names::HANA_STD;
 
@@ -50,23 +51,6 @@ pub const MODULES: &[EntryFn] = &[
     net::entry,
     http::entry,
 ];
-
-/// Ids of the modules in [`MODULES`] (complete: every function Hana has).
-const IMPLEMENTED: &[&str] = &["math", "text", "list", "json", "csv", "stats", "path", "encoding", "hash", "random", "regex", "datetime", "file", "socket", "http"];
-
-/// Hana packages that come with Hana (not standard modules, not here yet).
-const HANA_PACKAGES: &[&str] = &["timezone", "http_server"];
-
-/// What a `[모듈]` name means in a language: see `haru_core::compiler::StdLookup`.
-pub fn lookup(lang: &str, name: &str) -> Option<(bool, Vec<String>)> {
-    if HANA_PACKAGES.contains(&name) {
-        return Some((false, Vec::new()));
-    }
-    let kanade = lang == "kanade";
-    let m = HANA_STD.iter().find(|m| (if kanade { m.names.1 } else { m.names.0 }) == name)?;
-    let fns = m.functions.iter().map(|f| if kanade { f.2 } else { f.1 }.to_string()).collect();
-    Some((IMPLEMENTED.contains(&m.id), fns))
-}
 
 /// A standard function: it takes the arguments as they come and checks them itself.
 pub(crate) type StdFn = fn(&[Value]) -> Result<Value>;

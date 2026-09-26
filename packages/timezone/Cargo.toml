@@ -1,0 +1,15 @@
+[package]
+name = "haru-pkg-timezone"
+description = "The timezone package that comes with Haru: the IANA time zone database"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "timezone"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+haru-sdk.workspace = true
+jiff = "0.2"

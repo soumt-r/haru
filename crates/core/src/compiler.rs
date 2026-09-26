@@ -22,60 +22,132 @@ use crate::value::{FuncObj, Value};
 #[derive(Debug)]
 pub struct Unsupported(pub String);
 
-/// What a `[모듈]` name means to this build, in a language: `None` when no
-/// standard module has that name; `Some((true, functions))` for one Haru has
-/// (its functions' names in that language); `Some((false, _))` for one only
-/// Hana has so far.
-pub type StdLookup<'s> = &'s dyn Fn(&str, &str) -> Option<(bool, Vec<String>)>;
-
-/// A file module read and parsed ahead (import paths are written literally).
-enum Source {
-    Ok(ast::Program, &'static Lang),
-    /// The error its import raises when it runs: (code, argument).
-    Fail(&'static str, String),
+/// What `[모듈]` names mean to a run: standard modules, the packages that
+/// come with Haru, a project's packages... (the CLI decides; see `Package`).
+pub trait Packages {
+    /// What `[name]` is in a language, or `None` when nothing has that name.
+    fn find(&self, lang: &str, name: &str) -> Option<Package>;
+    /// The names of a native module's functions in a language.
+    fn names(&self, module: usize, lang: &str) -> Vec<String>;
+    /// The text of a source file a program imports (a built program carries
+    /// its files inside).
+    fn read_file(&self, path: &str) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
 }
 
-/// Every file the statements import, and the files those import, by key.
-fn discover(stmts: &[Stmt], sources: &mut HashMap<String, Source>) {
-    let mut found = Vec::new();
+/// A standard module or a package, as found.
+#[derive(Clone)]
+pub struct Package {
+    /// The whole import fails with this (not installed, a bad manifest...).
+    pub fail: Option<(String, Vec<String>)>,
+    /// Something only Hana has so far: the program cannot run here yet.
+    pub unsupported: bool,
+    /// Its native module in the runtime, or the error a native item meets.
+    pub native: Result<usize, (String, Vec<String>)>,
+    /// A standard module.
+    pub core: bool,
+    /// Its source entry points.
+    pub entries: Vec<Entry>,
+}
+
+/// A package's source entry point for one language.
+#[derive(Clone)]
+pub struct Entry {
+    pub lang: &'static str,
+    /// Its path (the key of the module, and what messages name).
+    pub path: String,
+    /// Its text; `None` when it cannot be read.
+    pub text: Option<String>,
+}
+
+/// No packages and no standard modules.
+pub struct NoPackages;
+
+impl Packages for NoPackages {
+    fn find(&self, _: &str, _: &str) -> Option<Package> {
+        None
+    }
+    fn names(&self, _: usize, _: &str) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// A module read and parsed ahead (import paths are written literally).
+enum Source {
+    Ok(ast::Program, &'static Lang),
+    /// The error its import raises when it runs.
+    Fail(&'static str, Vec<String>),
+}
+
+fn parse_source(text: &str, lang: &'static Lang, fail: (&'static str, Vec<String>)) -> Source {
+    match haru_syntax::parse(text, lang.syntax) {
+        (prog, diags) if diags.is_empty() => Source::Ok(prog, lang),
+        _ => Source::Fail(fail.0, fail.1),
+    }
+}
+
+/// Every file and package entry point the statements import, and what those
+/// import, by key.
+fn discover(stmts: &[Stmt], lang: &'static Lang, packages: &dyn Packages, sources: &mut HashMap<String, Source>) {
+    let mut found: Vec<(String, bool)> = Vec::new();
     walk_stmts(
         stmts,
         &mut |s| {
-            if let Stmt::Import { module, is_builtin: false, .. } = s {
-                found.push(module.clone());
+            if let Stmt::Import { module, is_builtin, .. } = s {
+                found.push((module.clone(), *is_builtin));
             }
         },
         &mut |_| {},
     );
-    for path in found {
-        let key = format!("file:{path}");
+    for (module, is_builtin) in found {
+        let (key, source_lang) = if is_builtin {
+            // A package's entry point is read in the importer's language.
+            let Some(entry) = package_entry(packages, lang, &module) else { continue };
+            (format!("package:{}", entry.path), lang)
+        } else {
+            (format!("file:{module}"), crate::lang::for_path(std::path::Path::new(&module)))
+        };
         if sources.contains_key(&key) {
             continue;
         }
-        let lang = crate::lang::for_path(std::path::Path::new(&path));
-        let source = match std::fs::read_to_string(&path) {
-            Err(_) => Source::Fail("ImportError.ImportFileNotFound", path.clone()),
-            Ok(text) => match haru_syntax::parse(&text, lang.syntax) {
-                (prog, diags) if diags.is_empty() => Source::Ok(prog, lang),
-                _ => Source::Fail("ImportError.ImportFileSyntax", path.clone()),
-            },
+        let source = if is_builtin {
+            let entry = package_entry(packages, lang, &module).unwrap();
+            match &entry.text {
+                None => Source::Fail("ImportError.ImportFileNotFound", vec![entry.path.clone()]),
+                Some(text) => parse_source(text, lang, ("ImportError.ImportPackageSyntax", vec![module.clone(), entry.path.clone()])),
+            }
+        } else {
+            match packages.read_file(&module) {
+                None => Source::Fail("ImportError.ImportFileNotFound", vec![module.clone()]),
+                Some(text) => parse_source(&text, source_lang, ("ImportError.ImportFileSyntax", vec![module.clone()])),
+            }
         };
         sources.insert(key.clone(), source);
-        if let Source::Ok(prog, _) = &sources[&key] {
+        if let Source::Ok(prog, l) = &sources[&key] {
             // Borrow ends before the recursive insertions.
-            let stmts: Vec<Stmt> = prog.statements.clone();
-            discover(&stmts, sources);
+            let (stmts, l): (Vec<Stmt>, &'static Lang) = (prog.statements.clone(), l);
+            discover(&stmts, l, packages, sources);
         }
     }
 }
 
-pub fn compile(program: &ast::Program, lang: &'static Lang, std_lookup: StdLookup) -> Result<Program, Unsupported> {
+/// The entry point of a package for a language, when it is usable at all.
+fn package_entry(packages: &dyn Packages, lang: &'static Lang, module: &str) -> Option<Entry> {
+    let p = packages.find(lang.name, module)?;
+    if p.fail.is_some() || p.unsupported {
+        return None;
+    }
+    p.entries.into_iter().find(|e| e.lang == lang.name)
+}
+
+pub fn compile(program: &ast::Program, lang: &'static Lang, packages: &dyn Packages) -> Result<Program, Unsupported> {
     let mut sources = HashMap::new();
-    discover(&program.statements, &mut sources);
-    check_supported(&program.statements, lang, std_lookup)?;
+    discover(&program.statements, lang, packages, &mut sources);
+    check_supported(&program.statements, lang, packages)?;
     for s in sources.values() {
         if let Source::Ok(p, l) = s {
-            check_supported(&p.statements, l, std_lookup)?;
+            check_supported(&p.statements, l, packages)?;
         }
     }
     let error_classes = [builtin_error_class(&crate::lang::HARI), builtin_error_class(&crate::lang::KANADE)];
@@ -95,7 +167,7 @@ pub fn compile(program: &ast::Program, lang: &'static Lang, std_lookup: StdLooku
         type_ids: HashMap::new(),
         str_consts: HashMap::new(),
         sources: &sources,
-        std_lookup,
+        packages,
         module_ids: HashMap::new(),
         lang,
         module: 0,
@@ -286,20 +358,101 @@ impl<'a> Compiler<'a> {
     fn import_names(&self, module: &str, is_builtin: bool, all: bool, items: &[ast::ImportItem]) -> Vec<String> {
         let mut names: Vec<String> =
             items.iter().map(|i| if i.alias.is_empty() { i.name.clone() } else { i.alias.clone() }).collect();
+        let key = self.module_key(module, is_builtin);
         if all {
-            if is_builtin {
-                if let Some((true, fns)) = (self.std_lookup)(self.lang.name, module) {
-                    names.extend(fns);
+            match key.as_ref().and_then(|k| self.sources.get(k)) {
+                Some(Source::Ok(p, _)) => {
+                    for s in &p.statements {
+                        if let Stmt::Function(f) = s {
+                            names.push(f.name.clone());
+                        }
+                    }
                 }
-            } else if let Some(Source::Ok(p, _)) = self.sources.get(&format!("file:{module}")) {
-                for s in &p.statements {
-                    if let Stmt::Function(f) = s {
-                        names.push(f.name.clone());
+                _ if is_builtin => {
+                    if let Some(Package { native: Ok(m), .. }) = self.packages.find(self.lang.name, module) {
+                        names.extend(self.packages.names(m, self.lang.name));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(k) = key {
+            names.extend(self.leaked_names(&k));
+        }
+        names
+    }
+
+    /// How a `[모듈]` import is bound when it runs.
+    fn package_import(&self, module: &str) -> ImportKind {
+        let Some(p) = self.packages.find(self.lang.name, module) else {
+            // Nothing has that name: Hana's errors for a package that is not there.
+            return ImportKind::Package(PackageImport {
+                native: Err(("ImportError.ImportDLLNotFound".into(), vec![module.to_string()])),
+                core: false,
+                source: PackageSource::None,
+            });
+        };
+        if let Some((code, args)) = p.fail {
+            return ImportKind::Fail { code, args };
+        }
+        let source = match p.entries.iter().find(|e| e.lang == self.lang.name) {
+            Some(e) => {
+                let key = format!("package:{}", e.path);
+                match (self.module_ids.get(&key), self.sources.get(&key)) {
+                    (Some(&m), _) => PackageSource::Module(m),
+                    (None, Some(Source::Fail(code, args))) => PackageSource::Fail(code.to_string(), args.clone()),
+                    _ => PackageSource::Fail("ImportError.ImportFileNotFound".into(), vec![e.path.clone()]),
+                }
+            }
+            // An entry point for another language only.
+            None if !p.entries.is_empty() => {
+                PackageSource::Fail("ImportError.ImportUnsupportedLocale".into(), vec![module.to_string(), self.lang.name.to_string()])
+            }
+            None => PackageSource::None,
+        };
+        ImportKind::Package(PackageImport { native: p.native, core: p.core, source })
+    }
+
+    /// The key of the module an import runs (`file:...`, `package:...`), when
+    /// it is source.
+    fn module_key(&self, module: &str, is_builtin: bool) -> Option<String> {
+        if !is_builtin {
+            return Some(format!("file:{module}"));
+        }
+        package_entry(self.packages, self.lang, module).map(|e| format!("package:{}", e.path))
+    }
+
+    /// The native functions a module has as top-level variables, which an
+    /// import of it copies in (Hana's `injectNatives`): those its own imports
+    /// bind, and those its imports bring along.
+    fn leaked_names(&self, key: &str) -> Vec<String> {
+        fn go(c: &Compiler, key: &str, prefix: &str, seen: &mut HashSet<String>, out: &mut Vec<String>) {
+            if !seen.insert(key.to_string()) {
+                return;
+            }
+            let Some(Source::Ok(p, l)) = c.sources.get(key) else { return };
+            for s in &p.statements {
+                if let Stmt::Import { module, is_builtin, items, .. } = s {
+                    for i in items {
+                        let bind = if i.alias.is_empty() { &i.name } else { &i.alias };
+                        if bind.starts_with(prefix) && !out.contains(bind) {
+                            out.push(bind.clone());
+                        }
+                    }
+                    let sub = if *is_builtin {
+                        package_entry(c.packages, l, module).map(|e| format!("package:{}", e.path))
+                    } else {
+                        Some(format!("file:{module}"))
+                    };
+                    if let Some(sub) = sub {
+                        go(c, &sub, prefix, seen, out);
                     }
                 }
             }
         }
-        names
+        let mut out = Vec::new();
+        go(self, key, self.lang.native_prefix, &mut HashSet::new(), &mut out);
+        out
     }
 
     /// The names a scope's statements can declare, with whether any declaration
@@ -355,19 +508,14 @@ impl<'a> Compiler<'a> {
 }
 
 /// Constructs this version cannot run yet; they fail before anything runs.
-fn check_supported(stmts: &[Stmt], lang: &Lang, std_lookup: StdLookup) -> Result<(), Unsupported> {
+fn check_supported(stmts: &[Stmt], lang: &Lang, packages: &dyn Packages) -> Result<(), Unsupported> {
     let mut problem: Option<String> = None;
     walk_stmts(
         stmts,
         &mut |s| {
             if let Stmt::Import { module, is_builtin: true, .. } = s {
-                if problem.is_none() {
-                    let package = module.contains('/') || std::path::Path::new("packages").join(module).exists();
-                    if package {
-                        problem = Some(format!("package [{module}]"));
-                    } else if let Some((false, _)) = std_lookup(lang.name, module) {
-                        problem = Some(format!("standard module [{module}]"));
-                    }
+                if problem.is_none() && packages.find(lang.name, module).is_some_and(|p| p.unsupported) {
+                    problem = Some(format!("package [{module}]"));
                 }
             }
         },
@@ -483,7 +631,7 @@ struct Compiler<'a> {
     type_ids: HashMap<(String, &'static str), u32>,
     str_consts: HashMap<String, u32>,
     sources: &'a HashMap<String, Source>,
-    std_lookup: StdLookup<'a>,
+    packages: &'a dyn Packages,
     module_ids: HashMap<String, u32>,
 
     // The module being compiled.
@@ -1390,19 +1538,22 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
 
     /// `...에서 ...을 가져오자`: loads the module when it runs, then binds.
     fn import(&mut self, module: &str, is_builtin: bool, all: bool, items: &[ast::ImportItem]) {
-        let native = items.iter().any(|i| i.name.starts_with(self.c.lang.native_prefix));
-        let kind = if is_builtin && native {
-            // A package's native library (Hana's ABI); there is no such package here.
-            ImportKind::Fail { code: "ImportError.ImportDLLNotFound".to_string(), args: vec![module.to_string()] }
-        } else if is_builtin {
-            ImportKind::Std(module.to_string())
+        let kind = if is_builtin {
+            self.c.package_import(module)
         } else {
             let key = format!("file:{module}");
             match (self.c.module_ids.get(&key), self.c.sources.get(&key)) {
                 (Some(&m), _) => ImportKind::File(m),
-                (None, Some(Source::Fail(code, arg))) => ImportKind::Fail { code: code.to_string(), args: vec![arg.clone()] },
+                (None, Some(Source::Fail(code, args))) => ImportKind::Fail { code: code.to_string(), args: args.clone() },
                 _ => ImportKind::Fail { code: "ImportError.ImportFileNotFound".to_string(), args: vec![module.to_string()] },
             }
+        };
+        let leaks: Vec<(String, Loc)> = match self.c.module_key(module, is_builtin) {
+            Some(k) => self.c.leaked_names(&k).into_iter().map(|n| {
+                let slot = self.bind_slot(&n);
+                (n, slot)
+            }).collect(),
+            None => Vec::new(),
         };
         let items: Vec<(String, String, Loc)> = items
             .iter()
@@ -1421,7 +1572,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             }
         }
         let import = self.c.prog.imports.len() as u32;
-        self.c.prog.imports.push(ImportInfo { kind, source: module.to_string(), all, items, all_slots, aliased });
+        self.c.prog.imports.push(ImportInfo { kind, source: module.to_string(), all, items, all_slots, aliased, leaks });
         self.emit(Op::Import { import });
     }
 

@@ -149,6 +149,24 @@ impl Runtime {
         Some(FnRef { module, func })
     }
 
+    /// A module by its language-neutral id (`timezone`).
+    pub fn module_by_id(&self, id: &str) -> Option<usize> {
+        self.modules.iter().position(|m| m.id == id)
+    }
+
+    /// A function of a module by its language-neutral id (`Offset`): what a
+    /// package's `<네이티브_Offset>` names.
+    pub fn function_by_id(&self, module: usize, id: &str) -> Option<FnRef> {
+        let func = self.modules.get(module)?.functions.iter().position(|f| f.id == id)?;
+        Some(FnRef { module, func })
+    }
+
+    /// The names a module's functions have in `lang`, in its order.
+    pub fn function_names(&self, module: usize, lang: &str) -> Vec<String> {
+        let Some(m) = self.modules.get(module) else { return Vec::new() };
+        m.functions.iter().filter_map(|f| f.names.iter().find(|(l, _)| l.as_str() == lang).map(|(_, n)| n.clone())).collect()
+    }
+
     /// A function value that the program can store and pass on.
     pub fn function_value(&self, f: FnRef) -> Value {
         Value::func(FuncObj::Native { module: f.module, func: f.func })

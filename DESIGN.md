@@ -73,13 +73,24 @@ haru_sdk::export!(build);
 
 Rust로 된 네이티브 패키지는 소스에서 `haru`와 함께 컴파일해 **실행 파일 하나**로 묶을 수 있습니다(dlopen 없음, 링크 타임 최적화까지). Hana의 `pack`이 라이브러리 파일을 옆에 두거나 풀어 쓰던 것과 다른 점입니다. 동적 로드는 "미리 빌드한 파일을 받아서 바로 쓰기"용으로 남습니다.
 
+`haru build [--with <패키지>]... [-o <파일>] [<프로그램>]`은 임시 cargo 크레이트(`target/haru-build/`)를 만들어 `haru-cli`(라이브러리)와 패키지 크레이트들에 의존시키고, `main.rs`가 `haru_cli::main_with`에 링크한 패키지(이름·소스 진입점 `include_str!`·`haru_entry`)를 넘깁니다. 프로그램을 주면 그 프로그램과 그것이 가져오는 파일도 실행 파일 안에 들어가, 실행 파일이 곧 그 프로그램이 됩니다. 패키지 크레이트는 `crate-type = ["cdylib", "rlib"]`이어야 하고(같은 코드가 동적·정적 둘 다), 빌드에는 Haru 소스(`haru`를 빌드한 위치나 `$HARU_SRC`)가 필요합니다.
+
 ### 3.5 매니페스트: `haru.toml`
 
-주석을 쓸 수 있는 TOML. 이름·버전·의존성(최소 버전 선택 MVS는 Hana에서 검증된 방식이라 유지)·소스 진입점·네이티브(플랫폼별 미리 빌드 파일 + sha256, 또는 `crate = "native/"`로 소스 빌드). 함수 이름표는 매니페스트가 아니라 모듈 서술자에 있습니다 — 한 곳에만 두기 위해서입니다.
+주석을 쓸 수 있는 TOML. 이름·버전·의존성(최소 버전 선택 MVS는 Hana에서 검증된 방식이라 유지)·소스 진입점·네이티브(플랫폼별 미리 빌드 파일 + sha256, 또는 `crate = "native/"`로 소스 빌드). 함수 이름표는 매니페스트가 아니라 모듈 서술자에 있습니다 — 한 곳에만 두기 위해서입니다. 형식은 `crates/cli/src/manifest.rs` 머리 주석에 있습니다.
+
+**Haru 전용**(2026-09-26 결정): Haru는 Hana의 `hana.json`·`hana-lock.json`·`hana.pkg.json`·`~/.hana/pkg`를 읽지 않고, Hana의 JSON 네이티브 ABI(Go DLL)도 불러오지 않습니다. 언어가 같으니 **소스만으로 된 패키지는 두 런타임에서 그대로** 돌고(기본 진입점 `hari/index.hr`·`kanade/index.knd`는 둘 다 같음), 네이티브 부분만 런타임별로 따로 둡니다.
+
+- **도구**: `haru init | add <경로>[@버전] [--allow-build] | install | remove | list`. 버전은 저장소의 git 태그(`v1.2.0`), 선택은 `haru.lock`(버전 + 커밋), 캐시는 `~/.haru/pkg/<호스트>/<소유자>/<저장소>@<버전>`(`$HARU_HOME`). `haru run`은 아무것도 내려받거나 빌드하지 않습니다. git의 설정(자격 증명, `insteadOf`)이 그대로 통합니다.
+- **네이티브 준비**: 미리 빌드한 파일은 `url`에서 받아 sha256을 확인하고, `crate`는 `cargo build`로 빌드해 `<패키지>/.haru/native/<플랫폼>/`에 둡니다. 빌드는 크레이트의 코드를 실행하므로 프로젝트가 믿는 패키지(`trusted-builds`, `haru add --allow-build`)만 빌드합니다. 프로젝트 자신의 `packages/*`와 `[replace]` 폴더는 믿는 것으로 봅니다.
+- **찾는 순서** (`crates/cli/src/packages.rs`): `haru build`로 링크한 패키지 → 패키지 폴더(git 경로면 `[replace]` 폴더나 잠금 버전의 캐시, 아니면 `./packages`, `$HARU_PACKAGES`, `haru` 옆 `packages/`) → Haru에 딸린 패키지(timezone) → 표준 모듈. Hana처럼 폴더가 같은 이름의 딸린 패키지를 가립니다.
+- **가져오기 해석** (VM, Hana의 `importBuiltin` 순서): `<네이티브_이름>` 항목은 패키지 네이티브 모듈의 함수 id로, 나머지는 이 언어의 소스 진입점에서(없으면 다른 언어용만 있을 때 `ImportUnsupportedLocale`), 소스가 없으면 네이티브 모듈이 이름표로 내보낸 이름에서. 가져온 모듈이 가진 네이티브 함수 변수는 가져온 쪽으로도 들어옵니다(Hana의 `injectNatives`). 오류 코드는 Hana와 같고, `ImportPackageNotInstalled` 문구만 `haru install`을 가리킵니다.
 
 ### 3.6 소스 패키지와 캐시
 
-하리/카나데 소스 모듈은 처음 로드할 때 바이트코드로 컴파일하고 `~/.haru/cache/<소스 해시>.hrc`에 둡니다. 다음 임포트는 파싱·컴파일을 건너뜁니다. 한 패키지 안에서 소스와 네이티브를 섞을 수 있습니다(네이티브로 핵심을, 소스로 편의 함수를).
+한 패키지 안에서 소스와 네이티브를 섞을 수 있습니다(네이티브로 핵심을, 소스로 편의 함수를). Haru에 딸린 timezone이 그 예입니다: `packages/timezone/`은 Hana와 같은 `hari/index.hr`·`kanade/index.knd`와, haru-sdk로 쓴 네이티브 크레이트(IANA DB는 jiff)로 된 보통의 Haru 패키지이고, `haru`는 그것을 정적으로 링크하고 소스를 내장합니다.
+
+(계획) 소스 모듈을 바이트코드로 캐시(`~/.haru/cache/<소스 해시>.hrc`)하는 것은 아직 하지 않았습니다 — 지금은 컴파일이 실행보다 훨씬 짧아서 이득이 작습니다.
 
 ## 4. 네이티브 ABI v1
 
@@ -156,8 +167,8 @@ VM은 core가 커지면 떼어 냅니다.
   - **함수 값 출력**: 사용자 함수를 출력하면 Hana처럼 선언의 `String()` 모양(`func 이름() {…}`)이 나옵니다(`ast.rs`의 `go_string`).
   - **실행 옵션**: `haru run --allow-file=false --allow-net=false`.
   - **검증**: `tools/fuzz/stdfuzz.py`가 모듈 함수를 맞는/틀린 인자·콜백(오류·break·잘못된 반환·중첩 호출)으로 부르는 프로그램을 만듭니다. 모듈별 2,000~3,000개와 전체 섞음 모두 Hana와 같고, 파일·소켓·HTTP는 시나리오(로컬 HTTP 서버의 비정상 응답 포함)로 비교했습니다.
-- **M5**: 패키지 매니저(`haru add/install`), `haru build --with`, Hana 패키지(timezone, http_server)의 네이티브 부분을 Rust로.
-- **M6**: 리소스·이벤트 큐, 순환 수집기.
+- **M5 (완료)**: 패키지(§3.4~3.6). core의 가져오기가 `Packages` 해석기(CLI가 제공)를 통해 표준 모듈·딸린 패키지·로컬/설치 패키지를 같은 모양(소스 진입점 + 네이티브 모듈 + 실패 코드)으로 받습니다. 패키지 도구와 `haru build`, timezone 이식. 검증: timezone을 쓰는 말뭉치 10개와 timezone 무작위 2,000개(래퍼와 `<네이티브_*>` 직접 호출, 잘못된 인자 포함)가 Hana와 같음; `hana.pkg.json`을 쓰는 모듈 시나리오 3개는 `haru.toml`로 바꾼 복사본이 Hana 원본과 같음; 로컬 git 저장소로 `init → add → run`, MVS, 신뢰 전·후의 네이티브 크레이트, 새 캐시의 `install`, 다른 폴더에서 도는 `haru build` 결과물을 확인했습니다. http_server는 M6으로 미룹니다(콜백을 다른 스레드에서 부르는 서버라 이벤트 큐 위에 올립니다).
+- **M6**: 리소스·이벤트 큐, 순환 수집기, http_server.
 
 ## 8. 아직 정하지 않은 것
 
