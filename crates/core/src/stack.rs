@@ -59,7 +59,23 @@ impl<T> Stack<T> {
 
     #[inline]
     pub fn truncate(&mut self, len: usize) {
-        self.edit(|s| s.truncate(len));
+        if len >= self.len {
+            return;
+        }
+        let old = self.len;
+        // Shorter first: a drop that panics leaks the rest instead of
+        // dropping it twice.
+        self.len = len;
+        unsafe { std::ptr::drop_in_place(std::slice::from_raw_parts_mut(self.ptr.add(len), old - len)) };
+    }
+
+    /// Drops the last item where it is.
+    #[inline]
+    pub(crate) fn drop_last(&mut self) {
+        if self.len > 0 {
+            self.len -= 1;
+            unsafe { std::ptr::drop_in_place(self.ptr.add(self.len)) };
+        }
     }
 
     pub(crate) fn extend(&mut self, items: impl IntoIterator<Item = T>) {
@@ -92,7 +108,17 @@ impl<T> Stack<T> {
 impl<T: Clone> Stack<T> {
     #[inline]
     pub(crate) fn resize(&mut self, len: usize, v: T) {
-        self.edit(|s| s.resize(len, v));
+        if len <= self.len {
+            self.truncate(len);
+        } else if len <= self.cap {
+            // Room already: write the new items in place.
+            for i in self.len..len {
+                unsafe { self.ptr.add(i).write(v.clone()) };
+                self.len = i + 1;
+            }
+        } else {
+            self.edit(|s| s.resize(len, v));
+        }
     }
 }
 

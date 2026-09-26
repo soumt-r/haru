@@ -723,11 +723,18 @@ impl<'p> Vm<'p> {
         }
         let base = self.stack.len();
         self.stack.resize(base + proto.nregs as usize, Value::UNDEF);
+        // The arguments move into the new registers; the compiler keeps
+        // slots and metas inside the frame and the arguments below it. (A
+        // repeated parameter name shares a slot: what was there is released.)
+        let sp = self.stack.as_mut_ptr();
         for (i, p) in proto.params.iter().enumerate().take(argc as usize) {
-            let v = std::mem::replace(&mut self.stack[arg_base + i], Value::UNDEF);
-            self.stack[base + p.slot as usize] = v;
-            if let Some(m) = p.meta {
-                self.stack[base + m as usize] = meta_value(p.ty, false);
+            debug_assert!(arg_base + i < base && (p.slot as usize) < proto.nregs as usize);
+            unsafe {
+                let v = sp.add(arg_base + i).replace(Value::UNDEF);
+                drop(sp.add(base + p.slot as usize).replace(v));
+                if let Some(m) = p.meta {
+                    drop(sp.add(base + m as usize).replace(meta_value(p.ty, false)));
+                }
             }
         }
         let depth = self.depth;
@@ -2100,13 +2107,16 @@ impl<'p> Vm<'p> {
     /// caller, as Hana checks it after the body.
     #[inline]
     fn finish_call(&mut self, v: Value, fell_off: bool) -> Flow<()> {
-        let frame = self.frames.pop().unwrap();
-        self.stack.truncate(frame.base);
-        if frame.counted {
+        // What it needs of the frame, which then goes where it is.
+        let f = self.frames.last().unwrap();
+        let (base, counted, proto_id, post, ret) = (f.base, f.counted, f.proto, f.post, f.ret);
+        self.frames.drop_last();
+        self.stack.truncate(base);
+        if counted {
             self.depth -= 1;
         }
-        let proto = &self.prog.protos[frame.proto as usize];
-        let result = match frame.post {
+        let proto = &self.prog.protos[proto_id as usize];
+        let result = match post {
             Post::Discard => return Ok(()),
             Post::ModuleInit(m) => {
                 self.module_state[m as usize] = ModState::Loaded;
@@ -2134,7 +2144,7 @@ impl<'p> Vm<'p> {
             Post::Equals { neg: false } => v,
         };
         let caller = self.frames.last().unwrap();
-        self.stack[caller.base + frame.ret as usize] = result;
+        self.stack[caller.base + ret as usize] = result;
         Ok(())
     }
 
