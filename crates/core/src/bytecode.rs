@@ -68,6 +68,10 @@ pub enum BinOp {
 }
 
 impl BinOp {
+    pub fn is_comparison(self) -> bool {
+        matches!(self, BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le)
+    }
+
     pub fn symbol(self) -> &'static str {
         match self {
             BinOp::Add => "+",
@@ -169,6 +173,11 @@ pub enum Op {
     /// fails for values without members, or lets the key be computed.
     Member { dst: Reg, obj: Reg, name: u32, skip: u32 },
     Index { dst: Reg, obj: Reg, key: Reg },
+    /// A comparison of two registers and the jump on its being false, in one
+    /// (a condition of 만약 / 동안 반복).
+    CmpJump { op: BinOp, a: Reg, b: Reg, to: u32 },
+    /// `CmpJump` against a constant.
+    CmpKJump { op: BinOp, a: Reg, k: u32, to: u32 },
     /// `Index` with a constant key (`'표'의 "가"`).
     IndexK { dst: Reg, obj: Reg, k: u32 },
     /// Where a failed key computation lands (a list or string reports its own error).

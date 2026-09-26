@@ -1166,13 +1166,35 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         }
     }
 
+    /// The jump when the condition just computed into `cond` is false. A
+    /// comparison that ends the condition jumps by itself instead of making a
+    /// boolean first (its register is the condition's own, read by nothing else).
+    fn jump_if_false(&mut self, cond: Reg) -> usize {
+        let fused = match self.code.last() {
+            Some(&Op::BinK { op, dst, a, k }) if dst == cond && op.is_comparison() => Some(Op::CmpKJump { op, a, k, to: 0 }),
+            Some(&Op::Bin { op, dst, a, b }) if dst == cond && op.is_comparison() => Some(Op::CmpJump { op, a, b, to: 0 }),
+            _ => None,
+        };
+        match fused {
+            Some(op) => {
+                self.code.pop();
+                self.emit(op)
+            }
+            None => self.emit(Op::JumpIfFalse { cond, to: 0 }),
+        }
+    }
+
     fn here(&self) -> u32 {
         self.code.len() as u32
     }
 
     fn patch_jump(&mut self, at: usize, target: u32) {
         match &mut self.code[at] {
-            Op::Jump { to } | Op::JumpIfFalse { to, .. } | Op::JumpIfTrue { to, .. } => *to = target,
+            Op::Jump { to }
+            | Op::JumpIfFalse { to, .. }
+            | Op::JumpIfTrue { to, .. }
+            | Op::CmpJump { to, .. }
+            | Op::CmpKJump { to, .. } => *to = target,
             Op::RangeTest { exit, .. } | Op::IterNext { exit, .. } => *exit = target,
             Op::ArgGiven { skip, .. } | Op::Member { skip, .. } | Op::SetMember { skip, .. } => *skip = target,
             Op::SetIndexFail { skip, .. } => *skip = target,
@@ -1308,7 +1330,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             Stmt::If { condition, consequent, alternate } => {
                 let r = self.alloc();
                 self.expr_to(condition, r);
-                let jf = self.emit(Op::JumpIfFalse { cond: r, to: 0 });
+                let jf = self.jump_if_false(r);
                 self.next_reg = mark;
                 self.stmts(&consequent.statements);
                 match alternate {
@@ -1774,7 +1796,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         let top = self.here();
         let c = self.alloc();
         self.expr_to(condition, c);
-        let jf = self.emit(Op::JumpIfFalse { cond: c, to: 0 });
+        let jf = self.jump_if_false(c);
         let (from, to) = self.open_scope(&[], &body.statements);
         if to > from {
             self.emit(Op::Undef { from, to });

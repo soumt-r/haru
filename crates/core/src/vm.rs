@@ -580,6 +580,7 @@ impl<'p> Vm<'p> {
     /// Starts a function. The arguments are in `arg_base..arg_base+argc`
     /// (absolute stack positions); the caller's pc must already be saved.
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     fn call_proto(
         &mut self,
         proto_id: u32,
@@ -628,6 +629,7 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    #[inline]
     fn call_plain(&mut self, proto: u32, arg_base: usize, argc: u16, ret: Reg) -> Flow<()> {
         self.call_proto(proto, arg_base, argc, ret, Value::UNDEF, NONE, Post::Value, true)
     }
@@ -844,7 +846,14 @@ impl<'p> Vm<'p> {
                             (Some(x), Some(y), BinOp::Sub) => boxed(x - y),
                             _ => tri!(self.slow_binary(op, &reg!(a), &reg!(b))),
                         };
-                        tri!(self.assign(var, fi, result));
+                        // A variable of one slot without a type or 고정: it was
+                        // just read, so it exists; store straight into it.
+                        let v = &prog.vars[var as usize];
+                        match v.slots.as_slice() {
+                            [Slot { loc: Loc::Reg(r), meta: None }] => reg!(*r) = result,
+                            [Slot { loc: Loc::Global(g), meta: None }] => self.globals[*g as usize] = result,
+                            _ => tri!(self.assign(var, fi, result)),
+                        }
                     }
                     Op::Undef { from, to } => {
                         for r in from..to {
@@ -890,6 +899,26 @@ impl<'p> Vm<'p> {
                     }
                     Op::UnknownOp { k } => fail!(err(UNKNOWN_OPERATOR).arg(prog.consts[k as usize].clone())),
                     Op::Jump { to } => pc = to as usize,
+                    Op::CmpJump { op, a, b, to } => {
+                        let (x, y) = (&reg!(a), &reg!(b));
+                        let t = match (x.as_num(), y.as_num()) {
+                            (Some(x), Some(y)) => compare(op, x, y),
+                            _ => tri!(self.slow_condition(op, x, y)),
+                        };
+                        if !t {
+                            pc = to as usize;
+                        }
+                    }
+                    Op::CmpKJump { op, a, k, to } => {
+                        let (x, y) = (&reg!(a), &prog.consts[k as usize]);
+                        let t = match (x.as_num(), y.as_num()) {
+                            (Some(x), Some(y)) => compare(op, x, y),
+                            _ => tri!(self.slow_condition(op, x, y)),
+                        };
+                        if !t {
+                            pc = to as usize;
+                        }
+                    }
                     Op::JumpIfFalse { cond, to } => {
                         let v = &reg!(cond);
                         match v.as_bool() {
@@ -1826,6 +1855,7 @@ impl<'p> Vm<'p> {
     /// Returns from the running function with `v` (`fell_off`: its body
     /// ended without `돌려주자`). The declared return type is checked in the
     /// caller, as Hana checks it after the body.
+    #[inline]
     fn finish_call(&mut self, v: Value, fell_off: bool) -> Flow<()> {
         let frame = self.frames.pop().unwrap();
         self.stack.truncate(frame.base);
@@ -1863,6 +1893,12 @@ impl<'p> Vm<'p> {
         let caller = self.frames.last().unwrap();
         self.stack[caller.base + frame.ret as usize] = result;
         Ok(())
+    }
+
+    /// A comparison of values that are not both numbers, as a condition.
+    fn slow_condition(&self, op: BinOp, x: &Value, y: &Value) -> Result<bool, RuntimeError> {
+        let v = self.slow_binary(op, x, y)?;
+        v.as_bool().ok_or_else(|| err(NOT_BOOLEAN).str_arg(self.describe(&v)))
     }
 
     fn slow_binary(&self, op: BinOp, x: &Value, y: &Value) -> Result<Value, RuntimeError> {
@@ -2141,6 +2177,17 @@ fn conflict(source: &str, class: &str, theirs: &str) -> RuntimeError {
         err(CLASS_CONFLICT_OWN).str_arg(source).str_arg(class)
     } else {
         err(CLASS_CONFLICT).str_arg(source).str_arg(class).str_arg(theirs)
+    }
+}
+
+/// A comparison of two numbers.
+#[inline(always)]
+fn compare(op: BinOp, x: f64, y: f64) -> bool {
+    match op {
+        BinOp::Gt => x > y,
+        BinOp::Lt => x < y,
+        BinOp::Ge => x >= y,
+        _ => x <= y,
     }
 }
 
