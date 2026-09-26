@@ -854,11 +854,19 @@ impl<'p> Vm<'p> {
             }
             let frame = &self.frames[fi];
             let proto = &prog.protos[frame.proto as usize];
-            self.ns = frame.ns;
-            self.lang = self.namespaces[frame.ns as usize].lang;
+            // (A namespace's language never changes.)
+            if frame.ns != self.ns {
+                self.ns = frame.ns;
+                self.lang = self.namespaces[frame.ns as usize].lang;
+            }
             let code = &proto.code[..];
             let base = frame.base;
             let mut pc = frame.pc;
+            // A call that passed every argument skips the prologue (each
+            // `ArgGiven` would jump on).
+            if pc == 0 && !STEP && frame.argc as usize == proto.params.len() {
+                pc = proto.body as usize;
+            }
 
             // Registers are below the frame's size (the compiler counts them)
             // and the stack holds every frame: no bounds check per access. The

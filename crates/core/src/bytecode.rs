@@ -339,6 +339,9 @@ pub struct Proto {
     pub code: Vec<Op>,
     pub nregs: Reg,
     pub params: Vec<Param>,
+    /// Where the body starts after the parameter prologue: a call that
+    /// passes every argument starts there (each `ArgGiven` would jump on).
+    pub body: u32,
     pub return_type: u32,
     pub loops: Vec<LoopRange>,
     pub handlers: Vec<Handler>,

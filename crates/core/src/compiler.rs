@@ -610,6 +610,7 @@ fn placeholder(name: &str, module: u32) -> Proto {
         code: Vec::new(),
         nregs: 0,
         params: Vec::new(),
+        body: 0,
         return_type: 0,
         loops: Vec::new(),
         handlers: Vec::new(),
@@ -962,6 +963,8 @@ struct FnCompiler<'c, 'a> {
     is_main: bool,
     /// `마무리는 항상` blocks around the code being compiled.
     finally_depth: u32,
+    /// Where the body starts after the parameter prologue.
+    body: u32,
 }
 
 impl<'c, 'a> FnCompiler<'c, 'a> {
@@ -980,6 +983,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             has_this,
             is_main: false,
             finally_depth: 0,
+            body: 0,
         }
     }
 
@@ -991,6 +995,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             code: self.code,
             nregs: self.max_reg,
             params,
+            body: self.body,
             return_type,
             loops: self.loop_ranges,
             handlers: self.handlers,
@@ -1120,6 +1125,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
                 let here = self.here();
                 self.patch_jump(at, here);
             }
+            self.body = self.here();
             // A parameter's slot is defined from here on, unless another
             // name's declaration shares it (a repeated parameter name).
             for (p, ast_p) in params.iter().zip(params_ast) {
