@@ -197,6 +197,13 @@ pub enum Op {
     CmpJump { op: BinOp, a: Reg, b: Reg, to: u32 },
     /// `CmpJump` against a constant.
     CmpKJump { op: BinOp, a: Reg, k: u32, to: u32 },
+    /// `'표'의 "가"` for a dictionary that has the key: its value, and on at
+    /// `skip`. Anything else goes on to the instructions after it (the
+    /// member read, the key, their errors).
+    DictK { dst: Reg, obj: Reg, k: u32, skip: u32 },
+    /// `'표'의 "가"를 ...로 정하자` for a dictionary, then on at `skip`;
+    /// anything else goes on to the instructions after it.
+    DictSetK { obj: Reg, k: u32, val: Reg, skip: u32 },
     /// `Index` with a constant key (`'표'의 "가"`).
     IndexK { dst: Reg, obj: Reg, k: u32 },
     /// Where a failed key computation lands (a list or string reports its own error).

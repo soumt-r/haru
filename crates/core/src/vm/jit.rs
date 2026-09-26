@@ -1931,6 +1931,8 @@ impl<'a, 'b> Gen<'a, 'b> {
                 false => self.call_op(i),
             },
             Op::CallMethod { .. } => self.call_via(i, h_method_start as usize, h_step as usize),
+            Op::DictK { dst, obj, k, skip } => self.dict_k(i, Some(dst), obj, k, None, skip),
+            Op::DictSetK { obj, k, val, skip } => self.dict_k(i, None, obj, k, Some(val), skip),
             Op::SelfOr { dst, .. } => self.self_or(i, dst),
             Op::Index { dst, obj, key } => {
                 let k = self.addr(At::Reg(key));
@@ -2614,6 +2616,33 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.jump_next(i);
     }
 
+    /// `DictK` (`dst`) / `DictSetK` (`val`): a dictionary through its
+    /// helper and on at `skip`; anything else (or a key not there) on to the
+    /// next instruction.
+    fn dict_k(&mut self, i: usize, dst: Option<Reg>, obj: Reg, k: u32, val: Option<Reg>, skip: u32) {
+        let next = self.next(i);
+        let oa = self.addr(At::Reg(obj));
+        let t = self.tag_of(oa);
+        let is_dict = self.is_tag(t, tag::DICT as i64);
+        let go = self.b.create_block();
+        self.b.ins().brif(is_dict, go, &[], next, &[]);
+        self.switch(go);
+        let ka = self.b.ins().iconst(self.ptr, &self.prog.consts[k as usize] as *const Value as i64);
+        let r = match (dst, val) {
+            (Some(dst), _) => {
+                let d = self.addr(At::Reg(dst));
+                self.call(self.sigs.three_ptr, h_dict_get as usize, &[d, oa, ka]).unwrap()
+            }
+            (None, Some(val)) => {
+                let va = self.addr(At::Reg(val));
+                self.call(self.sigs.three_ptr, h_dict_set as usize, &[oa, ka, va]).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let skip = self.blocks[skip as usize];
+        self.b.ins().brif(r, next, &[], skip, &[]);
+    }
+
     /// `'나'`: the frame's object when it has one (else `h_op`).
     fn self_or(&mut self, i: usize, dst: Reg) {
         let fallback = self.direct_block(i);
@@ -3026,7 +3055,9 @@ fn native(op: &Op, prog: &Program) -> bool {
         | Op::NewObj { .. }
         | Op::InitField { .. }
         | Op::CallCtor { .. }
-        | Op::CallName { .. } => true,
+        | Op::CallName { .. }
+        | Op::DictK { .. }
+        | Op::DictSetK { .. } => true,
         _ => false,
     }
 }

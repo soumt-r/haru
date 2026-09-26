@@ -1215,6 +1215,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             Op::RangeTest { exit, .. } | Op::IterNext { exit, .. } => *exit = target,
             Op::ArgGiven { skip, .. } | Op::Member { skip, .. } | Op::SetMember { skip, .. } => *skip = target,
             Op::SetIndexFail { skip, .. } | Op::UpdateK { skip, .. } => *skip = target,
+            Op::DictK { skip, .. } | Op::DictSetK { skip, .. } => *skip = target,
             other => panic!("not a jump: {other:?}"),
         }
     }
@@ -1521,6 +1522,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
                     Expr::Identifier(n) => self.c.name(n),
                     _ => NONE,
                 };
+                let dict = self.literal_key(property).map(|k| self.emit(Op::DictSetK { obj, k, val, skip: 0 }));
                 let set = self.emit(Op::SetMember { obj, val, name, skip: 0 });
                 let key = self.alloc();
                 let start = self.here();
@@ -1544,6 +1546,9 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
                 self.patch_jump(set, here);
                 self.patch_jump(done, here);
                 self.patch_jump(fail, here);
+                if let Some(at) = dict {
+                    self.patch_jump(at, here);
+                }
             }
             _ => {} // Hana ignores other targets
         }
@@ -2037,6 +2042,8 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             }
             _ => NONE,
         };
+        // A literal key: a dictionary's value first, in one instruction.
+        let dict = self.literal_key(property).map(|k| self.emit(Op::DictK { dst, obj, k, skip: 0 }));
         let pre = self.emit(Op::Member { dst, obj, name, skip: 0 });
         let key = self.alloc();
         let start = self.here();
@@ -2060,6 +2067,18 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         let here = self.here();
         self.patch_jump(pre, here);
         self.patch_jump(done, here);
+        if let Some(at) = dict {
+            self.patch_jump(at, here);
+        }
+    }
+
+    /// A string or number literal as a key constant.
+    fn literal_key(&mut self, e: &Expr) -> Option<u32> {
+        match e {
+            Expr::Str(raw) => Some(self.c.str_const(&unescape(raw))),
+            Expr::Number(n) => Some(self.c.num_const(if *n == 0.0 { 0.0 } else { *n })),
+            _ => None,
+        }
     }
 
     fn args(&mut self, args: &[Expr]) -> Reg {

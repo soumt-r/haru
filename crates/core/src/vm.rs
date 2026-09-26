@@ -1447,6 +1447,23 @@ impl<'p> Vm<'p> {
                         let v = tri!(self.index(&reg!(obj), &reg!(key)));
                         reg!(dst) = v;
                     }
+                    Op::DictK { dst, obj, k, skip } => {
+                        if let Some(d) = reg!(obj).as_dict() {
+                            let found = Key::view(&prog.consts[k as usize]).and_then(|key| d.map.borrow().get(key).cloned());
+                            if let Some(v) = found {
+                                reg!(dst) = v;
+                                pc = skip as usize;
+                            }
+                        }
+                    }
+                    Op::DictSetK { obj, k, val, skip } => {
+                        if reg!(obj).tag() == tag::DICT {
+                            let (o, v) = (reg!(obj).clone(), reg!(val).clone());
+                            if self.set_index(&o, prog.consts[k as usize].clone(), v).is_ok() {
+                                pc = skip as usize;
+                            }
+                        }
+                    }
                     Op::IndexK { dst, obj, k } => {
                         let v = tri!(self.index(&reg!(obj), &prog.consts[k as usize]));
                         reg!(dst) = v;
