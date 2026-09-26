@@ -169,11 +169,15 @@ pub enum Op {
     /// fails for values without members, or lets the key be computed.
     Member { dst: Reg, obj: Reg, name: u32, skip: u32 },
     Index { dst: Reg, obj: Reg, key: Reg },
+    /// `Index` with a constant key (`'표'의 "가"`).
+    IndexK { dst: Reg, obj: Reg, k: u32 },
     /// Where a failed key computation lands (a list or string reports its own error).
     IndexFail { obj: Reg, key: u32 },
     /// A member write, first half: strings refuse, other values ignore it.
     SetMember { obj: Reg, val: Reg, name: u32, skip: u32 },
     SetIndex { obj: Reg, key: Reg, val: Reg },
+    /// `SetIndex` with a constant key.
+    SetIndexK { obj: Reg, k: u32, val: Reg },
     /// Where a failed key computation of a write lands: a dictionary takes
     /// the property's name (`name`) as the key, anything else ignores it.
     SetIndexFail { obj: Reg, val: Reg, name: u32, key: u32, skip: u32 },

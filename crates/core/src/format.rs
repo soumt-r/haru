@@ -103,6 +103,9 @@ pub fn number(n: f64) -> String {
         if n > 0.0 { "+Inf" } else { "-Inf" }.to_string()
     } else if n == 0.0 {
         if n.is_sign_negative() { "-0" } else { "0" }.to_string()
+    } else if n.fract() == 0.0 && n.abs() < 1e15 {
+        // A whole number prints the same as an integer, which is much quicker.
+        (n as i64).to_string()
     } else {
         format!("{n}")
     }

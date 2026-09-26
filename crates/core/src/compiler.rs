@@ -1151,6 +1151,21 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         self.code.len() - 1
     }
 
+    /// When the key just compiled (from `start`) is a lone constant: takes the
+    /// load back and gives the constant.
+    fn constant_key(&mut self, start: u32, key: Reg) -> Option<u32> {
+        if self.code.len() != start as usize + 1 {
+            return None;
+        }
+        match *self.code.last()? {
+            Op::LoadK { dst, k } if dst == key => {
+                self.code.pop();
+                Some(k)
+            }
+            _ => None,
+        }
+    }
+
     fn here(&self) -> u32 {
         self.code.len() as u32
     }
@@ -1451,8 +1466,16 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
                 let key = self.alloc();
                 let start = self.here();
                 self.expr_to(property, key);
-                let end = self.here();
-                self.emit(Op::SetIndex { obj, key, val });
+                let mut end = self.here();
+                match self.constant_key(start, key) {
+                    Some(k) => {
+                        end = start;
+                        self.emit(Op::SetIndexK { obj, k, val });
+                    }
+                    None => {
+                        self.emit(Op::SetIndex { obj, key, val });
+                    }
+                }
                 let done = self.emit(Op::Jump { to: 0 });
                 let target = self.here();
                 let key = self.handlers.len() as u32;
@@ -1949,8 +1972,17 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         let key = self.alloc();
         let start = self.here();
         self.expr_to(property, key);
-        let end = self.here();
-        self.emit(Op::Index { dst, obj, key });
+        let mut end = self.here();
+        match self.constant_key(start, key) {
+            // A constant cannot fail to compute: nothing to protect.
+            Some(k) => {
+                end = start;
+                self.emit(Op::IndexK { dst, obj, k });
+            }
+            None => {
+                self.emit(Op::Index { dst, obj, key });
+            }
+        }
         let done = self.emit(Op::Jump { to: 0 });
         let target = self.here();
         let key = self.handlers.len() as u32;

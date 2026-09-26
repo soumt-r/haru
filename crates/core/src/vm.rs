@@ -459,13 +459,13 @@ impl<'p> Vm<'p> {
         let prog = self.prog;
         let var = &prog.vars[var_id as usize];
         if ty != 0 {
-            self.check_type(VARIABLE_TYPE, self.name(var.name), ty, &val)?;
+            self.check_type_sym(VARIABLE_TYPE, var.name, ty, &val)?;
         }
         match self.find(var, fi) {
             Some(slot) => {
                 let (declared, constant) = self.meta(slot, fi);
                 if declared != 0 && declared != ty {
-                    self.check_type(VARIABLE_TYPE, self.name(var.name), declared, &val)?;
+                    self.check_type_sym(VARIABLE_TYPE, var.name, declared, &val)?;
                 }
                 if constant {
                     return Err(err(CONSTANT).str_arg(self.name(var.name)).into());
@@ -489,7 +489,7 @@ impl<'p> Vm<'p> {
         if let Some(slot) = self.find(var, fi) {
             let (declared, constant) = self.meta(slot, fi);
             if declared != 0 {
-                self.check_type(VARIABLE_TYPE, self.name(var.name), declared, &v)?;
+                self.check_type_sym(VARIABLE_TYPE, var.name, declared, &v)?;
             }
             if constant {
                 return Err(err(CONSTANT).str_arg(self.name(var.name)).into());
@@ -497,6 +497,30 @@ impl<'p> Vm<'p> {
             self.store(slot.loc, fi, v);
         }
         Ok(())
+    }
+
+    /// `check_type` for a variable named by a symbol: the name is looked up
+    /// (a lock) only when the check fails.
+    #[inline]
+    fn check_type_sym(&self, code: &str, name: u32, ty: u32, v: &Value) -> Flow<()> {
+        if self.fits(ty, v) {
+            return Ok(());
+        }
+        self.check_type(code, self.name(name), ty, v)
+    }
+
+    /// `accepts` with the common types decided here, without a call.
+    #[inline(always)]
+    fn fits(&self, ty: u32, v: &Value) -> bool {
+        let kind = &self.prog.types[ty as usize].kind;
+        let t = v.tag();
+        match kind {
+            TypeKind::Any => true,
+            TypeKind::Number => t == tag::NUM || t == tag::NULL,
+            TypeKind::String => t == tag::STR || t == tag::NULL,
+            TypeKind::Boolean => t == tag::BOOL || t == tag::NULL,
+            _ => self.accepts(kind, v),
+        }
     }
 
     fn check_type(&self, code: &str, name: &str, ty: u32, v: &Value) -> Flow<()> {
@@ -586,7 +610,7 @@ impl<'p> Vm<'p> {
         }
         for (i, p) in proto.params.iter().enumerate().take(argc as usize) {
             if p.ty != 0 {
-                self.check_type(ARGUMENT_TYPE, self.name(p.name), p.ty, &self.stack[arg_base + i])?;
+                self.check_type_sym(ARGUMENT_TYPE, p.name, p.ty, &self.stack[arg_base + i])?;
             }
         }
         let base = self.stack.len();
@@ -794,7 +818,7 @@ impl<'p> Vm<'p> {
                                     // The result is a string: check it as the value read.
                                     let (declared, constant) = self.meta(slot, fi);
                                     if declared != 0 {
-                                        tri!(self.check_type(VARIABLE_TYPE, self.name(v.name), declared, &reg!(a)));
+                                        tri!(self.check_type_sym(VARIABLE_TYPE, v.name, declared, &reg!(a)));
                                     }
                                     if constant {
                                         fail!(err(CONSTANT).str_arg(self.name(v.name)));
@@ -1105,7 +1129,7 @@ impl<'p> Vm<'p> {
                         let p = &proto.params[index as usize];
                         let v = reg!(src).clone();
                         if p.ty != 0 {
-                            tri!(self.check_type(ARGUMENT_TYPE, self.name(p.name), p.ty, &v));
+                            tri!(self.check_type_sym(ARGUMENT_TYPE, p.name, p.ty, &v));
                         }
                         reg!(p.slot) = v;
                         if let Some(m) = p.meta {
@@ -1177,6 +1201,14 @@ impl<'p> Vm<'p> {
                         let v = tri!(self.index(&reg!(obj), &reg!(key)));
                         reg!(dst) = v;
                     }
+                    Op::IndexK { dst, obj, k } => {
+                        let v = tri!(self.index(&reg!(obj), &prog.consts[k as usize]));
+                        reg!(dst) = v;
+                    }
+                    Op::SetIndexK { obj, k, val } => {
+                        let (o, v) = (reg!(obj).clone(), reg!(val).clone());
+                        tri!(self.set_index(&o, prog.consts[k as usize].clone(), v));
+                    }
                     Op::IndexFail { obj, key } => {
                         let pending = self.take_pending(fi, key);
                         match reg!(obj).tag() {
@@ -1203,7 +1235,7 @@ impl<'p> Vm<'p> {
                                     }
                                     if let Some(&ty) = self.class(class).and_then(|c| c.field_types.get(&name)) {
                                         if ty != 0 {
-                                            tri!(self.check_type(VARIABLE_TYPE, self.name(name), ty, &v));
+                                            tri!(self.check_type_sym(VARIABLE_TYPE, name, ty, &v));
                                         }
                                     }
                                     o.as_object().unwrap().props.borrow_mut().insert(name, v);
@@ -1220,22 +1252,7 @@ impl<'p> Vm<'p> {
                     }
                     Op::SetIndex { obj, key, val } => {
                         let (o, k, v) = (reg!(obj).clone(), reg!(key).clone(), reg!(val).clone());
-                        if let Some(list) = o.as_list() {
-                            if let Some(n) = k.as_num() {
-                                let i = go_int(n) - 1;
-                                let mut items = list.items.borrow_mut();
-                                if i >= 0 && (i as usize) < items.len() {
-                                    items[i as usize] = v;
-                                }
-                            }
-                        } else if let Some(d) = o.as_dict() {
-                            match Key::new(k) {
-                                Some(k) => {
-                                    d.map.borrow_mut().insert(k, v);
-                                }
-                                None => fail!(err(UNSUPPORTED).str_arg("dictionary as a key")),
-                            }
-                        }
+                        tri!(self.set_index(&o, k, v));
                     }
                     Op::SetIndexFail { obj, val, name, key, skip } => {
                         self.take_pending(fi, key);
@@ -1305,7 +1322,8 @@ impl<'p> Vm<'p> {
                         reg!(dst) = Value::string(text);
                     }
                     Op::Concat { dst, base: b, n } => {
-                        let mut s = String::new();
+                        let len: usize = (0..n as usize).map(|i| reg!(b as usize + i).as_str().map_or(0, str::len)).sum();
+                        let mut s = String::with_capacity(len);
                         for i in 0..n as usize {
                             s.push_str(reg!(b as usize + i).as_str().unwrap_or(""));
                         }
@@ -1345,7 +1363,7 @@ impl<'p> Vm<'p> {
                     Op::InitField { obj, name, src, ty } => {
                         let v = std::mem::replace(&mut reg!(src), Value::UNDEF);
                         if ty != 0 {
-                            tri!(self.check_type(VARIABLE_TYPE, self.name(name), ty, &v));
+                            tri!(self.check_type_sym(VARIABLE_TYPE, name, ty, &v));
                         }
                         reg!(obj).as_object().unwrap().props.borrow_mut().insert(name, v);
                     }
@@ -1822,14 +1840,14 @@ impl<'p> Vm<'p> {
                 return Ok(());
             }
             Post::Capture => {
-                if proto.return_type != 0 {
+                if proto.return_type != 0 && !self.fits(proto.return_type, &v) {
                     self.check_type(RETURN_TYPE, &proto.name, proto.return_type, &v)?;
                 }
                 self.captured = Some(v);
                 return Ok(());
             }
             Post::Value => {
-                if proto.return_type != 0 {
+                if proto.return_type != 0 && !self.fits(proto.return_type, &v) {
                     self.check_type(RETURN_TYPE, &proto.name, proto.return_type, &v)?;
                 }
                 v
@@ -1860,6 +1878,28 @@ impl<'p> Vm<'p> {
             }
         }
         Err(err(OPERAND_TYPES).str_arg(op.symbol()).str_arg(self.describe(x)).str_arg(self.describe(y)))
+    }
+
+    /// A write through `의` with a computed key: a list's element in range, a
+    /// dictionary's entry; other values ignore it.
+    fn set_index(&self, o: &Value, k: Value, v: Value) -> Result<(), RuntimeError> {
+        if let Some(list) = o.as_list() {
+            if let Some(n) = k.as_num() {
+                let i = go_int(n) - 1;
+                let mut items = list.items.borrow_mut();
+                if i >= 0 && (i as usize) < items.len() {
+                    items[i as usize] = v;
+                }
+            }
+        } else if let Some(d) = o.as_dict() {
+            match Key::new(k) {
+                Some(k) => {
+                    d.map.borrow_mut().insert(k, v);
+                }
+                None => return Err(err(UNSUPPORTED).str_arg("dictionary as a key")),
+            }
+        }
+        Ok(())
     }
 
     fn index(&self, o: &Value, k: &Value) -> Result<Value, RuntimeError> {
