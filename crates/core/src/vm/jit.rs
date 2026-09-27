@@ -140,12 +140,59 @@ enum State {
     Ready(Code),
 }
 
-/// A function's IR for the compiling thread.
+/// A function for the compiling thread to build and compile.
 struct Job {
     proto: u32,
-    func: cranelift_codegen::ir::Function,
-    /// With the optimizer (it has loops in registers).
-    optimized: bool,
+    /// The program (alive while the Jit is: see `Jit::alive`). Only read
+    /// there; nothing of it is cloned (its values count references).
+    prog: *const Program,
+    /// The function's inline caches (their addresses go into the code).
+    ics: *mut Ic,
+}
+
+// The pointers stay valid while the Jit lives, which `Jit::alive` makes sure
+// of for as long as the compiling thread reads through them.
+unsafe impl Send for Job {}
+
+/// What building a function's IR needs of the Jit: plain values, and the
+/// address of the code table (which does not move while the Jit lives).
+#[derive(Clone)]
+struct Setup {
+    ptr: types::Type,
+    cc: cranelift_codegen::isa::CallConv,
+    sig: Signature,
+    table: *const usize,
+    inline_rc: bool,
+    off_props: usize,
+    off_items: usize,
+}
+
+unsafe impl Send for Setup {}
+
+/// Builds function `proto_id`'s IR into `func`: whether it has loops in
+/// registers (to be compiled with the optimizer), or None when it is not to
+/// be compiled.
+fn build_function(func: &mut cranelift_codegen::ir::Function, fctx: &mut FunctionBuilderContext, proto_id: u32, prog: &Program, s: &Setup, ics: *mut Ic) -> Option<bool> {
+    let proto = &prog.protos[proto_id as usize];
+    if proto.code.is_empty() || std::env::var_os("HARU_JIT_SKIP").is_some_and(|v| v.to_str() == Some(&proto.name)) {
+        return None;
+    }
+    func.signature = s.sig.clone();
+    let has_loops = {
+        let b = FunctionBuilder::new(func, fctx);
+        Gen::new(b, s.ptr, s.cc, proto, prog, s.table, s.inline_rc, s.off_props, s.off_items, ics).build()
+    };
+    if std::env::var_os("HARU_JIT_DEBUG").is_some() {
+        eprintln!(
+            "  {} blocks, {} insts, {} regs, {}/{} ops native",
+            func.dfg.num_blocks(),
+            func.dfg.num_insts(),
+            proto.nregs,
+            proto.code.iter().filter(|op| native(op, prog)).count(),
+            proto.code.len()
+        );
+    }
+    Some(has_loops && std::env::var_os("HARU_JIT_OPT").is_none())
 }
 
 /// What came back: the machine code and its alignment, or why not.
@@ -165,15 +212,38 @@ struct Worker {
 }
 
 impl Worker {
-    fn start(plain: cranelift_codegen::isa::OwnedTargetIsa, optimized: cranelift_codegen::isa::OwnedTargetIsa) -> Option<Worker> {
+    fn start(
+        plain: cranelift_codegen::isa::OwnedTargetIsa,
+        optimized: cranelift_codegen::isa::OwnedTargetIsa,
+        setup: Setup,
+        alive: std::sync::Arc<std::sync::Mutex<bool>>,
+    ) -> Option<Worker> {
         let (jobs, inbox) = std::sync::mpsc::channel::<Job>();
         let (outbox, done) = std::sync::mpsc::channel::<Compiled>();
         std::thread::Builder::new()
             .name("haru-jit".into())
             .spawn(move || {
+                let mut fctx = FunctionBuilderContext::new();
                 for job in inbox {
-                    let isa = if job.optimized { &*optimized } else { &*plain };
-                    let mut ctx = Context::for_function(job.func);
+                    // The IR, reading the program: only while the Jit (and so
+                    // the program) is there.
+                    let built = {
+                        let alive = alive.lock().unwrap_or_else(|e| e.into_inner());
+                        if !*alive {
+                            break;
+                        }
+                        let mut func = cranelift_codegen::ir::Function::new();
+                        let prog = unsafe { &*job.prog };
+                        build_function(&mut func, &mut fctx, job.proto, prog, &setup, job.ics).map(|o| (func, o))
+                    };
+                    let Some((func, optimized_code)) = built else {
+                        if outbox.send(Compiled { proto: job.proto, code: Err("not compiled".to_string()) }).is_err() {
+                            break;
+                        }
+                        continue;
+                    };
+                    let isa = if optimized_code { &*optimized } else { &*plain };
+                    let mut ctx = Context::for_function(func);
                     let code = match ctx.compile(isa, &mut Default::default()) {
                         // No relocations: helpers are called by address and
                         // constants live in the code.
@@ -266,6 +336,18 @@ pub(super) struct Jit {
     ctx: Context,
     fctx: FunctionBuilderContext,
     states: Vec<State>,
+    /// True while the Jit (and the program it compiles) is there: the
+    /// compiling thread builds IR only while holding it (see `Drop`).
+    alive: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+impl Drop for Jit {
+    /// Waits for the compiling thread to finish reading the program (it
+    /// holds the lock while it builds a function's IR), and tells it to
+    /// read no more.
+    fn drop(&mut self) {
+        *self.alive.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    }
 }
 
 impl Jit {
@@ -290,20 +372,21 @@ impl Jit {
         // Functions with loops in registers: the optimizer takes the checks
         // and moves the copy repeats out of their loops.
         let loop_isa = isa_with("speed")?;
-        // Threshold 0 (tests) compiles each function before it first runs.
-        let worker = match threshold > 0 && std::env::var_os("HARU_JIT_SYNC").is_none() {
-            true => Worker::start(isa.clone(), loop_isa.clone()),
-            false => None,
-        };
-        let module = JITModule::new(JITBuilder::with_isa(isa, cranelift_module::default_libcall_names()));
+        let module = JITModule::new(JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names()));
         let ctx = module.make_context();
         // Compiled code writes `Post::Value` as 0.
         if unsafe { *(&Post::Value as *const Post as *const u32) } != 0 {
             return None;
         }
-        Some(Jit {
-            loop_isa,
-            worker,
+        let table = vec![0; protos].into_boxed_slice();
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(module.target_config().pointer_type()));
+        sig.returns.push(AbiParam::new(types::I32));
+        let setup = Setup {
+            ptr: module.target_config().pointer_type(),
+            cc: module.isa().default_call_conv(),
+            sig,
+            table: table.as_ptr(),
             inline_rc: rc_layout_holds() && std::env::var_os("HARU_JIT_NO_INLINE_RC").is_none(),
             off_props: {
                 let o = ObjObj { class: 0, props: Default::default() };
@@ -313,8 +396,21 @@ impl Jit {
                 let l = crate::value::ListObj { items: Default::default() };
                 l.items.as_ptr() as usize - &l as *const crate::value::ListObj as usize
             },
+        };
+        let alive = std::sync::Arc::new(std::sync::Mutex::new(true));
+        // Threshold 0 (tests) compiles each function before it first runs.
+        let worker = match threshold > 0 && std::env::var_os("HARU_JIT_SYNC").is_none() {
+            true => Worker::start(isa, loop_isa.clone(), setup.clone(), alive.clone()),
+            false => None,
+        };
+        Some(Jit {
+            loop_isa,
+            worker,
+            inline_rc: setup.inline_rc,
+            off_props: setup.off_props,
+            off_items: setup.off_items,
             ics: (0..protos).map(|_| Box::default()).collect(),
-            table: vec![0; protos].into_boxed_slice(),
+            table,
             counts: vec![0; protos],
             threshold,
             natives: (0..protos).map(|_| Box::default()).collect(),
@@ -322,6 +418,7 @@ impl Jit {
             ctx,
             fctx: FunctionBuilderContext::new(),
             states: (0..protos).map(|_| State::Untried).collect(),
+            alive,
         })
     }
 
@@ -357,20 +454,14 @@ impl Jit {
                 }
                 let started = std::time::Instant::now();
                 self.ics[id as usize] = vec![IC_EMPTY; prog.protos[id as usize].code.len()].into_boxed_slice();
-                if self.worker.is_some() {
-                    // The IR here, the rest on the compiling thread; the
-                    // interpreter goes on until the code is back.
-                    self.states[id as usize] = match self.build_ir(id, prog) {
-                        Some(optimized) => {
-                            let func = std::mem::replace(&mut self.ctx.func, cranelift_codegen::ir::Function::new());
-                            let w = self.worker.as_mut().unwrap();
-                            w.sent.insert(id, started);
-                            match w.jobs.send(Job { proto: id, func, optimized }) {
-                                Ok(()) => State::Compiling,
-                                Err(_) => State::Failed,
-                            }
-                        }
-                        None => State::Failed,
+                if let Some(w) = self.worker.as_mut() {
+                    // All of it on the compiling thread; the interpreter goes
+                    // on until the code is back.
+                    w.sent.insert(id, started);
+                    let ics = self.ics[id as usize].as_mut_ptr();
+                    self.states[id as usize] = match w.jobs.send(Job { proto: id, prog: prog as *const Program, ics }) {
+                        Ok(()) => State::Compiling,
+                        Err(_) => State::Failed,
                     };
                     return None;
                 }
@@ -444,34 +535,25 @@ impl Jit {
         sig
     }
 
-    /// Builds function `proto_id`'s IR in `ctx`; whether it has loops in
-    /// registers (to be compiled with the optimizer), or None when it is
-    /// not to be compiled.
+    /// What `build_function` needs of this Jit.
+    fn setup(&self) -> Setup {
+        Setup {
+            ptr: self.module.target_config().pointer_type(),
+            cc: self.module.isa().default_call_conv(),
+            sig: self.signature(),
+            table: self.table.as_ptr(),
+            inline_rc: self.inline_rc,
+            off_props: self.off_props,
+            off_items: self.off_items,
+        }
+    }
+
+    /// Builds function `proto_id`'s IR in `ctx` (see `build_function`).
     fn build_ir(&mut self, proto_id: u32, prog: &Program) -> Option<bool> {
-        let proto = &prog.protos[proto_id as usize];
-        if proto.code.is_empty() || std::env::var_os("HARU_JIT_SKIP").is_some_and(|s| s.to_str() == Some(&proto.name)) {
-            return None;
-        }
-        let ptr = self.module.target_config().pointer_type();
-        let cc = self.module.isa().default_call_conv();
         self.module.clear_context(&mut self.ctx);
-        self.ctx.func.signature = self.signature();
-        let has_loops = {
-            let b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
-            let ics = self.ics[proto_id as usize].as_mut_ptr();
-            Gen::new(b, ptr, cc, proto, prog, self.table.as_ptr(), self.inline_rc, self.off_props, self.off_items, ics).build()
-        };
-        if std::env::var_os("HARU_JIT_DEBUG").is_some() {
-            eprintln!(
-                "  {} blocks, {} insts, {} regs, {}/{} ops native",
-                self.ctx.func.dfg.num_blocks(),
-                self.ctx.func.dfg.num_insts(),
-                proto.nregs,
-                proto.code.iter().filter(|op| native(op, prog)).count(),
-                proto.code.len()
-            );
-        }
-        Some(has_loops && std::env::var_os("HARU_JIT_OPT").is_none())
+        let setup = self.setup();
+        let ics = self.ics[proto_id as usize].as_mut_ptr();
+        build_function(&mut self.ctx.func, &mut self.fctx, proto_id, prog, &setup, ics)
     }
 
     fn compile(&mut self, proto_id: u32, prog: &Program) -> Option<Code> {
@@ -1305,6 +1387,24 @@ unsafe extern "C" fn h_bin(env: *mut Env, dst: *mut Value, a: *const Value, b: *
 }
 
 /// A string's length in characters (`'글'의 '길이'`), `s` a string.
+/// The address of property `name` of the call's object (`'나'`), or null: a
+/// property read as a variable (no getter, no access check).
+unsafe extern "C" fn h_this_prop(env: *mut Env, name: u32) -> *const Value {
+    let this = &*(&(*env).this as *const [u64; 2] as *const Value);
+    match this.as_object() {
+        Some(o) => o.props.borrow().get(&name).map_or(std::ptr::null(), |v| v as *const Value),
+        None => std::ptr::null(),
+    }
+}
+
+/// Whether a variable whose `meta_value` is at `meta` takes the value at `v`
+/// (not a constant; its declared type fits the value, as `declare` checks).
+unsafe extern "C" fn h_meta_takes(env: *mut Env, meta: *const Value, v: *const Value) -> u32 {
+    let vm = &*(*env).vm;
+    let (declared, constant) = meta_parts(&*meta);
+    (!constant && (declared == 0 || vm.fits(declared, &*v))) as u32
+}
+
 unsafe extern "C" fn h_str_len(dst: *mut Value, s: *const Value) {
     let n = (*s).as_str().unwrap().chars().count();
     *dst = Value::num(n as f64);
@@ -1383,6 +1483,7 @@ struct Sigs {
     two_ptr: SigRef,
     ptr_len: SigRef,
     three_ptr: SigRef,
+    prop: SigRef,
     bin: SigRef,
 }
 
@@ -1458,6 +1559,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             one_ptr: sig(&[ptr], None),
             two_ptr: sig(&[ptr, ptr], None),
             ptr_len: sig(&[ptr, ptr], None),
+            prop: sig(&[ptr, types::I32], Some(ptr)),
             three_ptr: sig(&[ptr, ptr, ptr], Some(types::I32)),
             bin: sig(&[ptr, ptr, ptr, ptr, types::I32], Some(types::I32)),
         };
@@ -3227,42 +3329,11 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.jump_next(i);
     }
 
-    /// The payload of the running method's object (`'나'`), or `fallback`.
-    fn this_object(&mut self, fallback: Block) -> V {
-        let this = self.b.ins().iadd_imm(self.env, E_THIS as i64);
-        let t = self.tag_of(this);
-        let is_obj = self.is_tag(t, tag::OBJECT as i64);
-        let go = self.b.create_block();
-        self.b.ins().brif(is_obj, go, &[], fallback, &[]);
-        self.switch(go);
-        self.payload_of(this)
-    }
-
-    /// Looks for property `name` among the object's (at payload `p`): the
-    /// block it goes to when found (its parameter the value's address) and
-    /// the one when not.
-    fn scan_prop(&mut self, p: V, name: u32) -> (Block, Block) {
-        let props = self.off_props as i32;
-        let items = self.b.ins().load(self.ptr, flags(), p, props + OFF_PTR as i32);
-        let len = self.b.ins().load(types::I64, flags(), p, props + OFF_LEN as i32);
-        let (head, body, found, missing) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
-        self.b.append_block_param(head, types::I64);
-        self.b.append_block_param(found, self.ptr);
-        let zero = self.b.ins().iconst(types::I64, 0);
-        self.b.ins().jump(head, &[BlockArg::Value(zero)]);
-        self.switch(head);
-        let k = self.b.block_params(head)[0];
-        let more = self.b.ins().icmp(IntCC::UnsignedLessThan, k, len);
-        self.b.ins().brif(more, body, &[], missing, &[]);
-        self.switch(body);
-        let off = self.b.ins().imul_imm(k, PROP_SIZE as i64);
-        let e = self.b.ins().iadd(items, off);
-        let n = self.b.ins().load(types::I32, flags(), e, PROP_NAME as i32);
-        let hit = self.b.ins().icmp_imm(IntCC::Equal, n, name as i64);
-        let v = self.b.ins().iadd_imm(e, PROP_VALUE as i64);
-        let k1 = self.b.ins().iadd_imm(k, 1);
-        self.b.ins().brif(hit, found, &[BlockArg::Value(v)], head, &[BlockArg::Value(k1)]);
-        (found, missing)
+    /// The address of property `name` of the running method's object
+    /// (`'나'`), or 0 (no such property, or no object).
+    fn this_prop(&mut self, name: u32) -> V {
+        let n = self.b.ins().iconst(types::I32, name as i64);
+        self.call(self.sigs.prop, h_this_prop as usize, &[self.env, n]).unwrap()
     }
 
     /// A variable of several places (`'x'` in a loop, in a method): the
@@ -3271,28 +3342,28 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// check), else `h_op`.
     fn get_var_this(&mut self, i: usize, dst: Reg, regs: &[Reg], this: Option<u32>) {
         let fallback = self.direct_block(i);
+        // Where the value is found, copied from in one place.
+        let copy = self.b.create_block();
+        self.b.append_block_param(copy, self.ptr);
         for &r in regs {
             let s = self.addr(At::Reg(r));
             let t = self.tag_of(s);
             let undef = self.is_tag(t, TAG_UNDEF);
-            let (reg, other) = (self.b.create_block(), self.b.create_block());
-            self.b.ins().brif(undef, other, &[], reg, &[]);
-            self.switch(reg);
-            let d = self.addr(At::Reg(dst));
-            self.copy_value(s, d);
-            self.jump_next(i);
+            let other = self.b.create_block();
+            self.b.ins().brif(undef, other, &[], copy, &[BlockArg::Value(s)]);
             self.switch(other);
         }
-        let Some(name) = this else {
-            self.b.ins().jump(fallback, &[]);
-            return;
-        };
-        let p = self.this_object(fallback);
-        let (found, missing) = self.scan_prop(p, name);
-        self.switch(missing);
-        self.b.ins().jump(fallback, &[]);
-        self.switch(found);
-        let v = self.b.block_params(found)[0];
+        match this {
+            Some(name) => {
+                let v = self.this_prop(name);
+                self.b.ins().brif(v, copy, &[BlockArg::Value(v)], fallback, &[]);
+            }
+            None => {
+                self.b.ins().jump(fallback, &[]);
+            }
+        }
+        self.switch(copy);
+        let v = self.b.block_params(copy)[0];
         let d = self.addr(At::Reg(dst));
         self.copy_value(v, d);
         self.jump_next(i);
@@ -3328,7 +3399,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         let ra = self.addr(At::Reg(r));
         let t = self.tag_of(ra);
         let undef = self.is_tag(t, TAG_UNDEF);
-        let (go, again) = (self.b.create_block(), self.b.create_block());
+        let (go, again, put) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
         self.b.ins().brif(undef, go, &[], again, &[]);
 
         // Declared again (`'x'를 'x' / 2로 정하자`): the register holds it, so
@@ -3337,16 +3408,10 @@ impl<'a, 'b> Gen<'a, 'b> {
         if let Some(Loc::Reg(m)) = meta {
             self.meta_takes(m, src, fallback);
         }
-        let va = self.addr(At::Reg(src));
-        let vt = self.b.ins().load(types::I64, flags(), va, 0);
-        let vp = self.b.ins().load(types::I64, flags(), va, 8);
-        let ra = self.addr(At::Reg(r));
-        self.store(ra, vt, vp);
-        let va = self.addr(At::Reg(src));
-        let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
-        self.b.ins().store(flags(), undef, va, 0);
-        self.jump_next(i);
+        self.b.ins().jump(put, &[]);
 
+        // Nowhere yet (no property, no global of that name): a new variable
+        // in the register, its type in its meta register.
         self.switch(go);
         if let Some(Slot { loc: Loc::Global(g), .. }) = slots.get(2) {
             let ga = self.addr(At::Global(*g));
@@ -3356,71 +3421,58 @@ impl<'a, 'b> Gen<'a, 'b> {
             self.b.ins().brif(undef, go, &[], fallback, &[]);
             self.switch(go);
         }
-        let p = self.this_object(fallback);
-        let (found, missing) = self.scan_prop(p, name);
-        self.switch(found);
-        self.b.ins().jump(fallback, &[]);
+        let v = self.this_prop(name);
+        let missing = self.b.create_block();
+        self.b.ins().brif(v, fallback, &[], missing, &[]);
         self.switch(missing);
-        // The value moves into the register (which held nothing).
-        let va = self.addr(At::Reg(src));
-        let vt = self.b.ins().load(types::I64, flags(), va, 0);
-        let vp = self.b.ins().load(types::I64, flags(), va, 8);
-        let ra = self.addr(At::Reg(r));
-        self.store(ra, vt, vp);
-        let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
-        self.b.ins().store(flags(), undef, va, 0);
         if let Some(Loc::Reg(m)) = meta {
             let ma = self.addr(At::Reg(m));
             let t = self.b.ins().iconst(types::I64, TAG_NUM);
             let n = self.b.ins().iconst(types::I64, ((ty * 2) as f64).to_bits() as i64);
             self.store(ma, t, n);
         }
+        self.b.ins().jump(put, &[]);
+
+        // The value moves into the register (what it held goes).
+        self.switch(put);
+        let va = self.addr(At::Reg(src));
+        let vt = self.b.ins().load(types::I64, flags(), va, 0);
+        let vp = self.b.ins().load(types::I64, flags(), va, 8);
+        let ra = self.addr(At::Reg(r));
+        self.store(ra, vt, vp);
+        let va = self.addr(At::Reg(src));
+        let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
+        self.b.ins().store(flags(), undef, va, 0);
         self.jump_next(i);
     }
 
     /// Goes on when the variable whose `meta_value` is in register `m` (none,
-    /// or a declared type and constness) takes the value in `src`: not a
-    /// constant, and a type that takes the value's tag. Else `fallback`.
+    /// or a declared type and constness) takes the value in `src`: no type
+    /// (checked here), or `h_meta_takes` says so. Else `fallback`.
     fn meta_takes(&mut self, m: Reg, src: Reg, fallback: Block) {
         let ma = self.addr(At::Reg(m));
         let mt = self.tag_of(ma);
         let is_num = self.is_tag(mt, TAG_NUM);
-        let (typed, ok) = (self.b.create_block(), self.b.create_block());
-        let untyped = self.b.create_block();
+        let (typed, ok, untyped, ask) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
         self.b.ins().brif(is_num, typed, &[], untyped, &[]);
-        // No meta value yet (undefined, 비어있음): no type.
+        // No meta value (undefined, 비어있음): no type.
         self.switch(untyped);
         let u = self.is_tag(mt, TAG_UNDEF);
         let n = self.is_tag(mt, TAG_NULL);
         let none = self.b.ins().bor(u, n);
         self.b.ins().brif(none, ok, &[], fallback, &[]);
-
+        // 0: no type, not a constant.
         self.switch(typed);
-        let mv = self.num_of(ma);
+        let bits = self.payload_of(ma);
+        let zero = self.b.ins().icmp_imm(IntCC::Equal, bits, 0);
+        self.b.ins().brif(zero, ok, &[], ask, &[]);
+        self.switch(ask);
         let va = self.addr(At::Reg(src));
-        let vt = self.tag_of(va);
-        let tags = [TAG_NUM, tag::STR as i64, TAG_BOOL, tag::LIST as i64, tag::DICT as i64];
-        for want in tags {
-            let ids = types_taking(self.prog, want);
-            let this_tag = self.is_tag(vt, want);
-            let (check, other) = (self.b.create_block(), self.b.create_block());
-            self.b.ins().brif(this_tag, check, &[], other, &[]);
-            self.switch(check);
-            let mut fits = self.b.ins().iconst(types::I8, 0);
-            for id in ids {
-                let k = self.b.ins().f64const(id as f64);
-                let c = self.b.ins().fcmp(FloatCC::Equal, mv, k);
-                fits = self.b.ins().bor(fits, c);
-            }
-            self.b.ins().brif(fits, ok, &[], fallback, &[]);
-            self.switch(other);
-        }
-        self.b.ins().jump(fallback, &[]);
+        let r = self.call(self.sigs.three_ptr, h_meta_takes as usize, &[self.env, ma, va]).unwrap();
+        self.b.ins().brif(r, ok, &[], fallback, &[]);
         self.switch(ok);
     }
 
-    /// A variable whose first place is register `r`: its value when it has
-    /// one (else `h_op` looks further).
     fn get_var_reg(&mut self, i: usize, dst: Reg, r: Reg) {
         let fallback = self.direct_block(i);
         let s = self.addr(At::Reg(r));
@@ -3575,7 +3627,7 @@ impl<'a, 'b> Gen<'a, 'b> {
                 self.b.ins().band(same_tag, same)
             }
             (None, Some(k)) => {
-                let c = self.prog.consts[k as usize].clone();
+                let c = &self.prog.consts[k as usize];
                 match (c.as_num(), c.as_bool(), c.tag()) {
                     (Some(y), _, _) => {
                         let is_num = self.is_tag(ta, TAG_NUM);
@@ -3667,17 +3719,6 @@ fn simple_type(prog: &Program, ty: u32) -> Option<&'static [i64]> {
         TypeKind::Dict(None) => Some(&[tag::DICT as i64, TAG_NULL]),
         _ => None,
     }
-}
-
-/// The declared types (`meta_value` numbers, not constant) a value of tag
-/// `t` fits without a closer look: none, anything, and the types
-/// `simple_type` checks by that tag.
-fn types_taking(prog: &Program, t: i64) -> Vec<u32> {
-    (0..prog.types.len() as u32)
-        .filter(|&id| simple_type(prog, id).is_some_and(|tags| tags.is_empty() || tags.contains(&t)))
-        .map(|id| id * 2)
-        .take(8)
-        .collect()
 }
 
 /// Whether a call of `proto` with `argc` arguments can start its frame in
