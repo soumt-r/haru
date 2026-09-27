@@ -303,6 +303,13 @@ pub struct HostApi {
     /// Writes out what the program has printed so far: call it before
     /// waiting (a sleep, a network wait), so the output shows meanwhile.
     pub flush: unsafe extern "C" fn(ctx: *mut HostCtx),
+    /// How many parameters a function value declares, or -1 when it takes
+    /// any number (or is not a function). A function may be given fewer
+    /// arguments than that, never more. (Check `size` before using it.)
+    pub func_params: unsafe extern "C" fn(ctx: *mut HostCtx, func: RawValue) -> i64,
+    /// Removes `key` (borrowed) from a dictionary; false when it was not
+    /// there. (Check `size` before using it.)
+    pub dict_remove: unsafe extern "C" fn(dict: RawValue, key: RawValue) -> bool,
 }
 
 // Descriptors are built once and only read afterwards.

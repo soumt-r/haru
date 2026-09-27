@@ -783,10 +783,12 @@ impl<'p> Vm<'p> {
                 Some(name) => {
                     let name = name.to_string();
                     let info = &self.prog.modules[module as usize];
-                    if let Some(&g) = info.globals.get(name.as_str()) {
-                        let v = self.globals[g as usize].clone();
-                        if matches!(v.as_func(), Some(FuncObj::Builtin(_) | FuncObj::User(_) | FuncObj::Native { .. })) {
-                            return self.call_value(&v, arg_base, argc, ret, module);
+                    for key in [name.clone(), crate::compiler::import_binding(&name)] {
+                        if let Some(&g) = info.globals.get(key.as_str()) {
+                            let v = self.globals[g as usize].clone();
+                            if matches!(v.as_func(), Some(FuncObj::Builtin(_) | FuncObj::User(_) | FuncObj::Native { .. })) {
+                                return self.call_value(&v, arg_base, argc, ret, module);
+                            }
                         }
                     }
                     if let Some(p) = self.function_named(module, &name) {
@@ -1242,10 +1244,17 @@ impl<'p> Vm<'p> {
                         enter!(pc, self.call_plain(proto, base + b as usize, argc, dst));
                     }
                     Op::CallName { dst, name, var, base: b, argc } => {
+                        // The first of its meanings that is a function (a
+                        // variable holding one, then an import).
                         let f = if var == NONE {
                             None
                         } else {
-                            self.find(&prog.vars[var as usize], fi).map(|s| self.get(s.loc, fi))
+                            prog.vars[var as usize]
+                                .slots
+                                .iter()
+                                .filter(|s| self.defined(s.loc, fi))
+                                .map(|s| self.get(s.loc, fi))
+                                .find(|f| matches!(f.as_func(), Some(FuncObj::Builtin(_) | FuncObj::User(_) | FuncObj::Native { .. })))
                         };
                         match f {
                             Some(f) if matches!(f.as_func(), Some(FuncObj::Builtin(_) | FuncObj::User(_) | FuncObj::Native { .. })) => {
@@ -1618,7 +1627,13 @@ impl<'p> Vm<'p> {
                         let v = if let Some(p) = self.function_named(proto.module, n) {
                             Value::func(FuncObj::User(p))
                         } else {
-                            match self.find(&prog.vars[var as usize], fi).map(|s| self.get(s.loc, fi)) {
+                            let user = prog.vars[var as usize]
+                                .slots
+                                .iter()
+                                .filter(|s| self.defined(s.loc, fi))
+                                .map(|s| self.get(s.loc, fi))
+                                .find(|v| v.as_func().is_some());
+                            match user {
                                 Some(v) if matches!(v.as_func(), Some(FuncObj::User(_))) => v,
                                 _ => Value::str(n),
                             }
@@ -1987,7 +2002,9 @@ impl<'p> Vm<'p> {
             let target_sym = symbol::intern(target);
             let bind_sym = symbol::intern(bind);
             // A variable of the module (a built-in, an import of its own, ...).
-            if let Some(&g) = module.globals.get(target) {
+            let own_import = crate::compiler::import_binding(target);
+            let g = module.globals.get(target).or_else(|| module.globals.get(own_import.as_str()));
+            if let Some(&g) = g {
                 let v = self.globals[g as usize].clone();
                 if !v.is_undef() {
                     self.store(*slot, fi, v);
@@ -2375,6 +2392,16 @@ impl<'p> Vm<'p> {
 impl Caller for Vm<'_> {
     fn flush(&mut self) {
         Vm::flush(self);
+    }
+
+    fn params(&self, f: &Value) -> Option<usize> {
+        match f.as_func() {
+            Some(&FuncObj::User(p)) => {
+                let proto = &self.prog.protos[p as usize];
+                (!proto.raw_params).then_some(proto.params.len())
+            }
+            _ => None,
+        }
     }
 
     fn call(&mut self, f: &Value, args: &[Value]) -> Result<Value, RuntimeError> {

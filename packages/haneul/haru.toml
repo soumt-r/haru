@@ -1,0 +1,10 @@
+# 하늘 (空): a web framework in the manner of Flask. Everything is native:
+# the app, the request and the response are resources with methods named
+# in each language, so there are no source entry points.
+[package]
+name = "haneul"
+version = "0.1.0"
+
+[native]
+id = "haneul"
+crate = "."

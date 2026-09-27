@@ -145,6 +145,15 @@ unsafe extern "C" fn dict_set(dict: RawValue, key: RawValue, value: RawValue) {
     }
 }
 
+unsafe extern "C" fn dict_remove(dict: RawValue, key: RawValue) -> bool {
+    let v = std::mem::ManuallyDrop::new(Value::from_raw(dict));
+    let key = std::mem::ManuallyDrop::new(Key(Value::from_raw(key)));
+    let Some(d) = v.as_dict() else { return false };
+    // Dropped after the map is let go (dropping may free a resource).
+    let removed = d.map.borrow_mut().remove(&*key);
+    removed.is_some()
+}
+
 unsafe extern "C" fn dict_keys(dict: RawValue) -> RawValue {
     let v = std::mem::ManuallyDrop::new(Value::from_raw(dict));
     let keys = v.as_dict().map_or(Vec::new(), |d| d.map.borrow().keys().map(|k| k.0.clone()).collect());
@@ -176,6 +185,17 @@ unsafe extern "C" fn flush(c: *mut HostCtx) {
     }
 }
 
+unsafe extern "C" fn func_params(c: *mut HostCtx, func: RawValue) -> i64 {
+    let c = ctx(c);
+    let f = std::mem::ManuallyDrop::new(Value::from_raw(func));
+    let n = match f.as_func() {
+        Some(&FuncObj::Native { module, func }) => c.rt.params(FnRef { module, func }),
+        Some(FuncObj::User(_)) => c.caller.and_then(|caller| (*caller).params(&f)),
+        _ => None,
+    };
+    n.map_or(-1, |n| n as i64)
+}
+
 unsafe extern "C" fn throw_type(c: *mut HostCtx, index: usize, expected: u32) -> Status {
     ctx(c).pending = Some(type_error(index, expected));
     STATUS_ERROR
@@ -205,4 +225,6 @@ pub(crate) static HOST_API: HostApi = HostApi {
     resource_get,
     take_error,
     flush,
+    func_params,
+    dict_remove,
 };

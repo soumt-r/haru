@@ -1,0 +1,18 @@
+[package]
+name = "haru-pkg-haneul"
+description = "하늘 (空): a web framework for Haru in the manner of Flask"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "haneul"
+# Linked into haru only (never loaded as a library), so no cdylib: a cdylib
+# of the same name collides with the rlib when tests build without
+# `panic = "abort"`.
+crate-type = ["rlib"]
+
+[dependencies]
+haru-sdk.workspace = true
+sha2 = "0.10"

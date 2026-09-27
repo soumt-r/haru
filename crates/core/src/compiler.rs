@@ -356,21 +356,23 @@ impl<'a> Compiler<'a> {
     /// The names an import binds where it stands (its items, or with `전부`
     /// the functions of the module).
     fn import_names(&self, module: &str, is_builtin: bool, all: bool, items: &[ast::ImportItem]) -> Vec<String> {
-        let mut names: Vec<String> =
-            items.iter().map(|i| if i.alias.is_empty() { i.name.clone() } else { i.alias.clone() }).collect();
+        let mut names: Vec<String> = items
+            .iter()
+            .map(|i| self.bound_name(if i.alias.is_empty() { &i.name } else { &i.alias }))
+            .collect();
         let key = self.module_key(module, is_builtin);
         if all {
             match key.as_ref().and_then(|k| self.sources.get(k)) {
                 Some(Source::Ok(p, _)) => {
                     for s in &p.statements {
                         if let Stmt::Function(f) = s {
-                            names.push(f.name.clone());
+                            names.push(self.bound_name(&f.name));
                         }
                     }
                 }
                 _ if is_builtin => {
                     if let Some(Package { native: Ok(m), .. }) = self.packages.find(self.lang.name, module) {
-                        names.extend(self.packages.names(m, self.lang.name));
+                        names.extend(self.packages.names(m, self.lang.name).iter().map(|n| self.bound_name(n)));
                     }
                 }
                 _ => {}
@@ -380,6 +382,15 @@ impl<'a> Compiler<'a> {
             names.extend(self.leaked_names(&k));
         }
         names
+    }
+
+    /// The variable an imported name is bound to (see [`import_binding`]).
+    fn bound_name(&self, name: &str) -> String {
+        if name.starts_with(self.lang.native_prefix) {
+            name.to_string()
+        } else {
+            import_binding(name)
+        }
     }
 
     /// How a `[모듈]` import is bound when it runs.
@@ -1247,6 +1258,19 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         (self.c.prog.vars.len() - 1) as u32
     }
 
+    /// What `<이름>` may mean: a variable holding a function, then an
+    /// imported function.
+    fn callee_var(&mut self, name: &str) -> u32 {
+        let var = self.var(name);
+        let bound = import_binding(name);
+        let mut more: Vec<Slot> = self.scopes.iter().rev().filter_map(|s| s.names.get(&bound).copied()).collect();
+        if let Some(g) = self.c.globals.get(&bound) {
+            more.push(*g);
+        }
+        self.c.prog.vars[var as usize].slots.extend(more);
+        var
+    }
+
     fn get_var(&mut self, name: &str, dst: Reg) {
         let var = self.var(name);
         let v = &self.c.prog.vars[var as usize];
@@ -1652,7 +1676,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             .iter()
             .map(|i| {
                 let bind = if i.alias.is_empty() { i.name.clone() } else { i.alias.clone() };
-                let slot = self.bind_slot(&bind);
+                let slot = self.bind_slot(&self.c.bound_name(&bind));
                 (i.name.clone(), bind, slot)
             })
             .collect();
@@ -1661,7 +1685,9 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         if all {
             for n in self.c.import_names(module, is_builtin, true, &[]) {
                 let slot = self.bind_slot(&n);
-                all_slots.insert(n, slot);
+                // Found by the function's own name when it runs.
+                let plain = n.strip_prefix('\u{1}').map_or(n.clone(), str::to_string);
+                all_slots.insert(plain, slot);
             }
         }
         let import = self.c.prog.imports.len() as u32;
@@ -1896,7 +1922,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             }
             Expr::New { class, args } => self.new_object(class.as_ref(), args, dst),
             Expr::FunctionRef(n) => {
-                let var = self.var(n);
+                let var = self.callee_var(n);
                 let name = self.c.name(n);
                 self.emit(Op::FuncRef { dst, name, var });
             }
@@ -2241,7 +2267,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             let base = self.args(args);
             self.emit(Op::Call { dst, proto, base, argc });
         } else {
-            let var = self.var(name);
+            let var = self.callee_var(name);
             let n = self.c.name(name);
             let base = self.args(args);
             self.emit(Op::CallName { dst, name: n, var, base, argc });
@@ -2271,6 +2297,14 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
 }
 
 /// A string literal's escapes, the way Hana replaces them (in this order).
+/// The variable an import binds a function (or class) to: a name no program
+/// can write, so `'이름'` neither reads nor replaces it. Hana keeps imported
+/// functions apart from variables; only `<이름>(...)` and `<이름>` find them.
+/// (`<네이티브_…>` items stay variables: Hana injects them as such.)
+pub(crate) fn import_binding(name: &str) -> String {
+    format!("\u{1}{name}")
+}
+
 pub fn unescape(s: &str) -> String {
     s.replace("\\n", "\n").replace("\\\"", "\"").replace("\\t", "\t").replace("\\\\", "\\")
 }

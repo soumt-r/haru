@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>할 일</h1>
+<ul>
+  {% for 할일 in 할일들 %}
+  <li class="{{ '끝' if 할일.끝 else '' }}">
+    {{ 할일.제목 }}
+    {% if not 할일.끝 %}
+    <form method="post" action="/할일/{{ 할일.번호 }}/끝"><button>끝</button></form>
+    {% endif %}
+  </li>
+  {% else %}
+  <li>할 일이 없어요.</li>
+  {% endfor %}
+</ul>
+<form method="post" action="/할일">
+  <input name="제목" placeholder="새 할 일" autofocus>
+  <button>추가</button>
+</form>
+<p class="작게">{{ 할일들|length }}개 중 {{ 끝수 }}개 끝 · 이 브라우저로 {{ 방문 }}번째 방문</p>
+{% endblock %}

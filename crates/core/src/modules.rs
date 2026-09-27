@@ -67,6 +67,10 @@ pub trait Caller {
     fn call(&mut self, f: &Value, args: &[Value]) -> Result<Value, RuntimeError>;
     /// Writes out the program's buffered output.
     fn flush(&mut self) {}
+    /// How many parameters a function value declares (`None`: any number).
+    fn params(&self, _f: &Value) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -202,6 +206,12 @@ impl Runtime {
         Value::func(FuncObj::Native { module: f.module, func: f.func })
     }
 
+    /// How many parameters a native function has (`None`: it takes any number).
+    pub fn params(&self, f: FnRef) -> Option<usize> {
+        let func = &self.modules[f.module].functions[f.func];
+        (func.params.first() != Some(&kind::REST)).then_some(func.params.len())
+    }
+
     /// Calls a native function. The count and kinds of the arguments are
     /// checked here, so modules never see mismatched values.
     pub fn call(&self, f: FnRef, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -270,7 +280,7 @@ impl Runtime {
             .collect()
     }
 
-    pub(crate) fn module_id(&self, module: usize) -> &str {
+    pub fn module_id(&self, module: usize) -> &str {
         &self.modules[module].id
     }
 

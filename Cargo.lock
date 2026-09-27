@@ -474,6 +474,7 @@ version = "0.1.0"
 dependencies = [
  "haru-core",
  "haru-example-greet",
+ "haru-pkg-haneul",
  "haru-pkg-http-server",
  "haru-pkg-timezone",
  "haru-std",
@@ -503,6 +504,14 @@ name = "haru-example-greet"
 version = "0.1.0"
 dependencies = [
  "haru-sdk",
+]
+
+[[package]]
+name = "haru-pkg-haneul"
+version = "0.1.0"
+dependencies = [
+ "haru-sdk",
+ "sha2",
 ]
 
 [[package]]

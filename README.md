@@ -146,6 +146,7 @@ fn build(m: &mut Module) {
 
 | 패키지 | 하는 일 |
 | --- | --- |
+| [`haneul`](packages/haneul) | 하늘: Flask처럼 쓰는 웹 프레임워크 (라우팅, 템플릿, 세션) |
 | [`http_server`](packages/http_server) | HTTP 서버 |
 | [`timezone`](packages/timezone) | IANA 시간대로 시각 서식·읽기·요일·오프셋 |
 

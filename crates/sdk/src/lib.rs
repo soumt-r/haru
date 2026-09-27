@@ -46,6 +46,12 @@ fn host() -> &'static HostApi {
     unsafe { &*p }
 }
 
+/// Whether the host's table has the function at `offset` (fields are added
+/// at the end; an older host's table is shorter).
+fn host_has(offset: usize) -> bool {
+    host().size as usize >= offset + std::mem::size_of::<usize>()
+}
+
 /// Builds the module and hands its descriptor to the host. Called by
 /// [`export!`] and [`entry!`].
 #[doc(hidden)]
@@ -264,6 +270,12 @@ impl Dict {
         Ok(())
     }
 
+    /// Removes a key; false when it was not there (or the host is too old
+    /// to remove keys).
+    pub fn remove(&self, key: &Value) -> bool {
+        host_has(std::mem::offset_of!(HostApi, dict_remove)) && unsafe { (host().dict_remove)(self.0 .0, key.0) }
+    }
+
     /// The keys, in no particular order.
     pub fn keys(&self) -> List {
         List(Value(unsafe { (host().dict_keys)(self.0 .0) }))
@@ -330,6 +342,24 @@ impl Value {
         } else {
             Err(Error(ErrorKind::Pending))
         }
+    }
+}
+
+impl Value {
+    /// How many parameters this function value declares: it may be called
+    /// with fewer arguments, never more. `None` when it takes any number, is
+    /// not a function, or the host is too old to say.
+    pub fn param_count(&self) -> Option<usize> {
+        let h = host();
+        if !host_has(std::mem::offset_of!(HostApi, func_params)) {
+            return None;
+        }
+        let ctx = CTX.with(|c| c.get());
+        if ctx.is_null() {
+            return None;
+        }
+        let n = unsafe { (h.func_params)(ctx, self.0) };
+        usize::try_from(n).ok()
     }
 }
 
@@ -450,8 +480,26 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A parameter type.
 pub trait FromArg: Sized {
     const KIND: u32;
+    /// Whether the argument may be left out (`Option<T>`; only at the end).
+    const OPTIONAL: bool = false;
     /// `raw` is borrowed; `None` when its kind does not match.
     fn from_arg(raw: RawValue) -> Option<Self>;
+    /// The parameter's value when the argument is left out.
+    fn absent() -> Option<Self> {
+        None
+    }
+}
+
+/// A trailing parameter the program may leave out (`None` then).
+impl<T: FromArg> FromArg for Option<T> {
+    const KIND: u32 = T::KIND;
+    const OPTIONAL: bool = true;
+    fn from_arg(raw: RawValue) -> Option<Option<T>> {
+        T::from_arg(raw).map(Some)
+    }
+    fn absent() -> Option<Option<T>> {
+        Some(None)
+    }
 }
 
 impl FromArg for f64 {
@@ -604,6 +652,9 @@ pub enum Fail {
 /// `fn` items whose parameters are [`FromArg`] and whose result is [`IntoRet`].
 pub trait Handler<Args>: 'static {
     fn kinds() -> Vec<u32>;
+    /// How many arguments must be given (the parameters before the trailing
+    /// `Option`s).
+    fn required() -> usize;
     #[doc(hidden)]
     fn invoke(&self, args: &[RawValue]) -> std::result::Result<Value, Fail>;
 }
@@ -620,13 +671,19 @@ macro_rules! impl_handler {
                 vec![$($A::KIND),*]
             }
 
+            fn required() -> usize {
+                let optional: &[bool] = &[$($A::OPTIONAL),*];
+                optional.len() - optional.iter().rev().take_while(|o| **o).count()
+            }
+
             #[allow(unused_variables)]
             fn invoke(&self, args: &[RawValue]) -> std::result::Result<Value, Fail> {
                 $(
-                    let $a = args
-                        .get($i)
-                        .and_then(|raw| $A::from_arg(*raw))
-                        .ok_or(Fail::Type($i, $A::KIND))?;
+                    let $a = match args.get($i) {
+                        Some(raw) => $A::from_arg(*raw),
+                        None => $A::absent(),
+                    }
+                    .ok_or(Fail::Type($i, $A::KIND))?;
                 )*
                 (self)($($a),*).into_ret().map_err(Fail::Error)
             }

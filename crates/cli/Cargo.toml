@@ -19,6 +19,7 @@ haru-syntax.workspace = true
 haru-std.workspace = true
 haru-pkg-timezone = { path = "../../packages/timezone" }
 haru-pkg-http-server = { path = "../../packages/http_server" }
+haru-pkg-haneul = { path = "../../packages/haneul" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 sha2 = "0.10"

@@ -83,12 +83,14 @@ Rust로 된 네이티브 패키지는 소스에서 `haru`와 함께 컴파일해
 
 - **도구**: `haru init | add <경로>[@버전] [--allow-build] | install | remove | list`. 버전은 저장소의 git 태그(`v1.2.0`), 선택은 `haru.lock`(버전 + 커밋), 캐시는 `~/.haru/pkg/<호스트>/<소유자>/<저장소>@<버전>`(`$HARU_HOME`). `haru run`은 아무것도 내려받거나 빌드하지 않습니다. git의 설정(자격 증명, `insteadOf`)이 그대로 통합니다.
 - **네이티브 준비**: 미리 빌드한 파일은 `url`에서 받아 sha256을 확인하고, `crate`는 `cargo build`로 빌드해 `<패키지>/.haru/native/<플랫폼>/`에 둡니다. 빌드는 크레이트의 코드를 실행하므로 프로젝트가 믿는 패키지(`trusted-builds`, `haru add --allow-build`)만 빌드합니다. 프로젝트 자신의 `packages/*`와 `[replace]` 폴더는 믿는 것으로 봅니다.
-- **찾는 순서** (`crates/cli/src/packages.rs`): `haru build`로 링크한 패키지 → 패키지 폴더(git 경로면 `[replace]` 폴더나 잠금 버전의 캐시, 아니면 `./packages`, `$HARU_PACKAGES`, `haru` 옆 `packages/`) → Haru에 딸린 패키지(timezone) → 표준 모듈. Hana처럼 폴더가 같은 이름의 딸린 패키지를 가립니다.
-- **가져오기 해석** (VM, Hana의 `importBuiltin` 순서): `<네이티브_이름>` 항목은 패키지 네이티브 모듈의 함수 id로, 나머지는 이 언어의 소스 진입점에서(없으면 다른 언어용만 있을 때 `ImportUnsupportedLocale`), 소스가 없으면 네이티브 모듈이 이름표로 내보낸 이름에서. 가져온 모듈이 가진 네이티브 함수 변수는 가져온 쪽으로도 들어옵니다(Hana의 `injectNatives`). 오류 코드는 Hana와 같고, `ImportPackageNotInstalled` 문구만 `haru install`을 가리킵니다.
+- **찾는 순서** (`crates/cli/src/packages.rs`): `haru build`로 링크한 패키지 → 패키지 폴더(git 경로면 `[replace]` 폴더나 잠금 버전의 캐시, 아니면 `./packages`, `$HARU_PACKAGES`, `haru` 옆 `packages/`) → Haru에 딸린 패키지(timezone, http_server, haneul; 이름이나 네이티브 모듈의 언어별 이름으로, 예: `[하늘]`·`【空】`) → 표준 모듈. Hana처럼 폴더가 같은 이름의 딸린 패키지를 가립니다.
+- **가져오기 해석** (VM, Hana의 `importBuiltin` 순서): `<네이티브_이름>` 항목은 패키지 네이티브 모듈의 함수 id로, 나머지는 이 언어의 소스 진입점에서(없으면 다른 언어용만 있을 때 `ImportUnsupportedLocale`), 소스가 없으면 네이티브 모듈이 이름표로 내보낸 이름에서. 가져온 모듈이 가진 네이티브 함수 변수는 가져온 쪽으로도 들어옵니다(Hana의 `injectNatives`). 가져온 함수(`<네이티브_…>`가 아닌 항목과 `전부`)는 프로그램이 쓸 수 없는 이름(`\u{1}이름`, `compiler::import_binding`)의 슬롯에 묶여서, Hana처럼 변수와 따로 삽니다: `'이름'`으로는 읽히지 않고(ReferenceError), 어느 함수에서 `'이름'을 …로 정하자`를 해도 가져온 함수는 그대로이며, `<이름>(…)`·`<이름>`만 (그 이름의 함수 값 변수 다음으로) 찾습니다. 오류 코드는 Hana와 같고, `ImportPackageNotInstalled` 문구만 `haru install`을 가리킵니다.
 
 ### 3.6 소스 패키지와 캐시
 
 한 패키지 안에서 소스와 네이티브를 섞을 수 있습니다(네이티브로 핵심을, 소스로 편의 함수를). Haru에 딸린 timezone이 그 예입니다: `packages/timezone/`은 Hana와 같은 `hari/index.hr`·`kanade/index.knd`와, haru-sdk로 쓴 네이티브 크레이트(IANA DB는 jiff)로 된 보통의 Haru 패키지이고, `haru`는 그것을 정적으로 링크하고 소스를 내장합니다.
+
+반대로 소스 없이 네이티브만으로 된 패키지도 있습니다. Haru에 딸린 웹 프레임워크 하늘(`packages/haneul/`, Haru 전용, Hana에는 없음)은 앱·요청·응답이 언어별 이름의 메서드를 가진 리소스(§4.4)라서 진입점 파일이 없습니다. 처리기는 http_server처럼 `<실행>`이 기다리는 동안 프로그램의 스레드에서 돌고(§4.5), 처리기가 받는 인자 수는 `func_params`(§4.2)로 알아내서 `()`로 만든 처리기에도 요청을 억지로 넘기지 않습니다.
 
 (계획) 소스 모듈을 바이트코드로 캐시(`~/.haru/cache/<소스 해시>.hrc`)하는 것은 아직 하지 않았습니다 — 지금은 컴파일이 실행보다 훨씬 짧아서 이득이 작습니다.
 
@@ -112,7 +114,7 @@ Status (*NativeFn)(void* userdata, HostCtx* ctx, const Value* args, size_t argc,
 
 ### 4.2 HostApi (호스트가 주는 함수 표)
 
-문자열 보기/만들기, 참조 세기(`retain`/`release`), 목록·사전 읽기/쓰기/만들기, 함수 값 부르기, 오류 던지기(코드 + 인자 값), 리소스 만들기/꺼내기. 표 앞머리에 `abi_version`과 크기(`size`)가 있어 뒤에 함수를 더해도 옛 라이브러리가 깨지지 않습니다.
+문자열 보기/만들기, 참조 세기(`retain`/`release`), 목록·사전 읽기/쓰기/만들기, 함수 값 부르기, 오류 던지기(코드 + 인자 값), 리소스 만들기/꺼내기. 표 앞머리에 `abi_version`과 크기(`size`)가 있어 뒤에 함수를 더해도 옛 라이브러리가 깨지지 않습니다. 나중에 더한 것: 함수 값이 받는 매개변수 수(`func_params`, SDK `Value::param_count`), 사전의 키 지우기(`dict_remove`, SDK `Dict::remove`). SDK는 `size`를 보고, 없는 호스트에서는 `None`/`false`를 돌려줍니다. SDK 함수의 뒤쪽 `Option<T>` 매개변수는 빼고 부를 수 있습니다(`required`).
 
 ### 4.3 오류
 

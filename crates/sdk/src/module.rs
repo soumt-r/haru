@@ -40,7 +40,7 @@ impl ResourceEntry {
         self.methods.push(FuncEntry {
             id: id.to_string(),
             names: Vec::new(),
-            required: kinds.len(),
+            required: H::required(),
             kinds,
             func: native_fn::<H, A>(),
             userdata: Box::into_raw(Box::new(handler)) as *const c_void,
@@ -76,7 +76,7 @@ impl Module {
         self.funcs.push(FuncEntry {
             id: id.to_string(),
             names: Vec::new(),
-            required: kinds.len(),
+            required: H::required(),
             kinds,
             func: native_fn::<H, A>(),
             // Lives as long as the module, which is never unloaded.

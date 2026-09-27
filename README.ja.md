@@ -146,6 +146,7 @@ fn build(m: &mut Module) {
 
 | パッケージ | すること |
 | --- | --- |
+| [`haneul`](packages/haneul) | 空：Flaskのように使えるウェブフレームワーク（ルーティング・テンプレート・セッション） |
 | [`http_server`](packages/http_server) | HTTPサーバー |
 | [`timezone`](packages/timezone) | IANAタイムゾーンでの時刻の書式・読み取り・曜日・オフセット |
 

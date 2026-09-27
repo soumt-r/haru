@@ -1,0 +1,7 @@
+body { font-family: system-ui, sans-serif; background: #f6f3ff; color: #2d2640; }
+main { max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
+h1 { color: #7c5cc4; }
+li { margin: .4rem 0; }
+li form { display: inline; }
+li.끝 { text-decoration: line-through; color: #8a829c; }
+.작게 { font-size: .85rem; color: #8a829c; }

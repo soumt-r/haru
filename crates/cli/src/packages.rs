@@ -5,7 +5,8 @@
 //!    `[replace]` folder or the version `haru.lock` chose, in the cache; any
 //!    other name is the first `packages/<이름>` folder of `./packages`, then
 //!    of each folder in `$HARU_PACKAGES`, then of `packages/` next to `haru`;
-//! 2. a package that comes with Haru (timezone);
+//! 2. a package that comes with Haru (timezone, http_server, haneul), by its
+//!    name or its native module's name in the program's language (`[하늘]`);
 //! 3. a standard module.
 //!
 //! A package folder holds its source entry points (`hari/index.hr`,
@@ -57,6 +58,7 @@ pub fn bundled() -> Vec<Bundled> {
             native: Some(http_server::haru_entry),
             unsupported: false,
         },
+        Bundled { name: "haneul", hari: None, kanade: None, native: Some(haneul::haru_entry), unsupported: false },
     ]
 }
 
@@ -190,8 +192,32 @@ impl Resolver {
         if let Some(b) = self.bundled.iter().find(|b| b.name == name) {
             return Some(self.bundled_package(b));
         }
+        if let Some(b) = self.bundled_by_label(lang, name) {
+            return Some(self.bundled_package(b));
+        }
         let m = self.rt.borrow().module(lang, name)?;
         Some(Package { fail: None, unsupported: false, native: Ok(m), core: true, entries: Vec::new() })
+    }
+
+    /// A bundled package whose native module is called `name` in `lang`
+    /// (the module is loaded to learn its names).
+    fn bundled_by_label(&self, lang: &str, name: &str) -> Option<&Bundled> {
+        let mut rt = self.rt.borrow_mut();
+        if rt.module(lang, name).is_some_and(|m| !self.bundled.iter().any(|b| b.name == rt.module_id(m))) {
+            // A standard module.
+            return None;
+        }
+        self.bundled.iter().find(|b| {
+            let Some(entry) = b.native else { return false };
+            let module = match rt.module_by_id(b.name) {
+                Some(m) => m,
+                None => match rt.load_static(entry) {
+                    Ok(m) => m,
+                    Err(_) => return false,
+                },
+            };
+            rt.module(lang, name) == Some(module)
+        })
     }
 }
 
