@@ -812,7 +812,7 @@ impl Gen<'_, '_> {
             self.writeback(r, At::Reg(base + k));
         }
         let slow = self.exit(r, pc);
-        let status = self.call_core(pc + 1, dst, proto, base, argc, slow);
+        let status = self.call_core(pc + 1, dst, proto, base, argc, slow, None);
         let (ok, bad) = (self.b.create_block(), self.b.create_block());
         self.b.ins().brif(status, bad, &[], ok, &[]);
 

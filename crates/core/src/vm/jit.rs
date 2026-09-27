@@ -69,14 +69,27 @@ pub(super) struct Env {
     ns: usize,
     /// Where this call goes on after the call it is making (its frame's pc).
     pc: usize,
+    /// A method's object (`'나'`, else undefined), as a value's bits: its own
+    /// reference in a call without a frame, the frame's otherwise.
+    this: [u64; 2],
+    /// A method's class (else `NONE`).
+    self_class: usize,
 }
 
 impl Env {
     /// The `Env` of a call whose frame is in `vm.frames` at `fi`.
     fn framed(vm: *mut Vm<'static>, regs: *mut Value, globals: *mut Value, fi: usize, argc: usize, base: usize, start: usize, caller: *mut Env) -> Env {
-        Env { regs, globals, vm, fi, argc, base, start, caller, materialized: 1, proto: 0, ret: 0, depth: 0, ns: 0, pc: 0 }
+        // The frame's object, seen (not held) here.
+        let (this, self_class) = unsafe {
+            let f = &(&(*vm).frames)[fi];
+            (mem::transmute_copy::<Value, [u64; 2]>(&f.this), f.self_class as usize)
+        };
+        Env { regs, globals, vm, fi, argc, base, start, caller, materialized: 1, proto: 0, ret: 0, depth: 0, ns: 0, pc: 0, this, self_class }
     }
 }
+
+const E_THIS: i32 = mem::offset_of!(Env, this) as i32;
+const E_SELF_CLASS: i32 = mem::offset_of!(Env, self_class) as i32;
 
 const E_CALLER: i32 = mem::offset_of!(Env, caller) as i32;
 const E_MATERIALIZED: i32 = mem::offset_of!(Env, materialized) as i32;
@@ -657,8 +670,9 @@ unsafe extern "C" fn h_materialize(env: *mut Env) {
             counted: true,
             ret: e.ret as Reg,
             post: Post::Value,
-            this: Value::UNDEF,
-            self_class: NONE,
+            // The call's reference goes to the frame.
+            this: mem::transmute::<[u64; 2], Value>(e.this),
+            self_class: e.self_class as u32,
             ns: e.ns as u32,
             pending: None,
         });
@@ -1954,7 +1968,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                 true => self.fast_call(i, dst, proto, base, argc),
                 false => self.call_op(i),
             },
-            Op::CallMethod { .. } => self.call_via(i, h_method_start as usize, h_step as usize),
+            Op::CallMethod { dst, obj, name, base, argc, .. } => match self.method_target(name, argc) {
+                Some((classes, proto)) => self.fast_method_call(i, dst, obj, base, argc, &classes, proto),
+                None => self.call_via(i, h_method_start as usize, h_step as usize),
+            },
             Op::DictK { dst, obj, k, skip } => self.dict_k(i, Some(dst), obj, k, None, skip),
             Op::DictSetK { obj, k, val, skip } => self.dict_k(i, None, obj, k, Some(val), skip),
             Op::SelfOr { dst, .. } => self.self_or(i, dst),
@@ -2057,7 +2074,7 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// helpers' way, which does all of it again.
     fn fast_call(&mut self, i: usize, dst: Reg, proto: u32, b: Reg, argc: u16) {
         let slow = self.b.create_block();
-        let status = self.call_core(i + 1, dst, proto, b, argc, slow);
+        let status = self.call_core(i + 1, dst, proto, b, argc, slow, None);
         let (ok, bad) = (self.b.create_block(), self.b.create_block());
         self.b.ins().brif(status, bad, &[], ok, &[]);
         self.switch(ok);
@@ -2075,7 +2092,7 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// The native call of `fast_call` up to the callee's status (in the
     /// current block): anything unusual goes to `slow` before anything
     /// changed. The arguments are read from (and moved out of) memory.
-    pub(super) fn call_core(&mut self, resume: usize, dst: Reg, proto: u32, b: Reg, argc: u16, slow: Block) -> V {
+    pub(super) fn call_core(&mut self, resume: usize, dst: Reg, proto: u32, b: Reg, argc: u16, slow: Block, this: Option<(Reg, V)>) -> V {
         let callee = &self.prog.protos[proto as usize];
         let nregs = callee.nregs as i64;
         let entry = self.b.ins().iconst(self.ptr, unsafe { self.table.add(proto as usize) } as i64);
@@ -2152,6 +2169,20 @@ impl<'a, 'b> Gen<'a, 'b> {
         for (off, v) in [(E_CALLER, self.env), (E_MATERIALIZED, zero), (E_PROTO, protov), (E_RET, retv), (E_DEPTH, depth), (E_NS, ns), (E_PC, zero)] {
             self.b.ins().store(flags(), v, ce, off);
         }
+        // A method's object: one more reference, the call's own.
+        let (tt, tp, class) = match this {
+            Some((obj, class)) => {
+                let oa = self.addr(At::Reg(obj));
+                let t = self.b.ins().load(types::I64, flags(), oa, 0);
+                let p = self.b.ins().load(types::I64, flags(), oa, 8);
+                self.retain_counted(oa);
+                (t, p, class)
+            }
+            None => (self.b.ins().iconst(types::I64, TAG_UNDEF), zero, self.b.ins().iconst(types::I64, NONE as i64)),
+        };
+        for (off, v) in [(E_THIS, tt), (E_THIS + 8, tp), (E_SELF_CLASS, class)] {
+            self.b.ins().store(flags(), v, ce, off);
+        }
         let inst = self.b.ins().call_indirect(self.sigs.native, code, &[ce]);
         self.b.inst_results(inst)[0]
     }
@@ -2202,6 +2233,8 @@ impl<'a, 'b> Gen<'a, 'b> {
         let (vm, ptr, env) = (self.vm, self.ptr, self.env);
         let (vt, vp) = self.return_value(src, slow);
         self.release_regs();
+        let this = self.b.ins().iadd_imm(env, E_THIS as i64);
+        self.release(this);
         let d = self.b.ins().load(types::I32, flags(), vm, OFF_DEPTH as i32);
         let d = self.b.ins().iadd_imm(d, -1);
         self.b.ins().store(flags(), d, vm, OFF_DEPTH as i32);
@@ -2217,6 +2250,73 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.store(dst, vt, vp);
         let r = self.b.ins().iconst(types::I32, S_RETURNED as i64);
         self.b.ins().return_(&[r]);
+    }
+
+    /// The method `name` means for every object that has one, when that is
+    /// one function of the program (its classes, by name, each only one
+    /// class of that name) that `call_core` can call with `argc` arguments.
+    fn method_target(&self, name: u32, argc: u16) -> Option<(Vec<u32>, u32)> {
+        if name == crate::symbol::intern("__init__") {
+            return None;
+        }
+        let mut proto = None;
+        let mut classes = Vec::new();
+        for c in &self.prog.classes {
+            if let Some(p) = c.members.get(&name).and_then(|m| m.method) {
+                if proto.is_some_and(|q| q != p) {
+                    return None;
+                }
+                proto = Some(p);
+                classes.push(c.name);
+            }
+        }
+        let proto = proto?;
+        // A class name that two classes have (in two modules) is not known.
+        for &n in &classes {
+            if self.prog.classes.iter().filter(|c| c.name == n).count() != 1 {
+                return None;
+            }
+        }
+        (classes.len() <= 4 && self.inline_call(proto, argc)).then_some((classes, proto))
+    }
+
+    /// A call of a method `method_target` knows, on an object of one of its
+    /// classes: as `fast_call`, the object in the callee's `Env`. Anything
+    /// else: `h_method_start`.
+    #[allow(clippy::too_many_arguments)]
+    fn fast_method_call(&mut self, i: usize, dst: Reg, obj: Reg, b: Reg, argc: u16, classes: &[u32], proto: u32) {
+        let slow = self.b.create_block();
+        let oa = self.addr(At::Reg(obj));
+        let t = self.tag_of(oa);
+        let is_obj = self.is_tag(t, tag::OBJECT as i64);
+        let go = self.b.create_block();
+        self.b.ins().brif(is_obj, go, &[], slow, &[]);
+        self.switch(go);
+        let p = self.payload_of(oa);
+        let class = self.b.ins().load(types::I32, flags(), p, OFF_OBJ_CLASS as i32);
+        let known = self.b.create_block();
+        for &c in classes {
+            let hit = self.b.ins().icmp_imm(IntCC::Equal, class, c as i64);
+            let other = self.b.create_block();
+            self.b.ins().brif(hit, known, &[], other, &[]);
+            self.switch(other);
+        }
+        self.b.ins().jump(slow, &[]);
+        self.switch(known);
+        let class = self.b.ins().uextend(types::I64, class);
+        let status = self.call_core(i + 1, dst, proto, b, argc, slow, Some((obj, class)));
+        let (ok, bad) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(status, bad, &[], ok, &[]);
+        self.switch(ok);
+        self.reload();
+        self.jump_next(i);
+        self.switch(bad);
+        let (pc, one) = (self.b.ins().iconst(types::I32, i as i64), self.b.ins().iconst(types::I32, 1));
+        let r = self.call(self.sigs.failed, h_call_failed as usize, &[self.env, pc, one]).unwrap();
+        self.go_on(i, r);
+
+        self.switch(slow);
+        self.call_via(i, h_method_start as usize, h_step as usize);
     }
 
     /// `돌려주자`: the frame of a call that only wants the value ends here
@@ -2705,11 +2805,7 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// `'나'`: the frame's object when it has one (else `h_op`).
     fn self_or(&mut self, i: usize, dst: Reg) {
         let fallback = self.direct_block(i);
-        self.if_framed(fallback);
-        let fp = self.b.ins().load(self.ptr, flags(), self.vm, (OFF_FRAMES + OFF_PTR) as i32);
-        let off = self.b.ins().imul_imm(self.fi, FRAME_SIZE as i64);
-        let f = self.b.ins().iadd(fp, off);
-        let this = self.b.ins().iadd_imm(f, F_THIS as i64);
+        let this = self.b.ins().iadd_imm(self.env, E_THIS as i64);
         let t = self.tag_of(this);
         let none = self.is_tag(t, TAG_UNDEF);
         let go = self.b.create_block();
@@ -2847,13 +2943,9 @@ impl<'a, 'b> Gen<'a, 'b> {
         let (checks, read) = (self.b.create_block(), self.b.create_block());
         self.b.ins().brif(access, checks, &[], read, &[]);
         self.switch(checks);
-        self.if_framed(fallback);
-        let fp = self.b.ins().load(self.ptr, flags(), self.vm, (OFF_FRAMES + OFF_PTR) as i32);
-        let off = self.b.ins().imul_imm(self.fi, FRAME_SIZE as i64);
-        let f = self.b.ins().iadd(fp, off);
-        let this_tag = self.b.ins().load(types::I32, flags(), f, F_THIS as i32);
+        let this_tag = self.b.ins().load(types::I32, flags(), self.env, E_THIS);
         let has_this = self.b.ins().icmp_imm(IntCC::NotEqual, this_tag, TAG_UNDEF);
-        let this_p = self.b.ins().load(types::I64, flags(), f, F_THIS as i32 + 8);
+        let this_p = self.b.ins().load(types::I64, flags(), self.env, E_THIS + 8);
         let oa = self.addr(At::Reg(obj));
         let obj_p = self.payload_of(oa);
         let same = self.b.ins().icmp(IntCC::Equal, this_p, obj_p);
@@ -2988,11 +3080,7 @@ impl<'a, 'b> Gen<'a, 'b> {
 
     /// The payload of the running method's object (`'나'`), or `fallback`.
     fn this_object(&mut self, fallback: Block) -> V {
-        self.if_framed(fallback);
-        let fp = self.b.ins().load(self.ptr, flags(), self.vm, (OFF_FRAMES + OFF_PTR) as i32);
-        let off = self.b.ins().imul_imm(self.fi, FRAME_SIZE as i64);
-        let f = self.b.ins().iadd(fp, off);
-        let this = self.b.ins().iadd_imm(f, F_THIS as i64);
+        let this = self.b.ins().iadd_imm(self.env, E_THIS as i64);
         let t = self.tag_of(this);
         let is_obj = self.is_tag(t, tag::OBJECT as i64);
         let go = self.b.create_block();
@@ -3091,8 +3179,25 @@ impl<'a, 'b> Gen<'a, 'b> {
         let ra = self.addr(At::Reg(r));
         let t = self.tag_of(ra);
         let undef = self.is_tag(t, TAG_UNDEF);
-        let go = self.b.create_block();
-        self.b.ins().brif(undef, go, &[], fallback, &[]);
+        let (go, again) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(undef, go, &[], again, &[]);
+
+        // Declared again (`'x'를 'x' / 2로 정하자`): the register holds it, so
+        // the value replaces it when the variable's declared type takes it.
+        self.switch(again);
+        if let Some(Loc::Reg(m)) = meta {
+            self.meta_takes(m, src, fallback);
+        }
+        let va = self.addr(At::Reg(src));
+        let vt = self.b.ins().load(types::I64, flags(), va, 0);
+        let vp = self.b.ins().load(types::I64, flags(), va, 8);
+        let ra = self.addr(At::Reg(r));
+        self.store(ra, vt, vp);
+        let va = self.addr(At::Reg(src));
+        let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
+        self.b.ins().store(flags(), undef, va, 0);
+        self.jump_next(i);
+
         self.switch(go);
         if let Some(Slot { loc: Loc::Global(g), .. }) = slots.get(2) {
             let ga = self.addr(At::Global(*g));
@@ -3122,6 +3227,47 @@ impl<'a, 'b> Gen<'a, 'b> {
             self.store(ma, t, n);
         }
         self.jump_next(i);
+    }
+
+    /// Goes on when the variable whose `meta_value` is in register `m` (none,
+    /// or a declared type and constness) takes the value in `src`: not a
+    /// constant, and a type that takes the value's tag. Else `fallback`.
+    fn meta_takes(&mut self, m: Reg, src: Reg, fallback: Block) {
+        let ma = self.addr(At::Reg(m));
+        let mt = self.tag_of(ma);
+        let is_num = self.is_tag(mt, TAG_NUM);
+        let (typed, ok) = (self.b.create_block(), self.b.create_block());
+        let untyped = self.b.create_block();
+        self.b.ins().brif(is_num, typed, &[], untyped, &[]);
+        // No meta value yet (undefined, 비어있음): no type.
+        self.switch(untyped);
+        let u = self.is_tag(mt, TAG_UNDEF);
+        let n = self.is_tag(mt, TAG_NULL);
+        let none = self.b.ins().bor(u, n);
+        self.b.ins().brif(none, ok, &[], fallback, &[]);
+
+        self.switch(typed);
+        let mv = self.num_of(ma);
+        let va = self.addr(At::Reg(src));
+        let vt = self.tag_of(va);
+        let tags = [TAG_NUM, tag::STR as i64, TAG_BOOL, tag::LIST as i64, tag::DICT as i64];
+        for want in tags {
+            let ids = types_taking(self.prog, want);
+            let this_tag = self.is_tag(vt, want);
+            let (check, other) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(this_tag, check, &[], other, &[]);
+            self.switch(check);
+            let mut fits = self.b.ins().iconst(types::I8, 0);
+            for id in ids {
+                let k = self.b.ins().f64const(id as f64);
+                let c = self.b.ins().fcmp(FloatCC::Equal, mv, k);
+                fits = self.b.ins().bor(fits, c);
+            }
+            self.b.ins().brif(fits, ok, &[], fallback, &[]);
+            self.switch(other);
+        }
+        self.b.ins().jump(fallback, &[]);
+        self.switch(ok);
     }
 
     fn get_var_reg(&mut self, i: usize, dst: Reg, r: Reg) {
@@ -3242,33 +3388,86 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// `JumpIfFalse` after it, false to `to`); anything else through `h_op`.
     fn eq_jump(&mut self, i: usize, a: Reg, b: Option<Reg>, k: Option<u32>, neg: bool, to: u32) {
         let fallback = self.direct_block(i);
-        let k = k.map(|k| self.prog.consts[k as usize].as_num());
-        if let Some(None) = k {
-            // A string constant: `h_op`.
-            self.b.ins().jump(fallback, &[]);
-            return;
-        }
-        let (x, y) = match (b, k.flatten()) {
+        let past = self.blocks.get(i + 2).copied().unwrap_or(self.trap);
+        let to = self.blocks[to as usize];
+        let xa = self.addr(At::Reg(a));
+        let ta = self.tag_of(xa);
+        let c = match (b, k) {
             (Some(b), _) => {
-                let (xa, ya) = (self.addr(At::Reg(a)), self.addr(At::Reg(b)));
-                self.both_nums(xa, ya, fallback)
-            }
-            (None, Some(y)) => {
-                let xa = self.addr(At::Reg(a));
-                let t = self.tag_of(xa);
-                let is_num = self.is_tag(t, TAG_NUM);
+                // Two numbers: as numbers. Else (not an object on the left,
+                // which may have its own <기호 같다>, and not two strings,
+                // compared by their text) the same tag and payload, as `go_eq`.
+                let ya = self.addr(At::Reg(b));
+                let tb = self.tag_of(ya);
+                let (nums, other) = (self.b.create_block(), self.b.create_block());
+                let an = self.is_tag(ta, TAG_NUM);
+                let bn = self.is_tag(tb, TAG_NUM);
+                let both = self.b.ins().band(an, bn);
+                self.b.ins().brif(both, nums, &[], other, &[]);
+                self.switch(nums);
+                let (x, y) = (self.num_of(xa), self.num_of(ya));
+                let cc = if neg { FloatCC::NotEqual } else { FloatCC::Equal };
+                let c = self.b.ins().fcmp(cc, x, y);
+                self.b.ins().brif(c, past, &[], to, &[]);
+                self.switch(other);
+                let obj = self.is_tag(ta, tag::OBJECT as i64);
+                let as_ = self.is_tag(ta, tag::STR as i64);
+                let bs = self.is_tag(tb, tag::STR as i64);
+                let strs = self.b.ins().band(as_, bs);
+                let slow = self.b.ins().bor(obj, strs);
                 let go = self.b.create_block();
-                self.b.ins().brif(is_num, go, &[], fallback, &[]);
+                self.b.ins().brif(slow, fallback, &[], go, &[]);
                 self.switch(go);
-                (self.num_of(xa), self.b.ins().f64const(y))
+                let same_tag = self.b.ins().icmp(IntCC::Equal, ta, tb);
+                let (pa, pb) = (self.payload_of(xa), self.payload_of(ya));
+                let same = self.b.ins().icmp(IntCC::Equal, pa, pb);
+                self.b.ins().band(same_tag, same)
+            }
+            (None, Some(k)) => {
+                let c = self.prog.consts[k as usize].clone();
+                match (c.as_num(), c.as_bool(), c.tag()) {
+                    (Some(y), _, _) => {
+                        let is_num = self.is_tag(ta, TAG_NUM);
+                        let go = self.b.create_block();
+                        self.b.ins().brif(is_num, go, &[], fallback, &[]);
+                        self.switch(go);
+                        let x = self.num_of(xa);
+                        let y = self.b.ins().f64const(y);
+                        let cc = if neg { FloatCC::NotEqual } else { FloatCC::Equal };
+                        let c = self.b.ins().fcmp(cc, x, y);
+                        self.b.ins().brif(c, past, &[], to, &[]);
+                        return;
+                    }
+                    // 참/거짓 and 비어있음: anything but an object (its own
+                    // <기호 같다>) is equal when it is the same.
+                    (None, Some(v), _) => {
+                        let obj = self.is_tag(ta, tag::OBJECT as i64);
+                        let go = self.b.create_block();
+                        self.b.ins().brif(obj, fallback, &[], go, &[]);
+                        self.switch(go);
+                        let is_bool = self.is_tag(ta, TAG_BOOL);
+                        let pa = self.payload_of(xa);
+                        let same = self.b.ins().icmp_imm(IntCC::Equal, pa, v as i64);
+                        self.b.ins().band(is_bool, same)
+                    }
+                    (None, None, t) if t == tag::NULL => {
+                        let obj = self.is_tag(ta, tag::OBJECT as i64);
+                        let go = self.b.create_block();
+                        self.b.ins().brif(obj, fallback, &[], go, &[]);
+                        self.switch(go);
+                        self.is_tag(ta, TAG_NULL)
+                    }
+                    // A string constant: `h_op`.
+                    _ => {
+                        self.b.ins().jump(fallback, &[]);
+                        return;
+                    }
+                }
             }
             _ => unreachable!(),
         };
-        let cc = if neg { FloatCC::NotEqual } else { FloatCC::Equal };
-        let c = self.b.ins().fcmp(cc, x, y);
-        let past = self.blocks.get(i + 2).copied().unwrap_or(self.trap);
-        let to = self.blocks[to as usize];
-        self.b.ins().brif(c, past, &[], to, &[]);
+        let (yes, no) = if neg { (to, past) } else { (past, to) };
+        self.b.ins().brif(c, yes, &[], no, &[]);
     }
 
     /// `dst = take(src)` (the register is left undefined).
@@ -3312,8 +3511,22 @@ fn simple_type(prog: &Program, ty: u32) -> Option<&'static [i64]> {
         TypeKind::Number => Some(&[TAG_NUM, TAG_NULL]),
         TypeKind::String => Some(&[tag::STR as i64, TAG_NULL]),
         TypeKind::Boolean => Some(&[TAG_BOOL, TAG_NULL]),
+        // Any list or dictionary (their elements are not looked at).
+        TypeKind::List(None) => Some(&[tag::LIST as i64, TAG_NULL]),
+        TypeKind::Dict(None) => Some(&[tag::DICT as i64, TAG_NULL]),
         _ => None,
     }
+}
+
+/// The declared types (`meta_value` numbers, not constant) a value of tag
+/// `t` fits without a closer look: none, anything, and the types
+/// `simple_type` checks by that tag.
+fn types_taking(prog: &Program, t: i64) -> Vec<u32> {
+    (0..prog.types.len() as u32)
+        .filter(|&id| simple_type(prog, id).is_some_and(|tags| tags.is_empty() || tags.contains(&t)))
+        .map(|id| id * 2)
+        .take(8)
+        .collect()
 }
 
 /// Whether a call of `proto` with `argc` arguments can start its frame in

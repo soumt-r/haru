@@ -75,3 +75,11 @@ fn lazy_frames() {
 fn method_vars() {
     check("method_vars", include_str!("jit/method_vars.hr"), include_str!("jit/method_vars.out"));
 }
+
+/// Method calls straight into compiled code: a method both classes share
+/// and one a subclass overrides, recursion, an error, a private method,
+/// a static method, a wrong argument type.
+#[test]
+fn method_calls() {
+    check("method_calls", include_str!("jit/method_calls.hr"), include_str!("jit/method_calls.out"));
+}

@@ -1,0 +1,12 @@
+90300
+903000
+3628800
+10
+100
+DivideByZeroError: 0으로 나눌 수 없어요.
+1
+2
+3
+AccessViolationError: '비밀' 기능은 내부 전용(private)이라 외부에서 부를 수 없어요.
+5
+TypeError: 'n' 인자에는 '숫자' 타입만 넘길 수 있어요. '문자열' 값이 들어왔어요.
