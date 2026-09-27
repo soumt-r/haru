@@ -67,7 +67,8 @@ jobs:
           printf '<더하기>를 만들자 ([숫자]인 %s, [숫자]인 %s):\n    %s + %s를 돌려주자\n<더하기>(1, 2)를 출력하자\n' "'가'" "'나'" "'가'" "'나'" > add.hr
           "$haru" run add.hr | grep -Fx "3"
           printf '<피보>를 만들자 (%s):\n    만약 (%s < 2) 라면:\n        %s를 돌려주자\n    (<피보>(%s - 1) + <피보>(%s - 2))를 돌려주자\n<피보>(25)를 출력하자\n' "'n'" "'n'" "'n'" "'n'" "'n'" > fib.hr
-          "$haru" run --jit fib.hr | grep -Fx "75025"
+          "$haru" run fib.hr | grep -Fx "75025"
+          "$haru" run --no-jit fib.hr | grep -Fx "75025"
           printf '[timezone]에서 <시간대서식>을 가져오자\n<시간대서식>(0, "YYYY-MM-DD HH:mm", "Asia/Seoul")를 출력하자\n' > tz.hr
           "$haru" run tz.hr | grep -F "1970-01-01 09:00"
           cd .. && rm -rf try

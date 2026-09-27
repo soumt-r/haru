@@ -2,8 +2,9 @@
 //! on standard output, runtime errors on standard error, exit status 1), so
 //! the two can be compared. A construct Haru cannot run yet exits with 3.
 //! `--time` prints how long reading and running took, measured in-process.
-//! `--jit` (or `HARU_JIT=1`) runs functions as native code; `HARU_JIT=0`
-//! turns that off again.
+//! Functions that run often become native code (the JIT) unless `--no-jit`
+//! or `HARU_JIT=0` says not to (`HARU_JIT=1` and `--jit` ask for it, as
+//! before it was the default).
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -15,8 +16,8 @@ use haru_core::{compiler, lang, syntax_report};
 
 use crate::packages::{Bundled, Resolver};
 
-/// Whether `--jit` was given.
-pub static JIT_FLAG: AtomicBool = AtomicBool::new(false);
+/// Whether the JIT is wanted: yes, unless `--no-jit` was given.
+pub static JIT_FLAG: AtomicBool = AtomicBool::new(true);
 
 fn jit_wanted() -> bool {
     match std::env::var("HARU_JIT").as_deref() {

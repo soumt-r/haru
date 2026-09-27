@@ -60,9 +60,13 @@ pub fn main_with(build: Build) -> ExitCode {
         }
         None => false,
     };
+    // The JIT is on by default; `--jit` is still taken (it asked for it before).
     if let Some(i) = args.iter().position(|a| a == "--jit") {
         args.remove(i);
-        run::JIT_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(i) = args.iter().position(|a| a == "--no-jit") {
+        args.remove(i);
+        run::JIT_FLAG.store(false, std::sync::atomic::Ordering::Relaxed);
     }
     // Hana's `--allow-file=false` / `--allow-net=false` (both allowed by default).
     for (flag, deny) in [("--allow-file", haru_std::deny_files as fn()), ("--allow-net", haru_std::deny_net)] {
@@ -99,7 +103,7 @@ pub fn main_with(build: Build) -> ExitCode {
         Some("ast") if args.len() == 2 => return ast::print(Path::new(&args[1])),
         Some("ast-check") if args.len() == 2 => return ast::check(Path::new(&args[1])),
         _ => {
-            eprintln!("usage: haru run <file> | init | add <package>[@version] | install | remove <package> | list | version | modules [--lang L] | call [--lang L] <module> <function> [args...] | ast <file> | ast-check <dir>");
+            eprintln!("usage: haru run [--no-jit] [--time] <file> | init | add <package>[@version] | install | remove <package> | list | version | modules [--lang L] | call [--lang L] <module> <function> [args...] | ast <file> | ast-check <dir>");
             return ExitCode::FAILURE;
         }
     }
