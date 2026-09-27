@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Rust tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Release builds: the JIT tests run programs long enough to get compiled,
+      # and the example package is built as a dynamic library for its test.
+      - run: cargo build --release --locked --workspace
+      - run: cargo test --release --locked --workspace
+
+  # Hana (Go) is the reference: Haru must read, run and report everything the
+  # way it does. The docs repositories are checked out too, for the parser's
+  # corpus (every code block in the docs).
+  hana:
+    name: Agrees with Hana
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: haru
+      - uses: actions/checkout@v7
+        with:
+          repository: soumt-r/hana
+          path: hana
+      - uses: actions/checkout@v7
+        with:
+          repository: soumt-r/hari-document
+          path: hari-docs
+      - uses: actions/checkout@v7
+        with:
+          repository: soumt-r/kanade-document
+          path: kanade-docs
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: hana/go.mod
+          cache-dependency-path: |
+            hana/go.sum
+            haru/tools/*/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: haru
+
+      - name: Error catalog and standard names are Hana's
+        run: |
+          (cd haru/tools/errsgen && go run . -check ../../crates/core/src/catalog.rs)
+          (cd haru/tools/stdgen && go run . -check ../../std/src/names.rs)
+
+      - name: Build hana and haru
+        run: |
+          (cd hana && go build -o hana .)
+          (cd haru && cargo build --release --locked -p haru-cli)
+
+      - name: The parser reads everything as Hana's does
+        working-directory: haru
+        run: tools/parity.sh 5
+
+      - name: Programs print what Hana prints
+        working-directory: haru
+        run: |
+          tools/runcheck.sh ../hana/hana target/release/haru ../hana/bench
+          tools/runcheck.sh ../hana/hana target/release/haru crates/core/tests/jit
+
+      - name: The JIT changes nothing
+        working-directory: haru
+        run: |
+          tools/jitcheck.sh target/release/haru ../hana/bench
+          tools/jitcheck.sh target/release/haru crates/core/tests/jit
+          HARU_JIT_HOT=3 tools/jitcheck.sh target/release/haru crates/core/tests/jit

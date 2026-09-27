@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/soumt-r/haru/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/soumt-r/haru/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Rust" src="https://img.shields.io/badge/rust-stable-b69cf6?logo=rust&logoColor=white">
   <img alt="JIT: Cranelift" src="https://img.shields.io/badge/JIT-Cranelift-a98bf2">
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-b69cf6"></a>

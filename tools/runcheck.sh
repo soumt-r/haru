@@ -9,7 +9,7 @@
 # panic) or run past 10 seconds are counted, not compared. Each run gets
 # empty input. Mismatches are listed in <corpus>/runcheck.txt.
 set -uo pipefail
-hana="$1" haru="$2" dir="$3" jobs="${4:-8}"
+hana="$(realpath "$1")" haru="$(realpath "$2")" dir="$3" jobs="${4:-8}"
 
 check() {
     local f="$1" hana="$2" haru="$3"
