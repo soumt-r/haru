@@ -18,7 +18,7 @@
 <p align="center">
   <b>Haru</b> runs <b>Hari</b> (하리) and <b>Kanade</b> (カナデ),<br>
   the programming languages you write in Korean and Japanese, in Rust.<br>
-  <sub>이름 <b>하루</b>는 봄을 뜻하는 春(はる)과, 우리말 하루(1일)를 함께 뜻해요.</sub>
+  <sub>이름 <b>하루</b>는 봄을 뜻하는 春(はる)과, 우리말 하루(day)를 함께 뜻해요.</sub>
 </p>
 
 <br>
