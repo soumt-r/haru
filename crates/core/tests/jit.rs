@@ -83,3 +83,11 @@ fn method_vars() {
 fn method_calls() {
     check("method_calls", include_str!("jit/method_calls.hr"), include_str!("jit/method_calls.out"));
 }
+
+/// Pushes and pops in compiled code: past the list's room, into a list of
+/// numbers, into a constant, from an empty list, from the front, through a
+/// variable that holds an object's list.
+#[test]
+fn lists() {
+    check("lists", include_str!("jit/lists.hr"), include_str!("jit/lists.out"));
+}

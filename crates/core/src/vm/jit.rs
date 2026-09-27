@@ -2014,6 +2014,10 @@ impl<'a, 'b> Gen<'a, 'b> {
                 }
             }
             Op::Decl { var, src, ty, konst: false } if self.decl_local_fits(var, ty) => self.decl_local(i, var, src, ty),
+            Op::ListCheck { list, target } => self.list_check(i, list, target),
+            Op::ListPush { list, val, front: false, target } => self.list_push(i, list, val, target),
+            Op::ListPush { .. } => self.direct(i),
+            Op::ListPop { dst, list, front: false } => self.list_pop(i, dst, list),
             Op::Member { dst, obj, name, skip } => self.member(i, dst, obj, name, skip),
             Op::SetMember { obj, val, name, skip } if name != NONE => self.set_member(i, obj, val, name, skip),
             Op::SetMember { .. } => self.direct(i),
@@ -2024,8 +2028,6 @@ impl<'a, 'b> Gen<'a, 'b> {
             | Op::Format { .. }
             | Op::Concat { .. }
             | Op::IterNext { .. }
-            | Op::ListCheck { .. }
-            | Op::ListPush { .. }
             | Op::NewObj { .. }
             | Op::InitField { .. }
             | Op::CallName { .. } => self.direct(i),
@@ -2722,6 +2724,155 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.b.ins().iadd(base, off)
     }
 
+    /// Goes on when the list in `list` may change: a list, and no place of
+    /// the variable it is in (`target`) holds a constant (as
+    /// `require_mutable`); `push`: and the variable's declared type (in its
+    /// register, the place `check_push` looks) takes any element. Else
+    /// `fallback`.
+    fn list_may_change(&mut self, list: Reg, target: u32, push: bool, fallback: Block) {
+        let la = self.addr(At::Reg(list));
+        let t = self.tag_of(la);
+        let is_list = self.is_tag(t, tag::LIST as i64);
+        let go = self.b.create_block();
+        self.b.ins().brif(is_list, go, &[], fallback, &[]);
+        self.switch(go);
+        if target == NONE {
+            return;
+        }
+        let slots = self.prog.vars[target as usize].slots.clone();
+        for s in &slots {
+            let m = match s.meta {
+                Some(Loc::Reg(m)) => At::Reg(m),
+                Some(Loc::Global(g)) => At::Global(g),
+                Some(Loc::This(_)) => {
+                    self.b.ins().jump(fallback, &[]);
+                    let dead = self.b.create_block();
+                    self.switch(dead);
+                    return;
+                }
+                None => continue,
+            };
+            // A constant's meta value is odd.
+            let ma = self.addr(m);
+            let mt = self.tag_of(ma);
+            let is_num = self.is_tag(mt, TAG_NUM);
+            let (num, fine) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(is_num, num, &[], fine, &[]);
+            self.switch(num);
+            let v = self.num_of(ma);
+            let n = self.b.ins().fcvt_to_sint_sat(types::I64, v);
+            let odd = self.b.ins().band_imm(n, 1);
+            self.b.ins().brif(odd, fallback, &[], fine, &[]);
+            self.switch(fine);
+        }
+        if !push {
+            return;
+        }
+        let (r, meta) = match slots.first() {
+            Some(Slot { loc: Loc::Reg(r), meta }) => (*r, *meta),
+            _ => {
+                self.b.ins().jump(fallback, &[]);
+                let dead = self.b.create_block();
+                self.switch(dead);
+                return;
+            }
+        };
+        let ra = self.addr(At::Reg(r));
+        let rt = self.tag_of(ra);
+        let undef = self.is_tag(rt, TAG_UNDEF);
+        let go = self.b.create_block();
+        self.b.ins().brif(undef, fallback, &[], go, &[]);
+        self.switch(go);
+        if let Some(Loc::Reg(m)) = meta {
+            let ma = self.addr(At::Reg(m));
+            let mt = self.tag_of(ma);
+            let is_num = self.is_tag(mt, TAG_NUM);
+            let (num, fine) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(is_num, num, &[], fine, &[]);
+            self.switch(num);
+            let v = self.num_of(ma);
+            let mut ok = self.b.ins().iconst(types::I8, 0);
+            let takes_any: Vec<u32> = (0..self.prog.types.len() as u32)
+                .filter(|&id| id == 0 || matches!(self.prog.types[id as usize].kind, TypeKind::Any | TypeKind::List(None)))
+                .take(8)
+                .collect();
+            for id in takes_any {
+                let k = self.b.ins().f64const((id * 2) as f64);
+                let c = self.b.ins().fcmp(FloatCC::Equal, v, k);
+                ok = self.b.ins().bor(ok, c);
+            }
+            self.b.ins().brif(ok, fine, &[], fallback, &[]);
+            self.switch(fine);
+        }
+    }
+
+    /// Before a push: the list may change (else `h_op` reports why).
+    fn list_check(&mut self, i: usize, list: Reg, target: u32) {
+        let fallback = self.direct_block(i);
+        self.list_may_change(list, target, false, fallback);
+        self.jump_next(i);
+    }
+
+    /// `'목록' 뒤에 x를 추가하자`: the value moves to the end when there is
+    /// room (else `h_op`, which makes room).
+    fn list_push(&mut self, i: usize, list: Reg, val: Reg, target: u32) {
+        let fallback = self.direct_block(i);
+        self.list_may_change(list, target, true, fallback);
+        let la = self.addr(At::Reg(list));
+        let p = self.payload_of(la);
+        let items = self.off_items as i32;
+        let base = self.b.ins().load(self.ptr, flags(), p, items + OFF_PTR as i32);
+        let len = self.b.ins().load(types::I64, flags(), p, items + OFF_LEN as i32);
+        let cap = self.b.ins().load(types::I64, flags(), p, items + OFF_CAP as i32);
+        let room = self.b.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+        let go = self.b.create_block();
+        self.b.ins().brif(room, go, &[], fallback, &[]);
+        self.switch(go);
+        let va = self.addr(At::Reg(val));
+        let vt = self.b.ins().load(types::I64, flags(), va, 0);
+        let vp = self.b.ins().load(types::I64, flags(), va, 8);
+        let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
+        self.b.ins().store(flags(), undef, va, 0);
+        let off = self.b.ins().ishl_imm(len, 4);
+        let e = self.b.ins().iadd(base, off);
+        self.b.ins().store(flags(), vt, e, 0);
+        self.b.ins().store(flags(), vp, e, 8);
+        let len1 = self.b.ins().iadd_imm(len, 1);
+        self.b.ins().store(flags(), len1, p, items + OFF_LEN as i32);
+        self.jump_next(i);
+    }
+
+    /// `'목록' 뒤에서 꺼내자`: the last element moves out (an empty list, or
+    /// anything else, is the interpreter's to report).
+    fn list_pop(&mut self, i: usize, dst: Reg, list: Reg) {
+        let slow = self.slow_block(i);
+        let la = self.addr(At::Reg(list));
+        let t = self.tag_of(la);
+        let is_list = self.is_tag(t, tag::LIST as i64);
+        let go = self.b.create_block();
+        self.b.ins().brif(is_list, go, &[], slow, &[]);
+        self.switch(go);
+        let p = self.payload_of(la);
+        let items = self.off_items as i32;
+        let base = self.b.ins().load(self.ptr, flags(), p, items + OFF_PTR as i32);
+        let len = self.b.ins().load(types::I64, flags(), p, items + OFF_LEN as i32);
+        let some = self.b.ins().icmp_imm(IntCC::NotEqual, len, 0);
+        let take = self.b.create_block();
+        self.b.ins().brif(some, take, &[], slow, &[]);
+        self.switch(take);
+        let len1 = self.b.ins().iadd_imm(len, -1);
+        let off = self.b.ins().ishl_imm(len1, 4);
+        let e = self.b.ins().iadd(base, off);
+        let vt = self.b.ins().load(types::I64, flags(), e, 0);
+        let vp = self.b.ins().load(types::I64, flags(), e, 8);
+        self.b.ins().store(flags(), len1, p, items + OFF_LEN as i32);
+        // The list is no longer needed here: the destination may be the
+        // register that held it.
+        let d = self.addr(At::Reg(dst));
+        self.store(d, vt, vp);
+        self.jump_next(i);
+    }
+
     /// `'목록'의 i번째` / `'표'의 "키"`: a list's item or a dictionary's
     /// value here; anything else (strings, errors) through `h_op`.
     fn index(&mut self, i: usize, dst: Reg, obj: Reg, ka: V, known: Option<f64>) {
@@ -2978,8 +3129,6 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.jump_next(i);
     }
 
-    /// A variable whose first place is register `r`: its value when it has
-    /// one (else `h_op` looks further).
     /// `'x'에 y를 더하자` (or 빼자) of numbers, into the variable's place. A
     /// method's variable is in the first of its registers that holds it
     /// (anything else: `h_op`).
@@ -3270,6 +3419,8 @@ impl<'a, 'b> Gen<'a, 'b> {
         self.switch(ok);
     }
 
+    /// A variable whose first place is register `r`: its value when it has
+    /// one (else `h_op` looks further).
     fn get_var_reg(&mut self, i: usize, dst: Reg, r: Reg) {
         let fallback = self.direct_block(i);
         let s = self.addr(At::Reg(r));
@@ -3591,6 +3742,7 @@ fn native(op: &Op, prog: &Program) -> bool {
         | Op::IterNext { .. }
         | Op::ListCheck { .. }
         | Op::ListPush { .. }
+        | Op::ListPop { front: false, .. }
         | Op::NewObj { .. }
         | Op::InitField { .. }
         | Op::CallCtor { .. }

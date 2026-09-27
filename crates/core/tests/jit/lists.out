@@ -1,0 +1,6 @@
+500500
+TypeError: '수들'에는 '(숫자)목록' 타입만 담을 수 있어요. '목록' 값이 들어왔어요.
+ConstantAssignmentError: 상수 '고'의 값은 변경할 수 없어요.
+IndexOutOfBoundsError: 목록이 비어 있어요.
+50 항목50 처음
+39
