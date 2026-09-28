@@ -466,11 +466,11 @@ dependencies = [
 
 [[package]]
 name = "haru-abi"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "haru-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "haru-core",
  "haru-example-greet",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "haru-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -502,21 +502,21 @@ dependencies = [
 
 [[package]]
 name = "haru-example-greet"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "haru-sdk",
 ]
 
 [[package]]
 name = "haru-example-greet-c"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "haru-http"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "haru-pkg-haneul"
@@ -546,14 +546,14 @@ dependencies = [
 
 [[package]]
 name = "haru-sdk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "haru-abi",
 ]
 
 [[package]]
 name = "haru-std"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "fastrand",
@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "haru-syntax"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "hashbrown"
