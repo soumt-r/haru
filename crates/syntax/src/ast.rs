@@ -98,6 +98,16 @@ pub struct FuncDecl {
     pub access: &'static str,
     pub is_static: bool,
     pub return_type: Option<TypeRef>,
+    /// Where the name is written (for the parser's diagnostics; not syntax).
+    pub src: Src,
+}
+
+/// A place in the source: line, 0-based column and length in characters.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Src {
+    pub line: u32,
+    pub col: u32,
+    pub len: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,7 +140,8 @@ pub enum Stmt {
     Throw(Expr),
     Function(FuncDecl),
     InterfaceMethod(String),
-    Constructor { id: String, params: Vec<Param>, body: Vec<Stmt> },
+    /// `src` is where it starts (for the parser's diagnostics; not syntax).
+    Constructor { id: String, params: Vec<Param>, body: Vec<Stmt>, src: Src },
 }
 
 // Hana's `String()` of each node: what Hana prints for a function value is

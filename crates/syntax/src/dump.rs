@@ -296,7 +296,7 @@ impl W {
                 w.field("ReturnType", |w| w.opt_type(&f.return_type));
             }),
             Stmt::InterfaceMethod(name) => self.node("InterfaceMethod", |w| w.field("Name", |w| w.ident(name))),
-            Stmt::Constructor { id, params, body } => self.node("ConstructorDeclaration", |w| {
+            Stmt::Constructor { id, params, body, .. } => self.node("ConstructorDeclaration", |w| {
                 w.field("Id", |w| w.ident(id));
                 w.field("Params", |w| w.params(params));
                 w.field("Body", |w| w.stmts(body));

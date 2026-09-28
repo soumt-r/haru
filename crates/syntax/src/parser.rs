@@ -26,6 +26,61 @@ pub struct Diagnostic {
     pub col: u32,
     pub length: u32,
     pub literal: String,
+    pub kind: DiagKind,
+}
+
+/// What a diagnostic is about.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum DiagKind {
+    /// A token the parser doesn't know (or the end of the input).
+    #[default]
+    UnknownToken,
+    /// A function made twice in one place.
+    DuplicateFunction,
+    /// A class's second constructor.
+    DuplicateConstructor,
+}
+
+/// Functions made twice in one place (the file, a function's body, a class)
+/// and second constructors of a class, in source order: each statement is
+/// checked against the ones before it, then its own body. Hari has no
+/// overloading (a child class overriding a method is another place). Mirrors
+/// parser/hari's duplicates in Hana.
+fn duplicates(stmts: &[Stmt], in_class: bool, out: &mut Vec<Diagnostic>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut constructors = 0;
+    for s in stmts {
+        match s {
+            Stmt::Function(f) => {
+                let key = (in_class && f.is_static, f.name.as_str());
+                if !seen.insert(key) {
+                    out.push(Diagnostic {
+                        line: f.src.line,
+                        col: f.src.col,
+                        length: f.src.len,
+                        literal: f.name.clone(),
+                        kind: DiagKind::DuplicateFunction,
+                    });
+                }
+                duplicates(&f.body.statements, false, out);
+            }
+            Stmt::Constructor { body, src, .. } => {
+                constructors += 1;
+                if constructors > 1 {
+                    out.push(Diagnostic {
+                        line: src.line,
+                        col: src.col,
+                        length: src.len,
+                        literal: "constructor".to_string(),
+                        kind: DiagKind::DuplicateConstructor,
+                    });
+                }
+                duplicates(body, false, out);
+            }
+            Stmt::Class { body, .. } => duplicates(body, true, out),
+            _ => {}
+        }
+    }
 }
 
 pub struct Parser<'a> {
@@ -148,6 +203,7 @@ impl<'a> Parser<'a> {
                 statements.push(s);
             }
         }
+        duplicates(&statements, false, &mut self.diags);
         Program { statements }
     }
 
@@ -461,7 +517,9 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let name = strip(self.consume().lit, self.lang.delim_len);
+        let name_tok = self.consume();
+        let src = Src { line: name_tok.line, col: name_tok.col, len: name_tok.lit.chars().count() as u32 };
+        let name = strip(name_tok.lit, self.lang.delim_len);
         if self.at(Kind::Particle) {
             self.consume();
         }
@@ -480,7 +538,7 @@ impl<'a> Parser<'a> {
         }
         let access = self.lang.access_modifier(action.lit);
         let body = self.parse_block();
-        Stmt::Function(FuncDecl { name, params, body, access, is_static, return_type })
+        Stmt::Function(FuncDecl { name, params, body, access, is_static, return_type, src })
     }
 
     /// Parameters up to `)`. Function declarations accept bare identifiers and
@@ -1041,6 +1099,7 @@ impl<'a> Parser<'a> {
                     col: tok.col,
                     length: tok.lit.chars().count() as u32,
                     literal: tok.lit.to_string(),
+                    kind: DiagKind::UnknownToken,
                 });
                 Expr::Str(format!("알수없음: {}", tok.lit))
             }
@@ -1048,7 +1107,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_constructor(&mut self) -> Stmt {
-        self.consume();
+        let start = self.consume();
+        let src = Src { line: start.line, col: start.col, len: start.lit.chars().count() as u32 };
         let mut params = Vec::new();
         if self.at(Kind::LParen) {
             self.consume();
@@ -1060,6 +1120,6 @@ impl<'a> Parser<'a> {
         }
         self.skip_until_colon();
         let body = self.parse_block();
-        Stmt::Constructor { id: self.lang.constructor_function_name.to_string(), params, body: body.statements }
+        Stmt::Constructor { id: self.lang.constructor_function_name.to_string(), params, body: body.statements, src }
     }
 }

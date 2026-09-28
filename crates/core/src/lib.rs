@@ -46,7 +46,14 @@ pub fn syntax_report(diags: &[haru_syntax::Diagnostic], lang: &lang::Lang) -> (&
     let messages = diags
         .iter()
         .map(|d| {
-            let e = if d.literal.is_empty() {
+            let e = if d.kind == haru_syntax::DiagKind::DuplicateFunction {
+                RuntimeError::core("SyntaxError.DuplicateFunction")
+                    .num_arg(d.line as f64)
+                    .num_arg(d.col as f64 + 1.0)
+                    .str_arg(&d.literal)
+            } else if d.kind == haru_syntax::DiagKind::DuplicateConstructor {
+                RuntimeError::core("SyntaxError.DuplicateConstructor").num_arg(d.line as f64).num_arg(d.col as f64 + 1.0)
+            } else if d.literal.is_empty() {
                 RuntimeError::core("SyntaxError.UnexpectedEnd").num_arg(d.line as f64)
             } else {
                 RuntimeError::core("SyntaxError.UnexpectedToken")

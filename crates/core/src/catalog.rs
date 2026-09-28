@@ -77,6 +77,8 @@ pub static CATALOG: &[(&str, &str, &str, &str)] = &[
     ("ReferenceError.SuperOutsideMethod", "Cannot use 'super' outside of a class method.", "'부모'는 클래스의 메서드 안에서만 쓸 수 있어요.", "『親』はクラスのメソッドの中でのみ使えます。"),
     ("ReferenceError.ThisNotBound", "'this' is not bound.", "메서드 밖에서는 '나'를 쓸 수 없어요.", "メソッドの外では『私』は使えません。"),
     ("ReferenceError.VariableNotFound", "Variable '%s' not found.", "'%s' 변수를 찾을 수 없어요.", "変数『%s』が見つかりません。"),
+    ("SyntaxError.DuplicateConstructor", "Line %[1]d, column %[2]d: this class already has a constructor. A class can have only one.", "%[1]d번째 줄 %[2]d번째 글자: 이 설계에는 '처음 만들어질 때'가 이미 있어요. 설계마다 하나만 만들 수 있어요.", "%[1]d行目、%[2]d文字目: この設計には「最初に作られる時」がすでにあります。設計ごとに一つしか作れません。"),
+    ("SyntaxError.DuplicateFunction", "Line %[1]d, column %[2]d: a function named <%[3]s> is already defined here. A function name can be used once.", "%[1]d번째 줄 %[2]d번째 글자: 같은 곳에 이름이 <%[3]s>인 함수가 이미 있어요. 함수는 이름마다 하나만 만들 수 있어요.", "%[1]d行目、%[2]d文字目: 同じところに〈%[3]s〉という関数がすでにあります。関数は名前ごとに一つしか作れません。"),
     ("SyntaxError.UnexpectedEnd", "Unexpected end of input at line %[1]d.", "%[1]d번째 줄에서 문장이 끝나지 않았어요.", "%[1]d行目で文が途中で終わっています。"),
     ("SyntaxError.UnexpectedToken", "Unexpected '%[3]s' at line %[1]d, column %[2]d.", "%[1]d번째 줄 %[2]d번째 글자의 '%[3]s'를 이해할 수 없어요.", "%[1]d行目、%[2]d文字目の「%[3]s」を解釈できません。"),
     ("TypeError.ArgumentTypeMismatch", "Argument '%[1]s' must be '%[2]s', but got '%[3]s'.", "'%[1]s' 인자에는 '%[2]s' 타입만 넘길 수 있어요. '%[3]s' 값이 들어왔어요.", "引数『%[1]s』には『%[2]s』型の値しか渡せません。『%[3]s』の値が渡されました。"),

@@ -600,6 +600,7 @@ fn builtin_error_class(lang: &Lang) -> Stmt {
                 id: lang.syntax.constructor_function_name.to_string(),
                 params: vec![ast::Param { name: lang.error_ctor_arg.to_string(), type_annotation: None, default: None }],
                 body: vec![Stmt::Assign { target: this_msg.clone(), value: Some(Expr::Identifier(lang.error_ctor_arg.to_string())) }],
+                src: ast::Src::default(),
             },
             Stmt::Function(ast::FuncDecl {
                 name: "__toString__".to_string(),
@@ -608,6 +609,7 @@ fn builtin_error_class(lang: &Lang) -> Stmt {
                 access: "public",
                 is_static: false,
                 return_type: None,
+                src: ast::Src::default(),
             }),
         ],
     }

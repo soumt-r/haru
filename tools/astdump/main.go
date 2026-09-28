@@ -236,6 +236,10 @@ func parse(p program) (tree string, ok bool) {
 // Fields (all interface{}) that are engine caches or bookkeeping, not syntax.
 var skip = map[string]bool{"Module": true, "Boxed": true, "Cooked": true, "Parts": true}
 
+// Where a declaration is written (for the parser's diagnostics, which are
+// compared on their own).
+var position = map[string]bool{"SrcLine": true, "SrcCol": true, "SrcLen": true}
+
 func dump(b *strings.Builder, v reflect.Value, field string) {
 	switch v.Kind() {
 	case reflect.Interface, reflect.Ptr:
@@ -250,7 +254,7 @@ func dump(b *strings.Builder, v reflect.Value, field string) {
 		str(b, t.Name())
 		for i := 0; i < t.NumField(); i++ {
 			f := t.Field(i)
-			if !f.IsExported() || (skip[f.Name] && f.Type.Kind() == reflect.Interface) {
+			if !f.IsExported() || (skip[f.Name] && f.Type.Kind() == reflect.Interface) || position[f.Name] {
 				continue
 			}
 			b.WriteString(",")

@@ -8,7 +8,7 @@ pub mod parser;
 pub mod profile;
 pub mod token;
 
-pub use parser::{Diagnostic, Parser};
+pub use parser::{DiagKind, Diagnostic, Parser};
 pub use profile::{Profile, HARI, KANADE};
 
 /// The profile for a source file, by extension (`.knd` is Kanade).
