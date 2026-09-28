@@ -152,25 +152,7 @@ fn civil(days: i64) -> (i64, i64, i64) {
 
 const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-pub fn now_secs() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
-}
-
-/// `Sun, 06 Nov 1994 08:49:37 GMT`.
-pub fn http_date(secs: i64) -> String {
-    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (y, m, d) = civil(days);
-    format!(
-        "{}, {d:02} {} {y:04} {:02}:{:02}:{:02} GMT",
-        DAYS[days.rem_euclid(7) as usize],
-        MONTHS[(m - 1) as usize],
-        rem / 3600,
-        rem / 60 % 60,
-        rem % 60
-    )
-}
+pub use haru_http::{http_date, now_secs};
 
 /// `27/Sep/2026 08:49:37` (UTC), for the request log.
 pub fn log_date(secs: i64) -> String {

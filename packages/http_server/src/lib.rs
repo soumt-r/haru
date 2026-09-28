@@ -10,13 +10,14 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
+use haru_http::{Job, Request, Response, Rules};
 use haru_sdk::abi::tag;
 use haru_sdk::prelude::*;
 
@@ -204,30 +205,6 @@ fn shutdown(_: &[Value]) -> Result<Value> {
     Ok(Value::NULL)
 }
 
-/// A request as the reading thread sends it over.
-struct Request {
-    method: String,
-    path: String,
-    query: Vec<(String, String)>,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-    remote: String,
-}
-
-/// What the program's thread sends back to be written.
-struct Answer {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-    /// Content-Length is left out (1xx, 204, 304).
-    bodiless: bool,
-}
-
-struct Job {
-    request: Request,
-    reply: Sender<Answer>,
-}
-
 /// `<네이티브_Listen>(port)`: serves until Shutdown.
 fn listen(args: &[Value]) -> Result<Value> {
     let j = json_args(args)?;
@@ -250,7 +227,7 @@ fn listen(args: &[Value]) -> Result<Value> {
     let local = listener.local_addr().ok();
     {
         let stop = stop.clone();
-        std::thread::spawn(move || accept_loop(listener, jobs, stop));
+        std::thread::spawn(move || haru_http::accept_loop(listener, jobs, stop, &RULES));
     }
     RUNNING.with(|r| *r.borrow_mut() = Some(stop.clone()));
     SERVING.with(|s| s.set(true));
@@ -260,8 +237,7 @@ fn listen(args: &[Value]) -> Result<Value> {
     RUNNING.with(|r| *r.borrow_mut() = None);
     // Wake the accepting thread so it sees the switch and ends.
     if let Some(a) = local {
-        let wake = if a.ip().is_unspecified() { SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), a.port()) } else { a };
-        let _ = TcpStream::connect_timeout(&wake, Duration::from_millis(200));
+        haru_http::wake(a);
     }
     Ok(Value::NULL)
 }
@@ -286,24 +262,25 @@ fn serve(incoming: &Receiver<Job>, stop: &AtomicBool) {
 }
 
 /// Go's http.Error: the message on its own line, plain text, not sniffed.
-fn error_answer(message: &str, status: u16) -> Answer {
-    Answer {
+fn error_answer(message: &str, status: u16) -> Response {
+    Response {
         status,
         headers: vec![
             ("Content-Type".into(), "text/plain; charset=utf-8".into()),
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
         body: format!("{message}\n").into_bytes(),
-        bodiless: false,
     }
 }
 
-fn handle(req: Request) -> Answer {
-    let key = format!("{} {}", req.method, req.path);
+fn handle(req: Request) -> Response {
+    // `target_ok` let only targets `split_target` reads through.
+    let (path, query) = split_target(&req.target).unwrap_or_else(|| ("/".into(), Vec::new()));
+    let key = format!("{} {path}", req.method);
     let Some(handler) = ROUTES.with(|r| r.borrow().get(&key).cloned()) else {
         return error_answer("404 page not found", 404);
     };
-    let request = match request_value(&req) {
+    let request = match request_value(&req, &path, &query) {
         Ok(v) => v,
         Err(_) => return error_answer("bad request", 500),
     };
@@ -321,19 +298,27 @@ fn handle(req: Request) -> Answer {
 }
 
 /// The request as the handler gets it (every text as JSON carries it).
-fn request_value(r: &Request) -> Result<Value> {
-    let query = Dict::new();
-    for (k, v) in &r.query {
-        query.set(k.as_str(), v.as_str())?;
+fn request_value(r: &Request, path: &str, query: &[(String, String)]) -> Result<Value> {
+    let q = Dict::new();
+    for (k, v) in query {
+        q.set(k.as_str(), v.as_str())?;
     }
+    // Go moves Host and Transfer-Encoding out of the header map; names are
+    // lower-case and the first value of each counts.
     let headers = Dict::new();
+    let mut seen: Vec<String> = Vec::new();
     for (k, v) in &r.headers {
-        headers.set(k.as_str(), v.as_str())?;
+        let key = k.to_ascii_lowercase();
+        if key == "host" || key == "transfer-encoding" || seen.contains(&key) {
+            continue;
+        }
+        headers.set(key.as_str(), json_string(v.as_bytes()).as_str())?;
+        seen.push(key);
     }
     let d = Dict::new();
     d.set("method", r.method.as_str())?;
-    d.set("path", r.path.as_str())?;
-    d.set("query", query)?;
+    d.set("path", path)?;
+    d.set("query", q)?;
     d.set("headers", headers)?;
     d.set("body", json_string(&r.body))?;
     d.set("remote", r.remote.as_str())?;
@@ -342,16 +327,15 @@ fn request_value(r: &Request) -> Result<Value> {
 
 /// Go's writeResponse: null (an empty 200), a text (text/plain), or a
 /// response {"status", "body", "type", "headers"} decoded as Go decodes it.
-fn response_of(j: &J) -> Answer {
-    let plain = |body: String| Answer {
+fn response_of(j: &J) -> Response {
+    let plain = |body: String| Response {
         status: 200,
         headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
         body: body.into_bytes(),
-        bodiless: false,
     };
     let shape_error = || error_answer("the handler must return a string or a response", 500);
     let entries = match j {
-        J::Null => return Answer { status: 200, headers: Vec::new(), body: Vec::new(), bodiless: false },
+        J::Null => return Response { status: 200, headers: Vec::new(), body: Vec::new() },
         J::Str(s) => return plain(s.clone()),
         J::Obj(e) => e,
         _ => return shape_error(),
@@ -412,8 +396,8 @@ fn response_of(j: &J) -> Answer {
         }
         return a;
     }
-    let bodiless = (100..200).contains(&code) || code == 204 || code == 304;
-    Answer { status: code as u16, headers: out, body: if bodiless { Vec::new() } else { body.into_bytes() }, bodiless }
+    let code = code as u16;
+    Response { status: code, headers: out, body: if haru_http::bodiless(code) { Vec::new() } else { body.into_bytes() } }
 }
 
 /// Go's `CanonicalMIMEHeaderKey` (a key with other characters is kept as it is).
@@ -476,100 +460,24 @@ fn bind(addr: &str) -> std::result::Result<TcpListener, String> {
     TcpListener::bind(target).map_err(|e| format!("listen tcp {addr}: bind: {}", os_message(&e)))
 }
 
-fn accept_loop(listener: TcpListener, jobs: Sender<Job>, stop: Arc<AtomicBool>) {
-    for conn in listener.incoming() {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
-        if let Ok(c) = conn {
-            let jobs = jobs.clone();
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                let _ = connection(c, jobs, stop);
-            });
-        }
-    }
-}
+/// How Go's server reads and writes, as far as the programs can tell: no
+/// limits but a body cut at 10 MB, and its answers.
+static RULES: Rules = Rules {
+    max_line: None,
+    max_headers: None,
+    max_body: 10 << 20,
+    truncate_body: true,
+    strict_length: false,
+    read_timeout: None,
+    target_ok: |t| split_target(t).is_some(),
+    refuse: bad_request,
+    write: write_answer,
+};
 
-const MAX_BODY: usize = 10 << 20;
-
-/// One connection: requests in, answers out, until either side stops.
-fn connection(stream: TcpStream, jobs: Sender<Job>, stop: Arc<AtomicBool>) -> io::Result<()> {
-    let remote = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-    let mut writer = stream.try_clone()?;
-    let mut reader = BufReader::new(stream);
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(());
-        }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.split(' ').collect();
-        if parts.len() != 3 || !parts[2].starts_with("HTTP/1.") {
-            writer.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request")?;
-            return Ok(());
-        }
-        let (method, target, version) = (parts[0].to_string(), parts[1], parts[2]);
-        let mut headers: Vec<(String, String)> = Vec::new();
-        loop {
-            let mut h = String::new();
-            if reader.read_line(&mut h)? == 0 {
-                return Ok(());
-            }
-            let h = h.trim_end_matches(['\r', '\n']);
-            if h.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':') {
-                headers.push((k.trim().to_string(), v.trim().to_string()));
-            }
-        }
-        let header = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone());
-        let Some((path, query)) = split_target(target) else {
-            writer.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request")?;
-            return Ok(());
-        };
-        if header("Expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue")) {
-            writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
-        }
-        let chunked = header("Transfer-Encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked"));
-        let mut body = if chunked {
-            read_chunked(&mut reader)?
-        } else {
-            let n: usize = header("Content-Length").and_then(|l| l.parse().ok()).unwrap_or(0);
-            let mut b = vec![0; n];
-            reader.read_exact(&mut b)?;
-            b
-        };
-        body.truncate(MAX_BODY);
-        let close = header("Connection").is_some_and(|c| c.eq_ignore_ascii_case("close"))
-            || (version == "HTTP/1.0" && !header("Connection").is_some_and(|c| c.eq_ignore_ascii_case("keep-alive")));
-
-        // Go moves Host and Transfer-Encoding out of the header map; names
-        // are lower-case and the first value of each counts.
-        let mut seen: Vec<(String, String)> = Vec::new();
-        for (k, v) in &headers {
-            let key = k.to_ascii_lowercase();
-            if key == "host" || key == "transfer-encoding" || seen.iter().any(|(s, _)| *s == key) {
-                continue;
-            }
-            seen.push((key, json_string(v.as_bytes())));
-        }
-        let head = method == "HEAD";
-        let request = Request { method, path, query, headers: seen, body, remote: remote.clone() };
-        let (reply, answer) = channel();
-        if stop.load(Ordering::SeqCst) || jobs.send(Job { request, reply }).is_err() {
-            return Ok(());
-        }
-        let Ok(a) = answer.recv() else { return Ok(()) };
-        write_answer(&mut writer, &a, head, close)?;
-        if close {
-            return Ok(());
-        }
-    }
+/// What Go writes for a request it cannot read.
+fn bad_request(w: &mut TcpStream, _status: u16) -> io::Result<()> {
+    w.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request")?;
+    w.flush()
 }
 
 /// The decoded path and the query's first values (Go's URL rules).
@@ -619,32 +527,6 @@ fn unescape(s: &str, plus: bool) -> Option<String> {
         }
     }
     Some(json_string(&out))
-}
-
-fn read_chunked(r: &mut BufReader<TcpStream>) -> io::Result<Vec<u8>> {
-    let mut body = Vec::new();
-    loop {
-        let mut line = String::new();
-        r.read_line(&mut line)?;
-        let size_text = line.trim().split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_text, 16).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
-        if size == 0 {
-            // Trailers, up to the blank line.
-            loop {
-                let mut t = String::new();
-                if r.read_line(&mut t)? == 0 || t.trim().is_empty() {
-                    return Ok(body);
-                }
-            }
-        }
-        let mut chunk = vec![0; size];
-        r.read_exact(&mut chunk)?;
-        if body.len() < MAX_BODY {
-            body.extend_from_slice(&chunk);
-        }
-        let mut crlf = String::new();
-        r.read_line(&mut crlf)?;
-    }
 }
 
 /// Go's `http.StatusText`.
@@ -716,50 +598,25 @@ fn status_text(code: u16) -> Option<&'static str> {
     })
 }
 
-/// `http.TimeFormat` of now.
-fn http_date() -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + (m <= 2) as i64;
-    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    format!(
-        "{}, {d:02} {} {y:04} {:02}:{:02}:{:02} GMT",
-        DAYS[days.rem_euclid(7) as usize],
-        MONTHS[(m - 1) as usize],
-        rem / 3600,
-        rem / 60 % 60,
-        rem % 60
-    )
-}
-
 /// What Go writes back: small bodies with their length, larger ones in chunks.
-fn write_answer(w: &mut TcpStream, a: &Answer, head: bool, close: bool) -> io::Result<()> {
+fn write_answer(w: &mut TcpStream, a: &Response, head: bool, close: bool) -> io::Result<()> {
+    let bodiless = haru_http::bodiless(a.status);
     let text = status_text(a.status).map_or_else(|| format!("status code {}", a.status), str::to_string);
     let mut out = format!("HTTP/1.1 {:03} {text}\r\n", a.status).into_bytes();
     let mut fields: Vec<(String, String)> = a
         .headers
         .iter()
-        .filter(|(k, _)| !k.is_empty() && k.bytes().all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)))
+        .filter(|(k, _)| haru_http::header_name_ok(k))
         .map(|(k, v)| (k.clone(), v.replace(['\r', '\n'], " ").trim_matches([' ', '\t']).to_string()))
         .collect();
-    let chunked = !a.bodiless && a.body.len() > 2048;
-    if !a.bodiless && !chunked {
+    let chunked = !bodiless && a.body.len() > 2048;
+    if !bodiless && !chunked {
         fields.push(("Content-Length".into(), a.body.len().to_string()));
     }
     if chunked {
         fields.push(("Transfer-Encoding".into(), "chunked".into()));
     }
-    fields.push(("Date".into(), http_date()));
+    fields.push(("Date".into(), haru_http::http_date(haru_http::now_secs())));
     if close {
         fields.push(("Connection".into(), "close".into()));
     }
@@ -768,7 +625,7 @@ fn write_answer(w: &mut TcpStream, a: &Answer, head: bool, close: bool) -> io::R
         out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
     }
     out.extend_from_slice(b"\r\n");
-    if !head && !a.bodiless {
+    if !head && !bodiless {
         if chunked {
             out.extend_from_slice(format!("{:x}\r\n", a.body.len()).as_bytes());
             out.extend_from_slice(&a.body);

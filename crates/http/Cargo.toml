@@ -1,0 +1,9 @@
+[package]
+name = "haru-http"
+description = "The HTTP/1.1 plumbing Haru's server packages share"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]

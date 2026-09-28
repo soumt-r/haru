@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/abi", "crates/sdk", "crates/syntax", "crates/core", "crates/cli", "std", "examples/greet", "packages/timezone", "packages/http_server", "packages/haneul"]
+members = ["crates/abi", "crates/sdk", "crates/syntax", "crates/core", "crates/cli", "crates/http", "std", "examples/greet", "packages/timezone", "packages/http_server", "packages/haneul"]
 
 [workspace.package]
 version = "0.2.0"
@@ -13,6 +13,7 @@ haru-sdk = { path = "crates/sdk" }
 haru-core = { path = "crates/core" }
 haru-syntax = { path = "crates/syntax" }
 haru-std = { path = "std" }
+haru-http = { path = "crates/http" }
 
 [profile.release]
 lto = "fat"

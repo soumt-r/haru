@@ -165,6 +165,7 @@ fn build(m: &mut Module) {
 | [`crates/core`](crates/core) | 値、コンパイラ、レジスタVM、JIT([`src/vm/jit.rs`](crates/core/src/vm/jit.rs))、モジュールレジストリ |
 | [`crates/abi`](crates/abi), [`crates/sdk`](crates/sdk) | ネイティブモジュールのABIと、Rustでモジュールを書くSDK |
 | [`crates/cli`](crates/cli) | `haru` コマンド |
+| [`crates/http`](crates/http) | サーバーのパッケージ(http_server、空)が共有するHTTP/1.1の接続処理 |
 | [`std/`](std) | SDKで書いた標準モジュール(実行ファイルに静的リンクされます) |
 | [`packages/`](packages), [`examples/`](examples) | 同梱のパッケージと、例のパッケージ |
 | [`tools/`](tools) | ハナと比べるツール(`runcheck.sh`、`jitcheck.sh`、`parity.sh`、エラーメッセージ・標準名前表の生成) |

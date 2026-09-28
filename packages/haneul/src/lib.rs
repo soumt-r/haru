@@ -921,7 +921,7 @@ fn run(app: Res<App>, port: Option<f64>, host: Option<Str>) -> Result<()> {
     let (jobs, incoming) = channel::<Job>();
     {
         let stop = stop.clone();
-        std::thread::spawn(move || http::accept_loop(listener, jobs, stop));
+        std::thread::spawn(move || http::accept_loop(listener, jobs, stop, &http::RULES));
     }
     *app.running.borrow_mut() = Some(stop.clone());
     let shown = match local {
@@ -945,7 +945,7 @@ fn run(app: Res<App>, port: Option<f64>, host: Option<Str>) -> Result<()> {
         }
         match incoming.recv_timeout(Duration::from_millis(50)) {
             Ok(job) => {
-                let inc = job.incoming;
+                let inc = job.request;
                 let line = format!("{} {} {}", inc.method, inc.target, inc.version);
                 let ip = inc.remote.parse::<std::net::SocketAddr>().map_or_else(|_| inc.remote.clone(), |a| a.ip().to_string());
                 let answer = match dispatch(&app, inc) {

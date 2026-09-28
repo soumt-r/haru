@@ -165,6 +165,7 @@ fn build(m: &mut Module) {
 | [`crates/core`](crates/core) | 값, 컴파일러, 레지스터 VM, JIT([`src/vm/jit.rs`](crates/core/src/vm/jit.rs)), 모듈 레지스트리 |
 | [`crates/abi`](crates/abi), [`crates/sdk`](crates/sdk) | 네이티브 모듈 ABI와 Rust로 모듈을 쓰는 SDK |
 | [`crates/cli`](crates/cli) | `haru` 명령 |
+| [`crates/http`](crates/http) | 서버 패키지(http_server, 하늘)가 함께 쓰는 HTTP/1.1 연결 처리 |
 | [`std/`](std) | SDK로 쓴 표준 모듈 (실행 파일에 정적으로 링크돼요) |
 | [`packages/`](packages), [`examples/`](examples) | 함께 두는 패키지와 예제 패키지 |
 | [`tools/`](tools) | 하나와 비교하는 도구들 (`runcheck.sh`, `jitcheck.sh`, `parity.sh`, 오류 문구·표준 이름표 생성기) |

@@ -507,9 +507,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "haru-http"
+version = "0.2.0"
+
+[[package]]
 name = "haru-pkg-haneul"
 version = "0.1.0"
 dependencies = [
+ "haru-http",
  "haru-sdk",
  "sha2",
 ]
@@ -518,6 +523,7 @@ dependencies = [
 name = "haru-pkg-http-server"
 version = "0.1.0"
 dependencies = [
+ "haru-http",
  "haru-sdk",
  "socket2",
 ]

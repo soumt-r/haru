@@ -15,4 +15,5 @@ crate-type = ["rlib"]
 
 [dependencies]
 haru-sdk.workspace = true
+haru-http.workspace = true
 sha2 = "0.10"
