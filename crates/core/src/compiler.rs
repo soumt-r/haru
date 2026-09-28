@@ -296,7 +296,7 @@ impl<'a> Compiler<'a> {
             class_protos.insert(name.clone(), cp);
         }
         self.class_defs = defs;
-        self.build_classes(&class_order, &class_protos);
+        self.build_classes(&class_order, &class_protos, lang);
 
         self.prog.protos.push(placeholder("<main>", id));
         for _ in &jobs {
@@ -686,7 +686,7 @@ impl<'a> Compiler<'a> {
 
     /// Resolves every class's lookups ahead (Hana's `classMember`,
     /// `fieldAnnotation`, constructor search and subtype checks).
-    fn build_classes(&mut self, order: &[String], protos: &HashMap<String, ClassProtos>) {
+    fn build_classes(&mut self, order: &[String], protos: &HashMap<String, ClassProtos>, lang: &Lang) {
         for name in order {
             let (chain, missing) = self.chain(name);
             let Some(Stmt::Class { base, interfaces, is_abstract, .. }) = self.class_defs.get(name).copied() else {
@@ -700,6 +700,7 @@ impl<'a> Compiler<'a> {
                 ctor: None,
                 statics: Default::default(),
                 equals: protos[name].equals,
+                operators: [None; 9],
                 init: protos[name].init,
                 lineage: Vec::new(),
                 supertypes: HashSet::new(),
@@ -747,6 +748,9 @@ impl<'a> Compiler<'a> {
                 info.supertypes.insert(sym);
             }
             let _ = interfaces;
+            for (op, mname) in info.operators.iter_mut().zip(lang.operator_methods) {
+                *op = info.members.get(&symbol::intern(mname)).and_then(|m| m.method);
+            }
             for (mname, proto, is_static, _) in &protos[name].methods {
                 if *is_static {
                     info.statics.entry(symbol::intern(mname)).or_insert(*proto);

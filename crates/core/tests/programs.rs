@@ -141,3 +141,10 @@ fn what_a_handler_catches() {
         "TypeError: 호출할 수 없는 값이에요.\n글자\n[오류 객체]\n3.5\n1\n마무리\n마무리\nDivideByZeroError: 0으로 나눌 수 없어요.\n런타임 오류: 밖\n"
     );
 }
+
+/// Kanade's operator methods (`〈記号 足す〉` …).
+#[test]
+fn kanade_operator_methods() {
+    let src = "【数】を設計しよう:\n    『v』を0にしよう\n    最初に作られる時(『v』)次のようにしよう:\n        『私』の『v』を『v』にしよう\n    〈記号 足す〉を作ろう(『o』):\n        新しい【数】((『私』の『v』 + 『o』の『v』))を返そう\n    〈記号 大きい〉を作ろう(『o』):\n        (『私』の『v』が『o』の『v』より大きい)を返そう\n『a』を新しい【数】(2)にしよう\n『a』に『a』を足そう\n(『a』の『v』)を出力しよう\n(『a』が新しい【数】(3)より大きい)を出力しよう\n";
+    assert_eq!(run_to_string(src, &KANADE), "4\n真\n");
+}

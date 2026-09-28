@@ -124,6 +124,22 @@ enum Post {
     ModuleInit(u32),
     /// A function a native function called back: its result goes back to it.
     Capture,
+    /// An operator method (`<기호 더하기>` …): its result, as `Value`.
+    Operator,
+    /// An operator method whose comparison ends a condition (`Op::CmpJump`):
+    /// a false result goes on at `to`.
+    Branch { to: u32 },
+    /// An operator method for `'x'에 y를 더하자` (`Op::Update`): its result
+    /// is assigned to `var`.
+    Assign { var: u32 },
+}
+
+impl Post {
+    /// Whether the call's argument was pushed above the caller's registers
+    /// (`Vm::call_operator`), to be dropped with the frame.
+    fn spilled(self) -> bool {
+        matches!(self, Post::Equals { .. } | Post::Operator | Post::Branch { .. } | Post::Assign { .. })
+    }
 }
 
 /// Hana's interpreter: whose classes, static variables and words code sees.
@@ -374,7 +390,7 @@ impl<'p> Vm<'p> {
             if frame.post == Post::Capture && !matches!(signal, Signal::Return(_)) {
                 // It leaves the function a native function called: back to that function.
                 let frame = self.frames.pop().unwrap();
-                self.stack.truncate(frame.base);
+                self.stack.truncate(frame.base - frame.post.spilled() as usize);
                 return Err(signal);
             }
             if let (Post::ModuleInit(_), Signal::Return(_)) = (frame.post, &signal) {
@@ -386,7 +402,7 @@ impl<'p> Vm<'p> {
                 // The import fails with it; the module may be loaded again later.
                 self.module_state[m as usize] = ModState::Unloaded;
                 let frame = self.frames.pop().unwrap();
-                self.stack.truncate(frame.base);
+                self.stack.truncate(frame.base - frame.post.spilled() as usize);
                 continue;
             }
             if self.frames.len() == 1 {
@@ -400,7 +416,7 @@ impl<'p> Vm<'p> {
                 _ => {
                     // Carry on from the caller's call instruction.
                     let frame = self.frames.pop().unwrap();
-                    self.stack.truncate(frame.base);
+                    self.stack.truncate(frame.base - frame.post.spilled() as usize);
                 }
             }
         }
@@ -1003,7 +1019,13 @@ impl<'p> Vm<'p> {
                         let result = match (reg!(a).as_num(), reg!(b).as_num(), op) {
                             (Some(x), Some(y), BinOp::Add) => boxed(x + y),
                             (Some(x), Some(y), BinOp::Sub) => boxed(x - y),
-                            _ => tri!(self.slow_binary(op, &reg!(a), &reg!(b))),
+                            _ => {
+                                if let Some((p, class)) = self.operator_method(op, &reg!(a)) {
+                                    let (x, y) = (reg!(a).clone(), reg!(b).clone());
+                                    enter!(pc, self.call_operator(p, class, x, y, 0, Post::Assign { var }, true));
+                                }
+                                tri!(self.slow_binary(op, &reg!(a), &reg!(b)))
+                            }
                         };
                         // A variable of one slot without a type or 고정: it was
                         // just read, so it exists; store straight into it.
@@ -1056,7 +1078,13 @@ impl<'p> Vm<'p> {
                         let y = &prog.consts[k as usize];
                         let v = match (x.as_num(), y.as_num()) {
                             (Some(x), Some(y)) => tri!(arith(op, x, y)),
-                            _ => tri!(self.slow_binary(op, x, y)),
+                            _ => {
+                                if let Some((p, class)) = self.operator_method(op, x) {
+                                    let (x, y) = (x.clone(), y.clone());
+                                    enter!(pc, self.call_operator(p, class, x, y, dst, Post::Operator, true));
+                                }
+                                tri!(self.slow_binary(op, x, y))
+                            }
                         };
                         reg!(dst) = v;
                     }
@@ -1064,7 +1092,13 @@ impl<'p> Vm<'p> {
                         let (x, y) = (&reg!(a), &reg!(b));
                         let v = match (x.as_num(), y.as_num()) {
                             (Some(x), Some(y)) => tri!(arith(op, x, y)),
-                            _ => tri!(self.slow_binary(op, x, y)),
+                            _ => {
+                                if let Some((p, class)) = self.operator_method(op, x) {
+                                    let (x, y) = (x.clone(), y.clone());
+                                    enter!(pc, self.call_operator(p, class, x, y, dst, Post::Operator, true));
+                                }
+                                tri!(self.slow_binary(op, x, y))
+                            }
                         };
                         reg!(dst) = v;
                     }
@@ -1073,8 +1107,8 @@ impl<'p> Vm<'p> {
                         if let Some(o) = reg!(a).as_object() {
                             if let Some(eq) = self.class(o.class).and_then(|c| c.equals) {
                                 let class = o.class;
-                                let this = reg!(a).clone();
-                                enter!(pc, self.call_proto(eq, base + b as usize, 1, dst, this, class, Post::Equals { neg }, false));
+                                let (this, arg) = (reg!(a).clone(), reg!(b).clone());
+                                enter!(pc, self.call_operator(eq, class, this, arg, dst, Post::Equals { neg }, false));
                             }
                         }
                         let eq = reg!(a).go_eq(&reg!(b));
@@ -1086,8 +1120,7 @@ impl<'p> Vm<'p> {
                             if let Some(eq) = self.class(o.class).and_then(|c| c.equals) {
                                 // The method takes the constant as its argument.
                                 let (class, this) = (o.class, reg!(a).clone());
-                                reg!(dst) = c.clone();
-                                enter!(pc, self.call_proto(eq, base + dst as usize, 1, dst, this, class, Post::Equals { neg }, false));
+                                enter!(pc, self.call_operator(eq, class, this, c.clone(), dst, Post::Equals { neg }, false));
                             }
                         }
                         let eq = reg!(a).go_eq(c);
@@ -1097,8 +1130,8 @@ impl<'p> Vm<'p> {
                         if let Some(o) = reg!(a).as_object() {
                             if let Some(eq) = self.class(o.class).and_then(|c| c.equals) {
                                 // Its result goes to the `JumpIfFalse` after this.
-                                let (class, this) = (o.class, reg!(a).clone());
-                                enter!(pc, self.call_proto(eq, base + b as usize, 1, dst, this, class, Post::Equals { neg }, false));
+                                let (class, this, arg) = (o.class, reg!(a).clone(), reg!(b).clone());
+                                enter!(pc, self.call_operator(eq, class, this, arg, dst, Post::Equals { neg }, false));
                             }
                         }
                         pc = if reg!(a).go_eq(&reg!(b)) != neg { pc + 1 } else { to as usize };
@@ -1108,8 +1141,7 @@ impl<'p> Vm<'p> {
                         if let Some(o) = reg!(a).as_object() {
                             if let Some(eq) = self.class(o.class).and_then(|c| c.equals) {
                                 let (class, this) = (o.class, reg!(a).clone());
-                                reg!(dst) = c.clone();
-                                enter!(pc, self.call_proto(eq, base + dst as usize, 1, dst, this, class, Post::Equals { neg }, false));
+                                enter!(pc, self.call_operator(eq, class, this, c.clone(), dst, Post::Equals { neg }, false));
                             }
                         }
                         pc = if reg!(a).go_eq(c) != neg { pc + 1 } else { to as usize };
@@ -1142,7 +1174,13 @@ impl<'p> Vm<'p> {
                         let (x, y) = (&reg!(a), &reg!(b));
                         let t = match (x.as_num(), y.as_num()) {
                             (Some(x), Some(y)) => compare(op, x, y),
-                            _ => tri!(self.slow_condition(op, x, y)),
+                            _ => {
+                                if let Some((p, class)) = self.operator_method(op, x) {
+                                    let (x, y) = (x.clone(), y.clone());
+                                    enter!(pc, self.call_operator(p, class, x, y, 0, Post::Branch { to }, true));
+                                }
+                                tri!(self.slow_condition(op, x, y))
+                            }
                         };
                         if !t {
                             pc = to as usize;
@@ -1152,7 +1190,13 @@ impl<'p> Vm<'p> {
                         let (x, y) = (&reg!(a), &prog.consts[k as usize]);
                         let t = match (x.as_num(), y.as_num()) {
                             (Some(x), Some(y)) => compare(op, x, y),
-                            _ => tri!(self.slow_condition(op, x, y)),
+                            _ => {
+                                if let Some((p, class)) = self.operator_method(op, x) {
+                                    let (x, y) = (x.clone(), y.clone());
+                                    enter!(pc, self.call_operator(p, class, x, y, 0, Post::Branch { to }, true));
+                                }
+                                tri!(self.slow_condition(op, x, y))
+                            }
                         };
                         if !t {
                             pc = to as usize;
@@ -2133,7 +2177,7 @@ impl<'p> Vm<'p> {
         let f = self.frames.last().unwrap();
         let (base, counted, proto_id, post, ret) = (f.base, f.counted, f.proto, f.post, f.ret);
         self.frames.drop_last();
-        self.stack.truncate(base);
+        self.stack.truncate(base - post.spilled() as usize);
         if counted {
             self.depth -= 1;
         }
@@ -2151,11 +2195,29 @@ impl<'p> Vm<'p> {
                 self.captured = Some(v);
                 return Ok(());
             }
-            Post::Value => {
+            Post::Value | Post::Operator => {
                 if proto.return_type != 0 && !self.fits(proto.return_type, &v) {
                     self.check_type(RETURN_TYPE, &proto.name, proto.return_type, &v)?;
                 }
                 v
+            }
+            Post::Branch { to } => {
+                if proto.return_type != 0 && !self.fits(proto.return_type, &v) {
+                    self.check_type(RETURN_TYPE, &proto.name, proto.return_type, &v)?;
+                }
+                match v.as_bool() {
+                    Some(true) => {}
+                    Some(false) => self.frames.last_mut().unwrap().pc = to as usize,
+                    None => return Err(err(NOT_BOOLEAN).str_arg(self.describe(&v)).into()),
+                }
+                return Ok(());
+            }
+            Post::Assign { var } => {
+                if proto.return_type != 0 && !self.fits(proto.return_type, &v) {
+                    self.check_type(RETURN_TYPE, &proto.name, proto.return_type, &v)?;
+                }
+                let fi = self.frames.len() - 1;
+                return self.assign(var, fi, v);
             }
             // Hana: no return is false for `==` and true for `!=`.
             Post::Equals { neg } if fell_off => Value::bool(neg),
@@ -2168,6 +2230,39 @@ impl<'p> Vm<'p> {
         let caller = self.frames.last().unwrap();
         self.stack[caller.base + ret as usize] = result;
         Ok(())
+    }
+
+    /// The method `op` calls on `x` and its class, when `x` is an object
+    /// whose class has one (`<기호 더하기>` …, spec 3.5).
+    fn operator_method(&self, op: BinOp, x: &Value) -> Option<(u32, u32)> {
+        let o = x.as_object()?;
+        Some((self.class(o.class)?.operators[op as usize]?, o.class))
+    }
+
+    /// Starts an operator method of `this` with `arg`, which goes in a slot
+    /// pushed above the caller's registers (so no register of the caller is
+    /// moved out) and is dropped with the frame (`Post::spilled`). A
+    /// `counted` call counts in the nesting as a call expression does (with
+    /// no `Op::Enter` before it, it counts itself).
+    #[allow(clippy::too_many_arguments)]
+    fn call_operator(&mut self, proto: u32, class: u32, this: Value, arg: Value, ret: Reg, post: Post, counted: bool) -> Flow<()> {
+        debug_assert!(post.spilled());
+        if counted {
+            if self.depth >= MAX_CALL_DEPTH {
+                return Err(err(CALL_TOO_DEEP).num_arg(MAX_CALL_DEPTH as f64).into());
+            }
+            self.depth += 1;
+        }
+        self.stack.push(arg);
+        let at = self.stack.len() - 1;
+        let started = self.call_proto(proto, at, 1, ret, this, class, post, counted);
+        if started.is_err() {
+            self.stack.truncate(at);
+            if counted {
+                self.depth -= 1;
+            }
+        }
+        started
     }
 
     /// A comparison of values that are not both numbers, as a condition.

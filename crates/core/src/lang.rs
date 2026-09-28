@@ -37,6 +37,9 @@ pub struct Lang {
     pub var_quote: (&'static str, &'static str),
     /// `<기호 같다>`: a class's `==`.
     pub equals_method: &'static str,
+    /// The method each arithmetic or comparison operator calls on an object
+    /// on its left, in `BinOp` order (`<기호 더하기>` …; Hana's `magic`).
+    pub operator_methods: [&'static str; 9],
     /// The built-in error class, its message field and constructor argument.
     pub error_class: &'static str,
     pub error_message: &'static str,
@@ -73,6 +76,7 @@ pub static HARI: Lang = Lang {
     string_contains: "포함확인",
     var_quote: ("'", "'"),
     equals_method: "기호 같다",
+    operator_methods: ["기호 더하기", "기호 빼기", "기호 곱하기", "기호 나누기", "기호 나머지", "기호 크다", "기호 작다", "기호 이상", "기호 이하"],
     error_class: "오류",
     error_message: "메시지",
     error_ctor_arg: "초기메시지",
@@ -107,6 +111,7 @@ pub static KANADE: Lang = Lang {
     string_contains: "含むか確認",
     var_quote: ("『", "』"),
     equals_method: "記号 同じだ",
+    operator_methods: ["記号 足す", "記号 引く", "記号 掛ける", "記号 割る", "記号 余り", "記号 大きい", "記号 小さい", "記号 以上", "記号 以下"],
     error_class: "エラー",
     error_message: "メッセージ",
     error_ctor_arg: "初期メッセージ",

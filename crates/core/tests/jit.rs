@@ -91,3 +91,10 @@ fn method_calls() {
 fn lists() {
     check("lists", include_str!("jit/lists.hr"), include_str!("jit/lists.out"));
 }
+
+/// Operator methods (`<기호 더하기>` …): from compiled code, in hot loops,
+/// in conditions and `더하자`, with errors inside and deep recursion.
+#[test]
+fn operators() {
+    check("operators", include_str!("jit/operators.hr"), include_str!("jit/operators.out"));
+}

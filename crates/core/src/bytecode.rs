@@ -459,6 +459,9 @@ pub struct ClassInfo {
     pub statics: crate::value::Map<u32, u32>,
     /// `<기호 같다>` of the class itself, compiled for `==`.
     pub equals: Option<u32>,
+    /// The method each other operator calls (`<기호 더하기>` …, found as a
+    /// method call finds it), by `BinOp`.
+    pub operators: [Option<u32>; 9],
     /// Its own field initializers as a body (see `Op::InitFieldsDyn`).
     pub init: u32,
     /// The class and its ancestors (instanceof, catch types).
