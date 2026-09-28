@@ -1024,6 +1024,10 @@ impl<'p> Vm<'p> {
                                     let (x, y) = (reg!(a).clone(), reg!(b).clone());
                                     enter!(pc, self.call_operator(p, class, x, y, 0, Post::Assign { var }, true));
                                 }
+                                if let Some((p, class)) = self.right_operator_method(op, &reg!(b)) {
+                                    let (x, y) = (reg!(a).clone(), reg!(b).clone());
+                                    enter!(pc, self.call_operator(p, class, y, x, 0, Post::Assign { var }, true));
+                                }
                                 tri!(self.slow_binary(op, &reg!(a), &reg!(b)))
                             }
                         };
@@ -1096,6 +1100,11 @@ impl<'p> Vm<'p> {
                                 if let Some((p, class)) = self.operator_method(op, x) {
                                     let (x, y) = (x.clone(), y.clone());
                                     enter!(pc, self.call_operator(p, class, x, y, dst, Post::Operator, true));
+                                }
+                                // The left has none: the right's `<기호 오른쪽 더하기>` ….
+                                if let Some((p, class)) = self.right_operator_method(op, y) {
+                                    let (x, y) = (x.clone(), y.clone());
+                                    enter!(pc, self.call_operator(p, class, y, x, dst, Post::Operator, true));
                                 }
                                 tri!(self.slow_binary(op, x, y))
                             }
@@ -2241,6 +2250,14 @@ impl<'p> Vm<'p> {
     fn operator_method(&self, op: BinOp, x: &Value) -> Option<(u32, u32)> {
         let o = x.as_object()?;
         Some((self.class(o.class)?.operators[op as usize]?, o.class))
+    }
+
+    /// The method an arithmetic `op` calls on `y`, an object on its right,
+    /// when the left has none (`<기호 오른쪽 더하기>` …), and its class.
+    fn right_operator_method(&self, op: BinOp, y: &Value) -> Option<(u32, u32)> {
+        let o = y.as_object()?;
+        let p = (*self.class(o.class)?.right_operators.get(op as usize)?)?;
+        Some((p, o.class))
     }
 
     /// Starts an operator method of `this` with `arg`, which goes in a slot

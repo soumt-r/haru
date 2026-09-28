@@ -693,6 +693,7 @@ impl<'a> Compiler<'a> {
                 statics: Default::default(),
                 equals: None,
                 operators: [None; 9],
+                right_operators: [None; 5],
                 init: protos[name].init,
                 lineage: Vec::new(),
                 supertypes: HashSet::new(),
@@ -744,6 +745,7 @@ impl<'a> Compiler<'a> {
             let method = |name: &str| info.members.get(&symbol::intern(name)).and_then(|m| m.method);
             info.equals = method(lang.equals_method);
             info.operators = lang.operator_methods.map(method);
+            info.right_operators = lang.right_operator_methods.map(method);
             for (mname, proto, is_static, _) in &protos[name].methods {
                 if *is_static {
                     info.statics.entry(symbol::intern(mname)).or_insert(*proto);

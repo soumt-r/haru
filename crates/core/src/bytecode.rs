@@ -463,6 +463,9 @@ pub struct ClassInfo {
     /// The method each other operator calls (`<기호 더하기>` …), likewise,
     /// by `BinOp`.
     pub operators: [Option<u32>; 9],
+    /// The method an arithmetic operator calls on an object on its right
+    /// (`<기호 오른쪽 더하기>` …), likewise, by `BinOp` (`Add` to `Mod`).
+    pub right_operators: [Option<u32>; 5],
     /// Its own field initializers as a body (see `Op::InitFieldsDyn`).
     pub init: u32,
     /// The class and its ancestors (instanceof, catch types).

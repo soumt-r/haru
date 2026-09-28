@@ -106,3 +106,10 @@ fn operators() {
 fn equals() {
     check("equals", include_str!("jit/equals.hr"), include_str!("jit/equals.out"));
 }
+
+/// Right-side operator methods (`3 * B` runs `B의 <기호 오른쪽 곱하기>(3)`),
+/// from `Bin` and `더하자`.
+#[test]
+fn right_operators() {
+    check("right_operators", include_str!("jit/right_operators.hr"), include_str!("jit/right_operators.out"));
+}
