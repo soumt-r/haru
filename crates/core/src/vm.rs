@@ -2255,14 +2255,15 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// A push/pop/clear may not change a constant's list.
+    /// A push/pop/clear may not change a constant's list. The nearest
+    /// declaration decides: a loop variable hiding a constant is not one.
     fn require_mutable(&self, target: u32, fi: usize) -> Result<(), RuntimeError> {
         if target == NONE {
             return Ok(());
         }
         let var = &self.prog.vars[target as usize];
-        for s in &var.slots {
-            if self.defined(s.loc, fi) && self.meta(*s, fi).1 {
+        if let Some(s) = self.find(var, fi) {
+            if self.meta(s, fi).1 {
                 return Err(err(CONSTANT).str_arg(self.name(var.name)));
             }
         }

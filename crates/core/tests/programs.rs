@@ -76,6 +76,14 @@ fn a_loop_pass_is_a_new_scope() {
     assert_eq!(hari(src), "런타임 오류: ReferenceError: '안' 변수를 찾을 수 없어요.\n");
 }
 
+/// A loop variable hides a constant of the same name: the nearest
+/// declaration decides whether pushing to the list is allowed.
+#[test]
+fn a_loop_variable_hiding_a_constant_is_no_constant() {
+    let src = "'목'을 [1]로 고정하자\n[[5]]의 '목'마다 반복하자:\n    '목'에 6을 추가하자\n    '목'을 이어출력하자\n'목'을 출력하자\n'목'에 2를 추가하자\n";
+    assert_eq!(hari(src), "[5, 6][1]\n런타임 오류: ConstantAssignmentError: 상수 '목'의 값은 변경할 수 없어요.\n");
+}
+
 #[test]
 fn functions_see_globals_but_not_callers() {
     let src = "<보기>를 만들자 ():\n    '전역'을 출력하자\n    '지역'을 출력하자\n'전역'을 1로 정하자\n1부터 1까지 반복하자:\n    '지역'을 2로 정하자\n    <보기>()를 실행하자\n";
