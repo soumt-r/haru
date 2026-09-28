@@ -1,0 +1,9 @@
+# The greet package in Hari and Kanade source only: no native module, so the
+# same folder is a package for Haru (this file) and for Hana (hana.pkg.json).
+[package]
+name = "greet_source"
+version = "0.1.0"
+
+[entry]
+hari = "hari/index.hr"
+kanade = "kanade/index.knd"

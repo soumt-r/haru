@@ -129,7 +129,11 @@ JIT는 기본으로 켜져 있어요. `--no-jit`이나 환경 변수 `HARU_JIT=0
 
 ## 패키지
 
-패키지는 `haru.toml`이 있는 폴더예요. 하리·카나데 소스로 쓸 수도 있고, [`crates/sdk`](crates/sdk)로 쓴 Rust 네이티브 모듈을 함께 둘 수도 있어요.
+패키지는 `haru.toml`이 있는 폴더예요. 세 가지로 쓸 수 있고, 섞어 써도 돼요. 같은 패키지를 세 가지로 쓴 예제가 [`examples/`](examples)에 있어요.
+
+- **하리·카나데 소스**: 언어마다 진입점(`hari/index.hr`, `kanade/index.knd`)을 둬요. 네이티브 코드가 없으면 하나에서도 돌아요 ([`greet_source`](examples/greet_source)).
+- **Rust**: [`crates/sdk`](crates/sdk)로 Rust 함수를 그대로 내보내요 ([`greet`](examples/greet)).
+- **C (C++, Zig 등)**: [`haru.h`](crates/abi/include/haru.h) 하나로 공유 라이브러리를 만들어요 ([`greet_c`](examples/greet_c)).
 
 ```rust
 use haru_sdk::prelude::*;
@@ -163,7 +167,7 @@ fn build(m: &mut Module) {
 | --- | --- |
 | [`crates/syntax`](crates/syntax) | 하리·카나데 렉서와 파서 (하나와 같은 트리를 만들어요) |
 | [`crates/core`](crates/core) | 값, 컴파일러, 레지스터 VM, JIT([`src/vm/jit.rs`](crates/core/src/vm/jit.rs)), 모듈 레지스트리 |
-| [`crates/abi`](crates/abi), [`crates/sdk`](crates/sdk) | 네이티브 모듈 ABI와 Rust로 모듈을 쓰는 SDK |
+| [`crates/abi`](crates/abi), [`crates/sdk`](crates/sdk) | 네이티브 모듈 ABI(C 헤더 [`haru.h`](crates/abi/include/haru.h) 포함)와 Rust로 모듈을 쓰는 SDK |
 | [`crates/cli`](crates/cli) | `haru` 명령 |
 | [`crates/http`](crates/http) | 서버 패키지(http_server, 하늘)가 함께 쓰는 HTTP/1.1 연결 처리 |
 | [`std/`](std) | SDK로 쓴 표준 모듈 (실행 파일에 정적으로 링크돼요) |

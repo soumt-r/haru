@@ -1,0 +1,13 @@
+[package]
+name = "haru-example-greet-c"
+description = "Builds the C example package (greet.c) for Haru's tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[build-dependencies]
+cc = "1"

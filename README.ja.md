@@ -129,7 +129,11 @@ JITは最初からオンです。`--no-jit` か環境変数 `HARU_JIT=0` でオ�
 
 ## パッケージ
 
-パッケージは `haru.toml` があるフォルダです。ハリ・カナデのソースで書くことも、[`crates/sdk`](crates/sdk) で書いたRustのネイティブモジュールを一緒に置くこともできます。
+パッケージは `haru.toml` があるフォルダです。三つの書き方があり、混ぜても構いません。同じパッケージを三通りに書いた例が [`examples/`](examples) にあります。
+
+- **ハリ・カナデのソース**: 言語ごとにエントリポイント(`hari/index.hr`、`kanade/index.knd`)を置きます。ネイティブコードがなければハナでも動きます([`greet_source`](examples/greet_source))。
+- **Rust**: [`crates/sdk`](crates/sdk) でRustの関数をそのまま公開します([`greet`](examples/greet))。
+- **C (C++、Zigなど)**: [`haru.h`](crates/abi/include/haru.h) だけで共有ライブラリを作ります([`greet_c`](examples/greet_c))。
 
 ```rust
 use haru_sdk::prelude::*;
@@ -163,7 +167,7 @@ fn build(m: &mut Module) {
 | --- | --- |
 | [`crates/syntax`](crates/syntax) | ハリ・カナデのレキサーとパーサー(ハナと同じ木を作ります) |
 | [`crates/core`](crates/core) | 値、コンパイラ、レジスタVM、JIT([`src/vm/jit.rs`](crates/core/src/vm/jit.rs))、モジュールレジストリ |
-| [`crates/abi`](crates/abi), [`crates/sdk`](crates/sdk) | ネイティブモジュールのABIと、Rustでモジュールを書くSDK |
+| [`crates/abi`](crates/abi), [`crates/sdk`](crates/sdk) | ネイティブモジュールのABI(Cヘッダ [`haru.h`](crates/abi/include/haru.h) を含む)と、Rustでモジュールを書くSDK |
 | [`crates/cli`](crates/cli) | `haru` コマンド |
 | [`crates/http`](crates/http) | サーバーのパッケージ(http_server、空)が共有するHTTP/1.1の接続処理 |
 | [`std/`](std) | SDKで書いた標準モジュール(実行ファイルに静的リンクされます) |

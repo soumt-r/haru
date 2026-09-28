@@ -474,6 +474,7 @@ version = "0.2.0"
 dependencies = [
  "haru-core",
  "haru-example-greet",
+ "haru-example-greet-c",
  "haru-pkg-haneul",
  "haru-pkg-http-server",
  "haru-pkg-timezone",
@@ -504,6 +505,13 @@ name = "haru-example-greet"
 version = "0.2.0"
 dependencies = [
  "haru-sdk",
+]
+
+[[package]]
+name = "haru-example-greet-c"
+version = "0.2.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

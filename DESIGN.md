@@ -63,7 +63,7 @@ haru_sdk::export!(build);
 - 인자 변환·개수 검사·타입 오류는 SDK와 호스트가 합니다. 작성자는 오류 문구를 만들지 않고 코드만 던집니다(Hana의 `errs` 방식을 패키지까지 넓힘).
 - `Str`은 호스트 문자열의 참조(복사 없음, `&str`로 쓰임), `List`/`Dict`/`Func`도 핸들입니다.
 - 같은 크레이트를 **cdylib로 빌드하면 동적 패키지**, **rlib로 링크하면 정적 모듈**입니다. 코드는 한 줄도 다르지 않습니다.
-- C/C++/Zig 작성자용으로 `haru.h`(ABI 헤더)를 생성해 둡니다. SDK는 편의 층일 뿐 필수가 아닙니다.
+- C/C++/Zig 작성자용 ABI 헤더는 `crates/abi/include/haru.h`입니다. `crates/abi/src/lib.rs`에서 생성하고(`crates/abi/tests/header.rs`, `HARU_BLESS=1`로 다시 씀), 테스트가 헤더가 최신인지 확인합니다. C++ 예약어인 필드는 `_`를 붙입니다(`throw_`, `template_`). SDK는 편의 층일 뿐 필수가 아닙니다. 같은 패키지를 Rust(`examples/greet`)·C(`examples/greet_c`)·하리/카나데 소스(`examples/greet_source`)로 쓴 예제가 있고, 테스트가 셋을 모두 불러 씁니다(C는 그 플랫폼의 C 컴파일러로 빌드).
 
 ### 3.3 std도 같은 방법으로
 

@@ -1,0 +1,30 @@
+# The greet package written in C: a native module and nothing else. Its
+# functions are found by their names in each language (`[greet_c]에서
+# <인사말>을 가져오자`). The library is prebuilt (see README.md); a package
+# that is published lists one file per platform with its url and sha256:
+#
+# [native.files.linux-amd64]
+# file = "native/libgreet_c.so"
+# url = "https://github.com/<owner>/<repo>/releases/download/v0.1.0/libgreet_c.so"
+# sha256 = "..."
+[package]
+name = "greet_c"
+version = "0.1.0"
+
+[native]
+id = "greet_c"
+
+[native.files.windows-amd64]
+file = "native/greet_c.dll"
+
+[native.files.linux-amd64]
+file = "native/libgreet_c.so"
+
+[native.files.linux-arm64]
+file = "native/libgreet_c.so"
+
+[native.files.darwin-arm64]
+file = "native/libgreet_c.dylib"
+
+[native.files.darwin-amd64]
+file = "native/libgreet_c.dylib"
