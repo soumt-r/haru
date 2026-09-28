@@ -1316,7 +1316,7 @@ unsafe extern "C" fn h_return(env: *mut Env, src: u32) -> u32 {
     let env = &mut *env;
     let vm = &mut *env.vm;
     let v = mem::replace(&mut vm.stack[env.base + src as usize], Value::UNDEF);
-    match vm.finish_call(v, false) {
+    match vm.finish_call(v) {
         Ok(()) => S_RETURNED,
         Err(s) => {
             vm.jit_signal = Some(s);
@@ -1332,7 +1332,7 @@ unsafe extern "C" fn h_return_null(env: *mut Env) -> u32 {
     if env.fi == 0 {
         return S_END;
     }
-    match vm.finish_call(Value::NULL, true) {
+    match vm.finish_call(Value::NULL) {
         Ok(()) => S_RETURNED,
         Err(s) => {
             vm.jit_signal = Some(s);

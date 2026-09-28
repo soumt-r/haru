@@ -266,10 +266,6 @@ impl<'a> Compiler<'a> {
                     Stmt::Function(f) => {
                         jobs.push(Job::Method(f));
                         cp.methods.push((f.name.clone(), base + jobs.len() as u32, f.is_static, Access::parse(f.access)));
-                        if f.name == lang.equals_method && cp.equals.is_none() {
-                            jobs.push(Job::Equals(f));
-                            cp.equals = Some(base + jobs.len() as u32);
-                        }
                     }
                     Stmt::Constructor { params, body, .. } => {
                         jobs.push(Job::Ctor(params, body));
@@ -320,7 +316,6 @@ impl<'a> Compiler<'a> {
                     f.return_type.as_ref(),
                     false,
                 ),
-                Job::Equals(f) => FnCompiler::new(self, true).compile_callable(&f.name, &f.params, &f.body.statements, None, true),
                 Job::Ctor(params, body) => {
                     FnCompiler::new(self, true).compile_callable(lang.syntax.constructor_function_name, params, body, None, false)
                 }
@@ -542,8 +537,6 @@ fn check_supported(stmts: &[Stmt], lang: &Lang, packages: &dyn Packages) -> Resu
 enum Job<'a> {
     Function(&'a ast::FuncDecl),
     Method(&'a ast::FuncDecl),
-    /// A class's `<기호 같다>` for `==`: binds only the first argument.
-    Equals(&'a ast::FuncDecl),
     Ctor(&'a [ast::Param], &'a [Stmt]),
     Getter(&'a [Stmt]),
     /// Binds only the new value (to the parameter, when it has one).
@@ -559,7 +552,6 @@ struct ClassProtos {
     /// (name, proto, static, access)
     methods: Vec<(String, u32, bool, Access)>,
     ctor: Option<u32>,
-    equals: Option<u32>,
     init: u32,
     fields: Vec<FieldDecl>,
 }
@@ -699,7 +691,7 @@ impl<'a> Compiler<'a> {
                 field_types: Default::default(),
                 ctor: None,
                 statics: Default::default(),
-                equals: protos[name].equals,
+                equals: None,
                 operators: [None; 9],
                 init: protos[name].init,
                 lineage: Vec::new(),
@@ -748,9 +740,10 @@ impl<'a> Compiler<'a> {
                 info.supertypes.insert(sym);
             }
             let _ = interfaces;
-            for (op, mname) in info.operators.iter_mut().zip(lang.operator_methods) {
-                *op = info.members.get(&symbol::intern(mname)).and_then(|m| m.method);
-            }
+            // Operator methods are found as a method call finds them.
+            let method = |name: &str| info.members.get(&symbol::intern(name)).and_then(|m| m.method);
+            info.equals = method(lang.equals_method);
+            info.operators = lang.operator_methods.map(method);
             for (mname, proto, is_static, _) in &protos[name].methods {
                 if *is_static {
                     info.statics.entry(symbol::intern(mname)).or_insert(*proto);

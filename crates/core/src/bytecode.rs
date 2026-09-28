@@ -457,10 +457,11 @@ pub struct ClassInfo {
     pub ctor: Option<u32>,
     /// Static methods of the class itself.
     pub statics: crate::value::Map<u32, u32>,
-    /// `<기호 같다>` of the class itself, compiled for `==`.
+    /// The method `==`/`!=` calls (`<기호 같다>`), found as a method call
+    /// finds it.
     pub equals: Option<u32>,
-    /// The method each other operator calls (`<기호 더하기>` …, found as a
-    /// method call finds it), by `BinOp`.
+    /// The method each other operator calls (`<기호 더하기>` …), likewise,
+    /// by `BinOp`.
     pub operators: [Option<u32>; 9],
     /// Its own field initializers as a body (see `Op::InitFieldsDyn`).
     pub init: u32,

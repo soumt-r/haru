@@ -98,3 +98,11 @@ fn lists() {
 fn operators() {
     check("operators", include_str!("jit/operators.hr"), include_str!("jit/operators.out"));
 }
+
+/// `<기호 같다>` is found as a method call finds it (a parent's too) and its
+/// argument is checked; `<` before a function call is a comparison; member
+/// access on a number names the type in the program's language.
+#[test]
+fn equals() {
+    check("equals", include_str!("jit/equals.hr"), include_str!("jit/equals.out"));
+}

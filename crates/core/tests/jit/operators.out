@@ -24,4 +24,4 @@ RecursionError: 호출이 너무 깊게 쌓여서 10000단계를 넘었어요.
 (2, 2)
 TypeError: '대상' 인자에는 '벡터' 타입만 넘길 수 있어요. '숫자' 값이 들어왔어요.
 TypeError: '+' 연산은 '숫자'와(과) '벡터' 사이에서 할 수 없어요. 자동 형변환은 하지 않아요.
-MemberAccessError: 'number' 타입의 값에는 멤버로 접근할 수 없어요.
+MemberAccessError: '숫자' 타입의 값에는 멤버로 접근할 수 없어요.

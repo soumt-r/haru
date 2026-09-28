@@ -80,9 +80,13 @@ fn match_rule(rule: Rule, s: &str) -> Option<usize> {
             body[n..].starts_with(close).then(|| open.len() + n + close.len_utf8())
         }
         Rule::Function { open, close } => {
+            // The name starts right after `<` (not a space or `=`) and stays
+            // on its line, so `<`/`<=` before a function is a comparison.
             let body = s.strip_prefix(open)?;
             let n = body.find(close)?;
-            (n > 0).then(|| open.len() + n + close.len_utf8())
+            let name = &body[..n];
+            let first = name.chars().next()?;
+            (!matches!(first, ' ' | '\t' | '\r' | '\n' | '=') && !name.contains('\n')).then(|| open.len() + n + close.len_utf8())
         }
         Rule::Type { open, close, first, rest } => {
             let body = s.strip_prefix(open)?;

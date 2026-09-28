@@ -118,7 +118,7 @@ enum Post {
     Value,
     /// Constructors and setters.
     Discard,
-    /// `<기호 같다>` for `==` (or `!=`, negated).
+    /// `<기호 같다>` for `==` (or `!=`, negated; 비어있음 is "not equal").
     Equals { neg: bool },
     /// A module's top-level code: when it ends the module is loaded.
     ModuleInit(u32),
@@ -395,7 +395,7 @@ impl<'p> Vm<'p> {
             }
             if let (Post::ModuleInit(_), Signal::Return(_)) = (frame.post, &signal) {
                 // A 돌려주자 at a module's top level ends its code: loaded.
-                self.finish_call(Value::NULL, false)?;
+                self.finish_call(Value::NULL)?;
                 return Ok(());
             }
             if let Post::ModuleInit(m) = frame.post {
@@ -409,7 +409,7 @@ impl<'p> Vm<'p> {
                 return Err(signal);
             }
             match signal {
-                Signal::Return(v) => match self.finish_call(v, false) {
+                Signal::Return(v) => match self.finish_call(v) {
                     Ok(()) => return Ok(()),
                     Err(s) => signal = s,
                 },
@@ -1108,7 +1108,7 @@ impl<'p> Vm<'p> {
                             if let Some(eq) = self.class(o.class).and_then(|c| c.equals) {
                                 let class = o.class;
                                 let (this, arg) = (reg!(a).clone(), reg!(b).clone());
-                                enter!(pc, self.call_operator(eq, class, this, arg, dst, Post::Equals { neg }, false));
+                                enter!(pc, self.call_operator(eq, class, this, arg, dst, Post::Equals { neg }, true));
                             }
                         }
                         let eq = reg!(a).go_eq(&reg!(b));
@@ -1120,7 +1120,7 @@ impl<'p> Vm<'p> {
                             if let Some(eq) = self.class(o.class).and_then(|c| c.equals) {
                                 // The method takes the constant as its argument.
                                 let (class, this) = (o.class, reg!(a).clone());
-                                enter!(pc, self.call_operator(eq, class, this, c.clone(), dst, Post::Equals { neg }, false));
+                                enter!(pc, self.call_operator(eq, class, this, c.clone(), dst, Post::Equals { neg }, true));
                             }
                         }
                         let eq = reg!(a).go_eq(c);
@@ -1131,7 +1131,7 @@ impl<'p> Vm<'p> {
                             if let Some(eq) = self.class(o.class).and_then(|c| c.equals) {
                                 // Its result goes to the `JumpIfFalse` after this.
                                 let (class, this, arg) = (o.class, reg!(a).clone(), reg!(b).clone());
-                                enter!(pc, self.call_operator(eq, class, this, arg, dst, Post::Equals { neg }, false));
+                                enter!(pc, self.call_operator(eq, class, this, arg, dst, Post::Equals { neg }, true));
                             }
                         }
                         pc = if reg!(a).go_eq(&reg!(b)) != neg { pc + 1 } else { to as usize };
@@ -1141,7 +1141,7 @@ impl<'p> Vm<'p> {
                         if let Some(o) = reg!(a).as_object() {
                             if let Some(eq) = self.class(o.class).and_then(|c| c.equals) {
                                 let (class, this) = (o.class, reg!(a).clone());
-                                enter!(pc, self.call_operator(eq, class, this, c.clone(), dst, Post::Equals { neg }, false));
+                                enter!(pc, self.call_operator(eq, class, this, c.clone(), dst, Post::Equals { neg }, true));
                             }
                         }
                         pc = if reg!(a).go_eq(c) != neg { pc + 1 } else { to as usize };
@@ -1344,7 +1344,7 @@ impl<'p> Vm<'p> {
                             }
                             tag::STR | tag::LIST | tag::RESOURCE => {}
                             tag::DICT => fail!(err(UNSUPPORTED).str_arg("dictionary method")),
-                            _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(type_name_of(&o))),
+                            _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(self.describe(&o))),
                         }
                     }
                     Op::CallMethod { dst, obj, name, target, base: b, argc } => {
@@ -1423,14 +1423,14 @@ impl<'p> Vm<'p> {
                     }
                     Op::Return { src } => {
                         let v = std::mem::replace(&mut reg!(src), Value::UNDEF);
-                        self.finish_call(v, false)?;
+                        self.finish_call(v)?;
                         continue 'frames;
                     }
                     Op::ReturnNull => {
                         if fi == 0 {
                             return Ok(());
                         }
-                        self.finish_call(Value::NULL, true)?;
+                        self.finish_call(Value::NULL)?;
                         continue 'frames;
                     }
                     Op::ReturnSignal { src } => {
@@ -1513,7 +1513,7 @@ impl<'p> Vm<'p> {
                                 }
                                 pc = skip as usize;
                             }
-                            _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(type_name_of(&o))),
+                            _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(self.describe(&o))),
                         }
                     }
                     Op::Index { dst, obj, key } => {
@@ -1864,7 +1864,7 @@ impl<'p> Vm<'p> {
                             }
                             tag::STR | tag::LIST | tag::RESOURCE => {}
                             tag::DICT => fail!(err(UNSUPPORTED).str_arg("dictionary method")),
-                            _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(type_name_of(&o))),
+                            _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(self.describe(&o))),
                         }
                     }
                     Op::CallMethodDyn { dst, obj, name, base: b, argc } => {
@@ -2168,11 +2168,10 @@ impl<'p> Vm<'p> {
         obj
     }
 
-    /// Returns from the running function with `v` (`fell_off`: its body
-    /// ended without `돌려주자`). The declared return type is checked in the
-    /// caller, as Hana checks it after the body.
+    /// Returns from the running function with `v`. The declared return type
+    /// is checked in the caller, as Hana checks it after the body.
     #[inline]
-    fn finish_call(&mut self, v: Value, fell_off: bool) -> Flow<()> {
+    fn finish_call(&mut self, v: Value) -> Flow<()> {
         // What it needs of the frame, which then goes where it is.
         let f = self.frames.last().unwrap();
         let (base, counted, proto_id, post, ret) = (f.base, f.counted, f.proto, f.post, f.ret);
@@ -2219,13 +2218,18 @@ impl<'p> Vm<'p> {
                 let fi = self.frames.len() - 1;
                 return self.assign(var, fi, v);
             }
-            // Hana: no return is false for `==` and true for `!=`.
-            Post::Equals { neg } if fell_off => Value::bool(neg),
-            Post::Equals { neg: true } => match v.as_bool() {
-                Some(b) => Value::bool(!b),
-                None => v,
-            },
-            Post::Equals { neg: false } => v,
+            // 비어있음 (nothing returned) is "not equal"; `!=` turns a
+            // true/false answer around.
+            Post::Equals { neg } => {
+                if proto.return_type != 0 && !self.fits(proto.return_type, &v) {
+                    self.check_type(RETURN_TYPE, &proto.name, proto.return_type, &v)?;
+                }
+                match v.as_bool() {
+                    _ if v.is_null() => Value::bool(neg),
+                    Some(b) if neg => Value::bool(!b),
+                    _ => v,
+                }
+            }
         };
         let caller = self.frames.last().unwrap();
         self.stack[caller.base + ret as usize] = result;
@@ -2431,7 +2435,7 @@ impl<'p> Vm<'p> {
                 Ok(Value::NULL)
             }
             tag::DICT => Err(err(UNSUPPORTED).str_arg("dictionary method")),
-            _ => Err(err(MEMBER_UNSUPPORTED).str_arg(type_name_of(o))),
+            _ => Err(err(MEMBER_UNSUPPORTED).str_arg(self.describe(o))),
         }
     }
 
@@ -2611,17 +2615,6 @@ fn boxed(n: f64) -> Value {
     Value::num(if n == 0.0 { 0.0 } else { n })
 }
 
-/// Hana's `errs.TypeNameOf`: a value's type in plain English.
-pub fn type_name_of(v: &Value) -> &'static str {
-    match v.tag() {
-        tag::NULL => "null",
-        tag::NUM => "number",
-        tag::STR => "string",
-        tag::BOOL => "boolean",
-        tag::DICT => "dict",
-        _ => "object",
-    }
-}
 
 #[cfg(test)]
 mod tests {
