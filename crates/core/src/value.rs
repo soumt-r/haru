@@ -41,6 +41,33 @@ pub struct DictObj {
     pub map: RefCell<Map<Key, Value>>,
 }
 
+impl DictObj {
+    /// The keys in the order `'사전'의 '키'마다 반복하자` walks them (Hana's
+    /// `value.SortedKeys`): numbers from small to large, then strings in
+    /// codepoint order, then 거짓 and 참; any other key last.
+    pub fn sorted_keys(&self) -> Vec<Value> {
+        fn rank(v: &Value) -> u8 {
+            match v.tag() {
+                tag::NUM => 0,
+                tag::STR => 1,
+                tag::BOOL => 2,
+                _ => 3,
+            }
+        }
+        let mut keys: Vec<Value> = self.map.borrow().keys().map(|k| k.0.clone()).collect();
+        keys.sort_by(|a, b| {
+            rank(a).cmp(&rank(b)).then_with(|| match (a.as_num(), b.as_num()) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                _ => match (a.as_str(), b.as_str()) {
+                    (Some(x), Some(y)) => x.cmp(y),
+                    _ => a.as_bool().cmp(&b.as_bool()),
+                },
+            })
+        });
+        keys
+    }
+}
+
 /// An instance: its class and its properties (created by assignment, as in
 /// Hana, so not a fixed layout). Keys are symbols (`crate::symbol`).
 pub struct ObjObj {

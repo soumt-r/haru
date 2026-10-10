@@ -177,3 +177,18 @@ fn strings_compare_in_codepoint_order() {
         );
     }
 }
+
+/// Spec 5.1: a dictionary's <포함확인>(키), and 마다 반복하자 over its keys
+/// (numbers, then strings in codepoint order, then 거짓 and 참).
+#[test]
+fn dictionaries_answer_contains_and_walk_their_keys() {
+    let src = "'d'를 {\"b\": 1, \"a\": 2, \"😀\": 4, \"ｱ\": 5, 10: 6, 9: 7, 참: 9, 거짓: 0}로 정하자\n('d'의 <포함확인>(\"a\"))을 출력하자\n('d'의 <포함확인>(\"z\"))을 출력하자\n('d'의 <포함확인>({}))을 출력하자\n'd'의 '키'마다 반복하자:\n    '키'를 출력하자\n'd'의 '키'마다 반복하자:\n    'd'의 \"새\"를 0으로 정하자\n('d'의 <포함확인>(\"새\"))을 출력하자\n('d'의 <없음>())을 출력하자\n";
+    for jit in [false, true] {
+        assert_eq!(
+            run_to_string_with(src, &HARI, jit),
+            "참\n거짓\n거짓\n9\n10\na\nb\nｱ\n😀\n거짓\n참\n참\n런타임 오류: MethodNotFoundError: '없음' 메서드를 찾을 수 없어요.\n"
+        );
+    }
+    let src = "『d』を{「b」: 1, 「a」: 2}にしよう\n(『d』の〈含むか確認〉(「a」))を出力しよう\n『d』の『キー』ごとに繰り返そう:\n    『キー』を出力しよう\n";
+    assert_eq!(run_to_string(src, &KANADE), "真\na\nb\n");
+}
