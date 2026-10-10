@@ -661,6 +661,7 @@ impl<'a> Parser<'a> {
                 ) =>
             {
                 // SOV: left right compare
+                let start = self.peek(0);
                 let right = self.parse_expression();
                 if self.at(Kind::Particle) {
                     self.consume();
@@ -668,6 +669,16 @@ impl<'a> Parser<'a> {
                 if self.at(Kind::Compare) {
                     let op = (self.lang.compare_sov)(self.consume().lit);
                     cond = Expr::Binary { left: Box::new(cond), op, right: Box::new(right) };
+                } else if let Some(t) = start {
+                    // No comparison came: report the right side instead of dropping it
+                    // (`('a'의 'k'번째 - 5)` once lost its `- 5` here).
+                    self.diags.push(Diagnostic {
+                        line: t.line,
+                        col: t.col,
+                        length: t.lit.chars().count() as u32,
+                        literal: t.lit.to_string(),
+                        kind: DiagKind::UnknownToken,
+                    });
                 }
             }
             Some(Kind::Compare) => {
@@ -951,6 +962,15 @@ impl<'a> Parser<'a> {
                 self.consume();
                 let property = self.parse_primary();
                 expr = Expr::Member { object: Box::new(expr), property: Box::new(property) };
+                // '목록'의 'k'번째: the ordinal closes the index, so an operator,
+                // a comparison or another 의 after it applies to the element.
+                if self.at(Kind::Particle) && self.lit(0) == Some(self.lang.ordinal_particle) {
+                    self.consume();
+                    // Hari's decorative 값 ('과일'의 5번째 값); Kanade's の値 is the branch above.
+                    if self.at(Kind::Ident) && self.lit(0) == Some(self.lang.popped_value_word) {
+                        self.consume();
+                    }
+                }
             } else if member {
                 // Kanade puts の before 前/後 too; leave the marker to the caller.
                 self.consume();

@@ -1255,6 +1255,8 @@ impl<'p> Vm<'p> {
                             s.chars().map(|c| Value::string(c.to_string())).collect()
                         } else if let Some(l) = v.as_list() {
                             l.items.borrow().to_vec()
+                        } else if let Some(d) = v.as_dict() {
+                            d.sorted_keys()
                         } else {
                             fail!(err(NOT_ITERABLE));
                         };
@@ -1351,8 +1353,7 @@ impl<'p> Vm<'p> {
                                     fail!(err(STATIC_MEMBER_NOT_FOUND).str_arg(self.name(name)));
                                 }
                             }
-                            tag::STR | tag::LIST | tag::RESOURCE => {}
-                            tag::DICT => fail!(err(UNSUPPORTED).str_arg("dictionary method")),
+                            tag::STR | tag::LIST | tag::RESOURCE | tag::DICT => {}
                             _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(self.describe(&o))),
                         }
                     }
@@ -1871,8 +1872,7 @@ impl<'p> Vm<'p> {
                                     fail!(err(STATIC_MEMBER_NOT_FOUND).str_arg(self.name(n)));
                                 }
                             }
-                            tag::STR | tag::LIST | tag::RESOURCE => {}
-                            tag::DICT => fail!(err(UNSUPPORTED).str_arg("dictionary method")),
+                            tag::STR | tag::LIST | tag::RESOURCE | tag::DICT => {}
                             _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(self.describe(&o))),
                         }
                     }
@@ -2304,6 +2304,18 @@ impl<'p> Vm<'p> {
                 return Ok(Value::string(s));
             }
         }
+        // Strings compare in codepoint order (spec 5.4), which is UTF-8 byte order.
+        if op.is_comparison() {
+            if let (Some(a), Some(b)) = (x.as_str(), y.as_str()) {
+                let r = match op {
+                    BinOp::Gt => a > b,
+                    BinOp::Lt => a < b,
+                    BinOp::Ge => a >= b,
+                    _ => a <= b,
+                };
+                return Ok(Value::bool(r));
+            }
+        }
         Err(err(OPERAND_TYPES).str_arg(op.symbol()).str_arg(self.describe(x)).str_arg(self.describe(y)))
     }
 
@@ -2451,7 +2463,16 @@ impl<'p> Vm<'p> {
                 o.as_list().unwrap().items.borrow_mut().clear();
                 Ok(Value::NULL)
             }
-            tag::DICT => Err(err(UNSUPPORTED).str_arg("dictionary method")),
+            // A dictionary's one method: <포함확인>(키), whether it has the key.
+            tag::DICT => {
+                if name != l.string_contains {
+                    return Err(err(METHOD_NOT_FOUND).str_arg(name));
+                }
+                if args.len() != 1 {
+                    return Err(err(ARG_COUNT).num_arg(1.0));
+                }
+                Ok(Value::bool(Key::view(&args[0]).is_some_and(|k| o.as_dict().unwrap().map.borrow().contains_key(k))))
+            }
             _ => Err(err(MEMBER_UNSUPPORTED).str_arg(self.describe(o))),
         }
     }

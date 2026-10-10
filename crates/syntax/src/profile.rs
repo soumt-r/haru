@@ -78,6 +78,9 @@ pub struct Profile {
     pub condition_then_words: &'static [&'static str],
     pub popped_value_word: &'static str,
     pub member_particle: &'static str,
+    /// Closes an index after the member particle ('목록'의 'k'번째). The
+    /// member chain eats it, so `'a'의 'k'번째 - 5` is (a[k]) - 5.
+    pub ordinal_particle: &'static str,
     pub type_in_word: &'static str,
     pub template_prefix: &'static str,
     pub template_suffix: &'static str,
@@ -432,6 +435,7 @@ pub static HARI: Profile = Profile {
     condition_then_words: &["라면"],
     popped_value_word: "값",
     member_particle: "의",
+    ordinal_particle: "번째",
     type_in_word: "인",
     template_prefix: "틀\"",
     template_suffix: "\"",
@@ -461,6 +465,7 @@ pub static KANADE: Profile = Profile {
     condition_then_words: &["なら", "ならば"],
     popped_value_word: "値",
     member_particle: "の",
+    ordinal_particle: "番目",
     type_in_word: "の",
     template_prefix: "枠「",
     template_suffix: "」",

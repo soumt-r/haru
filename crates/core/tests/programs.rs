@@ -3,7 +3,7 @@
 //! Hana's quirks included, from regressing without Hana at hand.
 
 use haru_core::lang::{HARI, KANADE};
-use haru_core::run_to_string;
+use haru_core::{run_to_string, run_to_string_with};
 
 fn hari(src: &str) -> String {
     run_to_string(src, &HARI)
@@ -147,4 +147,48 @@ fn what_a_handler_catches() {
 fn kanade_operator_methods() {
     let src = "【数】を設計しよう:\n    『v』を0にしよう\n    最初に作られる時(『v』)次のようにしよう:\n        『私』の『v』を『v』にしよう\n    〈記号 足す〉を作ろう(『o』):\n        新しい【数】((『私』の『v』 + 『o』の『v』))を返そう\n    〈記号 大きい〉を作ろう(『o』):\n        (『私』の『v』が『o』の『v』より大きい)を返そう\n『a』を新しい【数】(2)にしよう\n『a』に『a』を足そう\n(『a』の『v』)を出力しよう\n(『a』が新しい【数】(3)より大きい)を出力しよう\n";
     assert_eq!(run_to_string(src, &KANADE), "4\n真\n");
+}
+
+/// '목록'의 'k'번째 is one operand: the operator, comparison or next 의
+/// after the ordinal applies to the element (it once dropped `- 5` silently).
+#[test]
+fn an_ordinal_index_is_one_operand() {
+    let src = "'a'를 [(숫자)목록]인 [10, 20, 30]로 정하자\n'k'를 [숫자]인 2로 정하자\n('a'의 'k'번째 - 5)을 출력하자\n('a'의 3번째 - 'a'의 1번째)을 출력하자\n('a'의 2번째 + 1)을 출력하자\n('a'의 'k'번째 * 3)을 출력하자\n('a'의 1번째 < 'a'의 2번째)을 출력하자\n('a'의 'k'번째와 20이 같다)을 출력하자\n'격자'를 [[1, 2], [3, 4]]로 정하자\n'격자'의 2번째의 1번째를 출력하자\n('a'의 3번째 값 - 1)을 출력하자\n";
+    for jit in [false, true] {
+        assert_eq!(run_to_string_with(src, &HARI, jit), "15\n20\n21\n60\n참\n참\n3\n29\n");
+    }
+    let src = "『a』を【(数字)リスト】の【10, 20, 30】にしよう\n(『a』の2番目 - 5)を出力しよう\n『格子』を【【1, 2】, 【3, 4】】にしよう\n『格子』の2番目の1番目を出力しよう\n(『a』の3番目の値 - 1)を出力しよう\n";
+    assert_eq!(run_to_string(src, &KANADE), "15\n3\n29\n");
+    // A comparison's right side with no comparison after it is reported, not dropped.
+    assert_eq!(
+        hari("'x'를 3으로 정하자\n('x' 5)을 출력하자\n"),
+        "구문 분석(Parsing) 중 오류가 발생했어요:\n  - SyntaxError: 2번째 줄 6번째 글자의 '5'를 이해할 수 없어요.\n"
+    );
+}
+
+/// Spec 5.4: strings compare in codepoint order; a string and a number do not.
+#[test]
+fn strings_compare_in_codepoint_order() {
+    let src = "(\"a\" < \"b\")을 출력하자\n(\"b\" <= \"a\")을 출력하자\n(\"가\" > \"나\")을 출력하자\n(\"abc\" >= \"abc\")을 출력하자\n(\"😀\" > \"ｱ\")을 출력하자\n(\"ab\" < \"abc\")을 출력하자\n's'를 \"a\"로 정하자\n('s' < \"aaa\") 동안 반복하자:\n    's'에 \"a\"를 더하자\n's'를 출력하자\n(\"1\" < 2)을 출력하자\n";
+    for jit in [false, true] {
+        assert_eq!(
+            run_to_string_with(src, &HARI, jit),
+            "참\n거짓\n거짓\n참\n참\n참\naaa\n런타임 오류: TypeError: '<' 연산은 '문자열'와(과) '숫자' 사이에서 할 수 없어요. 자동 형변환은 하지 않아요.\n"
+        );
+    }
+}
+
+/// Spec 5.1: a dictionary's <포함확인>(키), and 마다 반복하자 over its keys
+/// (numbers, then strings in codepoint order, then 거짓 and 참).
+#[test]
+fn dictionaries_answer_contains_and_walk_their_keys() {
+    let src = "'d'를 {\"b\": 1, \"a\": 2, \"😀\": 4, \"ｱ\": 5, 10: 6, 9: 7, 참: 9, 거짓: 0}로 정하자\n('d'의 <포함확인>(\"a\"))을 출력하자\n('d'의 <포함확인>(\"z\"))을 출력하자\n('d'의 <포함확인>({}))을 출력하자\n'd'의 '키'마다 반복하자:\n    '키'를 출력하자\n'd'의 '키'마다 반복하자:\n    'd'의 \"새\"를 0으로 정하자\n('d'의 <포함확인>(\"새\"))을 출력하자\n('d'의 <없음>())을 출력하자\n";
+    for jit in [false, true] {
+        assert_eq!(
+            run_to_string_with(src, &HARI, jit),
+            "참\n거짓\n거짓\n9\n10\na\nb\nｱ\n😀\n거짓\n참\n참\n런타임 오류: MethodNotFoundError: '없음' 메서드를 찾을 수 없어요.\n"
+        );
+    }
+    let src = "『d』を{「b」: 1, 「a」: 2}にしよう\n(『d』の〈含むか確認〉(「a」))を出力しよう\n『d』の『キー』ごとに繰り返そう:\n    『キー』を出力しよう\n";
+    assert_eq!(run_to_string(src, &KANADE), "真\na\nb\n");
 }
