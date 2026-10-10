@@ -2304,6 +2304,18 @@ impl<'p> Vm<'p> {
                 return Ok(Value::string(s));
             }
         }
+        // Strings compare in codepoint order (spec 5.4), which is UTF-8 byte order.
+        if op.is_comparison() {
+            if let (Some(a), Some(b)) = (x.as_str(), y.as_str()) {
+                let r = match op {
+                    BinOp::Gt => a > b,
+                    BinOp::Lt => a < b,
+                    BinOp::Ge => a >= b,
+                    _ => a <= b,
+                };
+                return Ok(Value::bool(r));
+            }
+        }
         Err(err(OPERAND_TYPES).str_arg(op.symbol()).str_arg(self.describe(x)).str_arg(self.describe(y)))
     }
 
