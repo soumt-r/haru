@@ -266,6 +266,65 @@ mod tests {
         assert!(s.cap + s.off < 8 * 1000, "{} + {}", s.cap, s.off);
     }
 
+    /// Random operations, front ones mixed with everything else, give what a
+    /// `Vec` gives; `Rc` counts catch an item dropped twice or never (and Miri,
+    /// `cargo +nightly miri test -p haru-core --lib stack`, catches the rest).
+    #[test]
+    fn matches_a_vec_under_random_operations() {
+        use std::rc::Rc;
+        let rounds = if cfg!(miri) { 400 } else { 200_000 };
+        let token = Rc::new(());
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut s: Stack<(usize, Rc<()>)> = Stack::with_capacity(0);
+        let mut v: Vec<(usize, Rc<()>)> = Vec::new();
+        for round in 0..rounds {
+            let item = || (round, token.clone());
+            match next(12) {
+                0..=2 => {
+                    s.push(item());
+                    v.push(item());
+                }
+                3..=5 if !v.is_empty() => assert_eq!(s.remove(0).0, v.remove(0).0),
+                6 => {
+                    s.insert(0, item());
+                    v.insert(0, item());
+                }
+                7 if !v.is_empty() => assert_eq!(s.pop().map(|x| x.0), v.pop().map(|x| x.0)),
+                8 => {
+                    let i = next(v.len() + 1);
+                    s.insert(i, item());
+                    v.insert(i, item());
+                }
+                9 if !v.is_empty() => {
+                    let i = next(v.len());
+                    assert_eq!(s.remove(i).0, v.remove(i).0);
+                }
+                10 => {
+                    let n = next(v.len() + 3);
+                    s.resize(n, item());
+                    v.resize(n, item());
+                }
+                11 if next(50) == 0 => {
+                    s.clear();
+                    v.clear();
+                }
+                _ => {}
+            }
+            assert!(s.iter().map(|x| x.0).eq(v.iter().map(|x| x.0)));
+            assert!(s.len <= s.cap);
+            assert_eq!(Rc::strong_count(&token), 1 + s.len() + v.len());
+        }
+        drop(s);
+        drop(v);
+        assert_eq!(Rc::strong_count(&token), 1);
+    }
+
     #[test]
     fn drops_what_is_left() {
         use std::rc::Rc;
