@@ -40,7 +40,8 @@ pub fn call(id: u8, args: &[Value], lang: &Lang) -> Result<Value, RuntimeError> 
             Some(n) => {
                 let code = go_rune(n);
                 let c = u32::try_from(code).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}');
-                Ok(Value::string(c.to_string()))
+                let mut buf = [0u8; 4];
+                Ok(Value::str(c.encode_utf8(&mut buf)))
             }
             None => Err(RuntimeError::core(TO_TEXT)),
         },

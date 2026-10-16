@@ -778,8 +778,8 @@ impl<'p> Vm<'p> {
                 Ok(None)
             }
             Some(FuncObj::Builtin(b)) => {
-                let args: Vec<Value> = (0..argc as usize).map(|i| self.stack[arg_base + i].clone()).collect();
-                Ok(Some(builtins::call(*b, &args, self.lang)?))
+                let args = &self.stack[arg_base..arg_base + argc as usize];
+                Ok(Some(builtins::call(*b, args, self.lang)?))
             }
             Some(&FuncObj::Native { module: m, func }) => {
                 let Some(rt) = self.runtime else {
@@ -1275,8 +1275,13 @@ impl<'p> Vm<'p> {
                     }
 
                     Op::Print { src, newline } => {
-                        let text = display(&reg!(src), self.lang);
-                        self.print(&text, newline);
+                        let v = &reg!(src);
+                        if let Some(s) = v.as_str() {
+                            self.print(s, newline);
+                        } else {
+                            let text = display(v, self.lang);
+                            self.print(&text, newline);
+                        }
                     }
                     Op::Input { var, ty } => {
                         self.flush();
@@ -1394,8 +1399,8 @@ impl<'p> Vm<'p> {
                                 self.depth -= 1;
                             }
                             _ => {
-                                let args: Vec<Value> = (0..argc as usize).map(|i| reg!(b as usize + i).clone()).collect();
-                                let v = tri!(self.call_method(&o, self.name(name), target, fi, &args));
+                                let args = &self.stack[base + b as usize..base + b as usize + argc as usize];
+                                let v = tri!(self.call_method(&o, self.name(name), target, fi, args));
                                 reg!(dst) = v;
                                 self.depth -= 1;
                             }
@@ -1490,8 +1495,8 @@ impl<'p> Vm<'p> {
                         reg!(dst) = Value::dict(map);
                     }
                     Op::Member { dst, obj, name, skip } => {
-                        let o = reg!(obj).clone();
                         let length = name == self.length_word;
+                        let o = &reg!(obj);
                         match o.tag() {
                             tag::LIST if length => {
                                 let n = o.as_list().unwrap().items.borrow().len();
@@ -1505,6 +1510,7 @@ impl<'p> Vm<'p> {
                             }
                             tag::LIST | tag::STR | tag::DICT => {}
                             tag::OBJECT => {
+                                let o = o.clone();
                                 let class = o.as_object().unwrap().class;
                                 let m = self.member_of(class, name);
                                 tri!(self.check_access(fi, &o, m.field_access, false, name));
@@ -1523,11 +1529,26 @@ impl<'p> Vm<'p> {
                                 }
                                 pc = skip as usize;
                             }
-                            _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(self.describe(&o))),
+                            _ => fail!(err(MEMBER_UNSUPPORTED).str_arg(self.describe(o))),
                         }
                     }
                     Op::Index { dst, obj, key } => {
-                        let v = tri!(self.index(&reg!(obj), &reg!(key)));
+                        let o = &reg!(obj);
+                        let k = &reg!(key);
+                        if o.tag() == tag::LIST {
+                            if let Some(n) = k.as_num() {
+                                let i = go_int(n) - 1;
+                                let list = o.as_list().unwrap();
+                                let items = list.items.borrow();
+                                if i >= 0 && (i as usize) < items.len() {
+                                    let item = items[i as usize].clone();
+                                    drop(items);
+                                    reg!(dst) = item;
+                                    continue;
+                                }
+                            }
+                        }
+                        let v = tri!(self.index(o, k));
                         reg!(dst) = v;
                     }
                     Op::DictK { dst, obj, k, skip } => {
@@ -1548,12 +1569,40 @@ impl<'p> Vm<'p> {
                         }
                     }
                     Op::IndexK { dst, obj, k } => {
-                        let v = tri!(self.index(&reg!(obj), &prog.consts[k as usize]));
+                        let o = &reg!(obj);
+                        let c = &prog.consts[k as usize];
+                        if o.tag() == tag::LIST {
+                            if let Some(n) = c.as_num() {
+                                let i = go_int(n) - 1;
+                                let list = o.as_list().unwrap();
+                                let items = list.items.borrow();
+                                if i >= 0 && (i as usize) < items.len() {
+                                    let item = items[i as usize].clone();
+                                    drop(items);
+                                    reg!(dst) = item;
+                                    continue;
+                                }
+                            }
+                        }
+                        let v = tri!(self.index(o, c));
                         reg!(dst) = v;
                     }
                     Op::SetIndexK { obj, k, val } => {
-                        let (o, v) = (reg!(obj).clone(), reg!(val).clone());
-                        tri!(self.set_index(&o, prog.consts[k as usize].clone(), v));
+                        let o = &reg!(obj);
+                        let c = &prog.consts[k as usize];
+                        if o.tag() == tag::LIST {
+                            if let Some(n) = c.as_num() {
+                                let i = go_int(n) - 1;
+                                let list = o.as_list().unwrap();
+                                let mut items = list.items.borrow_mut();
+                                if i >= 0 && (i as usize) < items.len() {
+                                    items[i as usize] = reg!(val).clone();
+                                    continue;
+                                }
+                            }
+                        }
+                        let (o, v) = (o.clone(), reg!(val).clone());
+                        tri!(self.set_index(&o, c.clone(), v));
                     }
                     Op::IndexFail { key, .. } => {
                         // A key that cannot be computed reports its own error.
@@ -1594,7 +1643,20 @@ impl<'p> Vm<'p> {
                         }
                     }
                     Op::SetIndex { obj, key, val } => {
-                        let (o, k, v) = (reg!(obj).clone(), reg!(key).clone(), reg!(val).clone());
+                        let o = &reg!(obj);
+                        let k = &reg!(key);
+                        if o.tag() == tag::LIST {
+                            if let Some(n) = k.as_num() {
+                                let i = go_int(n) - 1;
+                                let list = o.as_list().unwrap();
+                                let mut items = list.items.borrow_mut();
+                                if i >= 0 && (i as usize) < items.len() {
+                                    items[i as usize] = reg!(val).clone();
+                                    continue;
+                                }
+                            }
+                        }
+                        let (o, k, v) = (o.clone(), k.clone(), reg!(val).clone());
                         tri!(self.set_index(&o, k, v));
                     }
                     Op::SetIndexFail { obj, val, name, key, skip } => {
@@ -1617,21 +1679,27 @@ impl<'p> Vm<'p> {
                         tri!(self.require_mutable(target, fi));
                     }
                     Op::ListPush { list, val, front, target } => {
-                        let l = reg!(list).clone();
-                        let v = std::mem::replace(&mut reg!(val), Value::UNDEF);
+                        let v = if val == list {
+                            reg!(val).clone()
+                        } else {
+                            std::mem::replace(&mut reg!(val), Value::UNDEF)
+                        };
+                        let l = &reg!(list);
                         let items = &l.as_list().unwrap().items;
                         if front {
                             items.borrow_mut().insert(0, v);
                         } else {
                             items.borrow_mut().push(v);
                         }
-                        if let Err(e) = self.check_push(target, fi, &l, front) {
-                            if front {
-                                items.borrow_mut().remove(0);
-                            } else {
-                                items.borrow_mut().pop();
+                        if target != NONE {
+                            if let Err(e) = self.check_push(target, fi, l, front) {
+                                if front {
+                                    items.borrow_mut().remove(0);
+                                } else {
+                                    items.borrow_mut().pop();
+                                }
+                                fail!(e);
                             }
-                            fail!(e);
                         }
                     }
                     Op::CheckFieldPush { list, obj, name, front } => {
@@ -1653,7 +1721,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                     Op::ListPop { dst, list, front } => {
-                        let l = reg!(list).clone();
+                        let l = &reg!(list);
                         let mut items = l.as_list().unwrap().items.borrow_mut();
                         if items.is_empty() {
                             drop(items);
@@ -1665,8 +1733,13 @@ impl<'p> Vm<'p> {
                     }
 
                     Op::Format { dst, src } => {
-                        let text = display(&reg!(src), self.lang);
-                        reg!(dst) = Value::string(text);
+                        let v = &reg!(src);
+                        if v.tag() == tag::STR {
+                            reg!(dst) = v.clone();
+                        } else {
+                            let text = display(v, self.lang);
+                            reg!(dst) = Value::string(text);
+                        }
                     }
                     Op::Concat { dst, base: b, n } => {
                         let len: usize = (0..n as usize).map(|i| reg!(b as usize + i).as_str().map_or(0, str::len)).sum();
@@ -1899,8 +1972,8 @@ impl<'p> Vm<'p> {
                                 }
                             }
                             _ => {
-                                let args: Vec<Value> = (0..argc as usize).map(|i| reg!(b as usize + i).clone()).collect();
-                                let v = tri!(self.call_method(&o, self.name(n), NONE, fi, &args));
+                                let args = &self.stack[base + b as usize..base + b as usize + argc as usize];
+                                let v = tri!(self.call_method(&o, self.name(n), NONE, fi, args));
                                 reg!(dst) = v;
                                 self.depth -= 1;
                             }

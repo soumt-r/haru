@@ -733,6 +733,9 @@ fn op_name(vm: &Vm, fi: usize, pc: u32) -> String {
 /// call's and its callers' up to one that has its frame), oldest first:
 /// from here on everything sees them as the interpreter made them.
 unsafe extern "C" fn h_materialize(env: *mut Env) {
+    if env.is_null() || (*env).materialized != 0 {
+        return;
+    }
     let mut chain = Vec::new();
     let mut e = env;
     while !e.is_null() && (*e).materialized == 0 {
@@ -759,6 +762,20 @@ unsafe extern "C" fn h_materialize(env: *mut Env) {
             pending: None,
         });
         e.materialized = 1;
+    }
+}
+
+unsafe extern "C" fn h_print(env: *mut Env, src: u32, newline: u32) {
+    stats::count(|| "h_print".to_string());
+    let env = &mut *env;
+    let vm = &mut *env.vm;
+    let base = env.base;
+    let v = unsafe { &*vm.stack.as_mut_ptr().add(base + src as usize) };
+    if let Some(s) = v.as_str() {
+        vm.print(s, newline != 0);
+    } else {
+        let text = display(v, vm.lang);
+        vm.print(&text, newline != 0);
     }
 }
 
@@ -1096,9 +1113,24 @@ unsafe extern "C" fn h_op(env: *mut Env, pc: u32) -> u32 {
             reg(obj).as_object().unwrap().props.borrow_mut().insert(name, v);
             next
         }
+        Op::Print { src, newline } => {
+            let v = reg(src);
+            if let Some(s) = v.as_str() {
+                vm.print(s, newline);
+            } else {
+                let text = display(v, vm.lang);
+                vm.print(&text, newline);
+            }
+            next
+        }
         Op::Format { dst, src } => {
-            let text = display(reg(src), vm.lang);
-            *reg(dst) = Value::string(text);
+            let v = reg(src);
+            if v.tag() == tag::STR {
+                *reg(dst) = v.clone();
+            } else {
+                let text = display(v, vm.lang);
+                *reg(dst) = Value::string(text);
+            }
             next
         }
         Op::Concat { dst, base: b, n } => {
@@ -1185,8 +1217,8 @@ unsafe extern "C" fn h_op(env: *mut Env, pc: u32) -> u32 {
             let Some(&FuncObj::Builtin(id)) = f.as_ref().and_then(|f| f.as_func()) else {
                 return SLOW;
             };
-            let args: Vec<Value> = (0..argc).map(|i| reg(b + i).clone()).collect();
-            match builtins::call(id, &args, vm.lang) {
+            let args = std::slice::from_raw_parts(regs.add(b as usize), argc as usize);
+            match builtins::call(id, args, vm.lang) {
                 Ok(v) => {
                     *reg(dst) = v;
                     vm.depth -= 1;
@@ -1485,6 +1517,7 @@ struct Sigs {
     three_ptr: SigRef,
     prop: SigRef,
     bin: SigRef,
+    print: SigRef,
 }
 
 struct Gen<'a, 'b> {
@@ -1517,6 +1550,8 @@ struct Gen<'a, 'b> {
     director: Block,
     trap: Block,
     sigs: Sigs,
+    slow_blocks: Vec<(usize, Block)>,
+    direct_blocks: Vec<(usize, Block)>,
 }
 
 /// Where a value sits: a register or a global.
@@ -1562,6 +1597,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             prop: sig(&[ptr, types::I32], Some(ptr)),
             three_ptr: sig(&[ptr, ptr, ptr], Some(types::I32)),
             bin: sig(&[ptr, ptr, ptr, ptr, types::I32], Some(types::I32)),
+            print: sig(&[ptr, types::I32, types::I32], None),
         };
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -1603,6 +1639,8 @@ impl<'a, 'b> Gen<'a, 'b> {
             director,
             trap,
             sigs,
+            slow_blocks: Vec::new(),
+            direct_blocks: Vec::new(),
         };
         g.reload();
         let start = g.b.ins().load(types::I64, flags(), g.env, 48);
@@ -1643,6 +1681,16 @@ impl<'a, 'b> Gen<'a, 'b> {
         }
         for r in &mut regions {
             self.emit_region(r);
+        }
+        for (i, blk) in std::mem::take(&mut self.slow_blocks) {
+            self.switch(blk);
+            self.step(i);
+        }
+        for (i, blk) in std::mem::take(&mut self.direct_blocks) {
+            self.switch(blk);
+            let pc = self.b.ins().iconst(types::I32, i as i64);
+            let director = self.director;
+            self.b.ins().jump(director, &[BlockArg::Value(pc)]);
         }
         let has_loops = !regions.is_empty();
         self.emit_stepper();
@@ -1809,12 +1857,12 @@ impl<'a, 'b> Gen<'a, 'b> {
 
     /// A block that runs `i` through the interpreter (a fast path's way out).
     fn slow_block(&mut self, i: usize) -> Block {
-        let cur = self.b.current_block().unwrap();
-        let slow = self.b.create_block();
-        self.switch(slow);
-        self.step(i);
-        self.switch(cur);
-        slow
+        if let Some(&(_, blk)) = self.slow_blocks.iter().find(|(k, _)| *k == i) {
+            return blk;
+        }
+        let blk = self.b.create_block();
+        self.slow_blocks.push((i, blk));
+        blk
     }
 
     fn emit_dispatch(&mut self) {
@@ -2124,6 +2172,12 @@ impl<'a, 'b> Gen<'a, 'b> {
             Op::SetMember { obj, val, name, skip } if name != NONE => self.set_member(i, obj, val, name, skip),
             Op::SetMember { .. } => self.direct(i),
             Op::CallCtor { .. } => self.call_via(i, h_ctor_start as usize, h_step as usize),
+            Op::Print { src, newline } => {
+                let src_v = self.b.ins().iconst(types::I32, src as i64);
+                let nl_v = self.b.ins().iconst(types::I32, newline as i64);
+                self.call(self.sigs.print, h_print as usize, &[self.env, src_v, nl_v]);
+                self.jump_next(i);
+            }
             Op::Decl { .. }
             | Op::Assign { .. }
             | Op::GetThis { .. }
@@ -2554,13 +2608,11 @@ impl<'a, 'b> Gen<'a, 'b> {
 
     /// A block that runs `i` through `direct`.
     fn direct_block(&mut self, i: usize) -> Block {
-        let cur = self.b.current_block().unwrap();
+        if let Some(&(_, blk)) = self.direct_blocks.iter().find(|(k, _)| *k == i) {
+            return blk;
+        }
         let blk = self.b.create_block();
-        self.switch(blk);
-        let pc = self.b.ins().iconst(types::I32, i as i64);
-        let director = self.director;
-        self.b.ins().jump(director, &[BlockArg::Value(pc)]);
-        self.switch(cur);
+        self.direct_blocks.push((i, blk));
         blk
     }
 
@@ -3778,6 +3830,7 @@ fn native(op: &Op, prog: &Program) -> bool {
         | Op::SetIndexK { .. }
         | Op::SetMember { .. }
         | Op::MethodPrep { .. }
+        | Op::Print { .. }
         | Op::Format { .. }
         | Op::Concat { .. }
         | Op::IterNext { .. }
