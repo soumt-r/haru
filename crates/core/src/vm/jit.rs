@@ -765,6 +765,38 @@ unsafe extern "C" fn h_materialize(env: *mut Env) {
     }
 }
 
+/// `새로운 [클래스]` of a class that can be made: 0, or 1 when it cannot
+/// (the interpreter reports why).
+unsafe extern "C" fn h_new_obj(env: *mut Env, dst: u32, class: u32) -> u32 {
+    stats::count(|| "h_new_obj".to_string());
+    let env = &mut *env;
+    let vm = &mut *env.vm;
+    crate::gc::safe_point();
+    match vm.class(class) {
+        Some(c) if !c.is_abstract => {
+            let o = Value::object_with(class, c.field_types.len());
+            *vm.stack.as_mut_ptr().add(env.base + dst as usize) = o;
+            0
+        }
+        _ => 1,
+    }
+}
+
+/// A field initializer: 0, or 1 when the value does not fit the field's
+/// declared type (the interpreter reports it).
+unsafe extern "C" fn h_init_field(env: *mut Env, obj: u32, name: u32, src: u32, ty: u32) -> u32 {
+    stats::count(|| "h_init_field".to_string());
+    let env = &mut *env;
+    let vm = &mut *env.vm;
+    let regs = vm.stack.as_mut_ptr().add(env.base);
+    if ty != 0 && !vm.fits(ty, &*regs.add(src as usize)) {
+        return 1;
+    }
+    let v = std::mem::replace(&mut *regs.add(src as usize), Value::UNDEF);
+    (*regs.add(obj as usize)).as_object().unwrap().props.borrow_mut().insert(name, v);
+    0
+}
+
 unsafe extern "C" fn h_print(env: *mut Env, src: u32, newline: u32) {
     stats::count(|| "h_print".to_string());
     let env = &mut *env;
@@ -1518,6 +1550,8 @@ struct Sigs {
     prop: SigRef,
     bin: SigRef,
     print: SigRef,
+    new_obj: SigRef,
+    init_field: SigRef,
 }
 
 struct Gen<'a, 'b> {
@@ -1598,6 +1632,8 @@ impl<'a, 'b> Gen<'a, 'b> {
             three_ptr: sig(&[ptr, ptr, ptr], Some(types::I32)),
             bin: sig(&[ptr, ptr, ptr, ptr, types::I32], Some(types::I32)),
             print: sig(&[ptr, types::I32, types::I32], None),
+            new_obj: sig(&[ptr, types::I32, types::I32], Some(types::I32)),
+            init_field: sig(&[ptr, types::I32, types::I32, types::I32, types::I32], Some(types::I32)),
         };
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -2178,14 +2214,28 @@ impl<'a, 'b> Gen<'a, 'b> {
                 self.call(self.sigs.print, h_print as usize, &[self.env, src_v, nl_v]);
                 self.jump_next(i);
             }
+            Op::NewObj { dst, class } => {
+                let args = [self.env, self.b.ins().iconst(types::I32, dst as i64), self.b.ins().iconst(types::I32, class as i64)];
+                let failed = self.call(self.sigs.new_obj, h_new_obj as usize, &args).unwrap();
+                self.go_next_or(i, failed);
+            }
+            Op::InitField { obj, name, src, ty } => {
+                let args = [
+                    self.env,
+                    self.b.ins().iconst(types::I32, obj as i64),
+                    self.b.ins().iconst(types::I32, name as i64),
+                    self.b.ins().iconst(types::I32, src as i64),
+                    self.b.ins().iconst(types::I32, ty as i64),
+                ];
+                let failed = self.call(self.sigs.init_field, h_init_field as usize, &args).unwrap();
+                self.go_next_or(i, failed);
+            }
             Op::Decl { .. }
             | Op::Assign { .. }
             | Op::GetThis { .. }
             | Op::Format { .. }
             | Op::Concat { .. }
             | Op::IterNext { .. }
-            | Op::NewObj { .. }
-            | Op::InitField { .. }
             | Op::CallName { .. } => self.direct(i),
             Op::ArgGiven { index, skip } => {
                 let argc = self.b.ins().load(types::I64, flags(), self.env, 32);
@@ -2594,6 +2644,14 @@ impl<'a, 'b> Gen<'a, 'b> {
     }
 
     /// Instruction `i` through `h_op`, else the interpreter.
+    /// After a helper that did instruction `i` itself unless it answered
+    /// `failed` (nonzero): then the interpreter does it (and reports).
+    fn go_next_or(&mut self, i: usize, failed: V) {
+        let slow = self.slow_block(i);
+        let next = self.next(i);
+        self.b.ins().brif(failed, slow, &[], next, &[]);
+    }
+
     fn direct(&mut self, i: usize) {
         let pc = self.b.ins().iconst(types::I32, i as i64);
         let r = self.call(self.sigs.step, h_op as usize, &[self.env, pc]).unwrap();
