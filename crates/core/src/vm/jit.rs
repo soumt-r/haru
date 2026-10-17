@@ -3424,26 +3424,43 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// Whether `decl_local` does a declaration of `var` with type `ty`: a
     /// method's variable (its register, then the object's property, then
     /// perhaps a global) of a type checked by tag.
-    fn decl_local_fits(&self, var: u32, ty: u32) -> bool {
+    /// The places of a variable `decl_local` handles: its register in this
+    /// scope (with its meta register), then maybe a property of `나` (in a
+    /// method), then maybe a global (a loop's body at the top level, or a
+    /// method seeing a global of the name).
+    fn decl_places(&self, var: u32) -> Option<(Reg, Option<Reg>, Option<u32>, Option<(u32, Option<u32>)>)> {
         let slots = self.prog.vars[var as usize].slots.as_slice();
-        let places = matches!(
-            slots,
-            [Slot { loc: Loc::Reg(_), meta: None | Some(Loc::Reg(_)) }, Slot { loc: Loc::This(_), .. }]
-                | [Slot { loc: Loc::Reg(_), meta: None | Some(Loc::Reg(_)) }, Slot { loc: Loc::This(_), .. }, Slot { loc: Loc::Global(_), .. }]
-        );
-        places && self.simple_type(ty).is_some()
+        let (r, meta, rest) = match slots {
+            [Slot { loc: Loc::Reg(r), meta: None }, rest @ ..] => (*r, None, rest),
+            [Slot { loc: Loc::Reg(r), meta: Some(Loc::Reg(m)) }, rest @ ..] => (*r, Some(*m), rest),
+            _ => return None,
+        };
+        let (this, rest) = match rest {
+            [Slot { loc: Loc::This(name), .. }, rest @ ..] => (Some(*name), rest),
+            _ => (None, rest),
+        };
+        let global = match rest {
+            [] => None,
+            [Slot { loc: Loc::Global(g), meta: None }] => Some((*g, None)),
+            [Slot { loc: Loc::Global(g), meta: Some(Loc::Global(m)) }] => Some((*g, Some(*m))),
+            _ => return None,
+        };
+        // A register alone needs no `h_op`'s way: the compiler stores it.
+        (this.is_some() || global.is_some()).then_some((r, meta, this, global))
     }
 
-    /// `정하자` of a method's variable that is nowhere yet (the common case in
-    /// a loop's body, which starts without its variables): the value, of the
-    /// declared type, goes into its register. A variable that exists (in the
-    /// register, as a property, as a global) takes `h_op`'s way.
+    fn decl_local_fits(&self, var: u32, ty: u32) -> bool {
+        self.decl_places(var).is_some() && self.simple_type(ty).is_some()
+    }
+
+    /// `정하자` of a variable of a scope (a method's, or a loop's body's): the
+    /// value, of the declared type, goes where `declare` would put it. The
+    /// places are looked at in its order: the register (declared again in
+    /// this scope), a property of `나` (`h_op`'s way), a global that exists
+    /// (it takes the value when its declared type and constness allow), else
+    /// a new variable in the register.
     fn decl_local(&mut self, i: usize, var: u32, src: Reg, ty: u32) {
-        let slots = self.prog.vars[var as usize].slots.clone();
-        let (r, meta, name) = match (slots[0], slots[1]) {
-            (Slot { loc: Loc::Reg(r), meta }, Slot { loc: Loc::This(name), .. }) => (r, meta, name),
-            _ => unreachable!(),
-        };
+        let (r, meta, this, global) = self.decl_places(var).unwrap();
         let fallback = self.direct_block(i);
         let va = self.addr(At::Reg(src));
         let tags = self.simple_type(ty).unwrap();
@@ -3457,27 +3474,39 @@ impl<'a, 'b> Gen<'a, 'b> {
         // Declared again (`'x'를 'x' / 2로 정하자`): the register holds it, so
         // the value replaces it when the variable's declared type takes it.
         self.switch(again);
-        if let Some(Loc::Reg(m)) = meta {
-            self.meta_takes(m, src, fallback);
+        if let Some(m) = meta {
+            self.meta_takes(At::Reg(m), src, fallback);
         }
         self.b.ins().jump(put, &[]);
 
-        // Nowhere yet (no property, no global of that name): a new variable
-        // in the register, its type in its meta register.
+        // Not in the register: a property of that name takes it (`h_op`).
         self.switch(go);
-        if let Some(Slot { loc: Loc::Global(g), .. }) = slots.get(2) {
-            let ga = self.addr(At::Global(*g));
+        if let Some(name) = this {
+            let v = self.this_prop(name);
+            let missing = self.b.create_block();
+            self.b.ins().brif(v, fallback, &[], missing, &[]);
+            self.switch(missing);
+        }
+
+        // A global of the name that exists takes it, as declared.
+        if let Some((g, gmeta)) = global {
+            let ga = self.addr(At::Global(g));
             let t = self.tag_of(ga);
             let undef = self.is_tag(t, TAG_UNDEF);
-            let go = self.b.create_block();
-            self.b.ins().brif(undef, go, &[], fallback, &[]);
-            self.switch(go);
+            let (new, existing) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(undef, new, &[], existing, &[]);
+            self.switch(existing);
+            if let Some(m) = gmeta {
+                self.meta_takes(At::Global(m), src, fallback);
+            }
+            self.move_value(src, At::Global(g));
+            self.jump_next(i);
+            self.switch(new);
         }
-        let v = self.this_prop(name);
-        let missing = self.b.create_block();
-        self.b.ins().brif(v, fallback, &[], missing, &[]);
-        self.switch(missing);
-        if let Some(Loc::Reg(m)) = meta {
+
+        // Nowhere yet: a new variable in the register, its type in its meta
+        // register.
+        if let Some(m) = meta {
             let ma = self.addr(At::Reg(m));
             let t = self.b.ins().iconst(types::I64, TAG_NUM);
             let n = self.b.ins().iconst(types::I64, ((ty * 2) as f64).to_bits() as i64);
@@ -3487,22 +3516,28 @@ impl<'a, 'b> Gen<'a, 'b> {
 
         // The value moves into the register (what it held goes).
         self.switch(put);
-        let va = self.addr(At::Reg(src));
-        let vt = self.b.ins().load(types::I64, flags(), va, 0);
-        let vp = self.b.ins().load(types::I64, flags(), va, 8);
-        let ra = self.addr(At::Reg(r));
-        self.store(ra, vt, vp);
-        let va = self.addr(At::Reg(src));
-        let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
-        self.b.ins().store(flags(), undef, va, 0);
+        self.move_value(src, At::Reg(r));
         self.jump_next(i);
     }
 
-    /// Goes on when the variable whose `meta_value` is in register `m` (none,
-    /// or a declared type and constness) takes the value in `src`: no type
+    /// Moves the value in register `src` to `to` (what `to` held goes;
+    /// `src` is left undefined).
+    fn move_value(&mut self, src: Reg, to: At) {
+        let va = self.addr(At::Reg(src));
+        let vt = self.b.ins().load(types::I64, flags(), va, 0);
+        let vp = self.b.ins().load(types::I64, flags(), va, 8);
+        let ta = self.addr(to);
+        self.store(ta, vt, vp);
+        let va = self.addr(At::Reg(src));
+        let undef = self.b.ins().iconst(types::I64, TAG_UNDEF);
+        self.b.ins().store(flags(), undef, va, 0);
+    }
+
+    /// Goes on when the variable whose `meta_value` is at `m` (none, or a
+    /// declared type and constness) takes the value in `src`: no type
     /// (checked here), or `h_meta_takes` says so. Else `fallback`.
-    fn meta_takes(&mut self, m: Reg, src: Reg, fallback: Block) {
-        let ma = self.addr(At::Reg(m));
+    fn meta_takes(&mut self, m: At, src: Reg, fallback: Block) {
+        let ma = self.addr(m);
         let mt = self.tag_of(ma);
         let is_num = self.is_tag(mt, TAG_NUM);
         let (typed, ok, untyped, ask) = (self.b.create_block(), self.b.create_block(), self.b.create_block(), self.b.create_block());
