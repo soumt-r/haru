@@ -276,7 +276,7 @@ impl<'p> Vm<'p> {
     /// available on this machine.
     #[cfg(feature = "jit")]
     pub fn enable_jit(&mut self) -> bool {
-        let threshold = std::env::var("HARU_JIT_HOT").ok().and_then(|n| n.parse().ok()).unwrap_or(1000);
+        let threshold = std::env::var("HARU_JIT_HOT").ok().and_then(|n| n.parse().ok()).unwrap_or(200);
         self.enable_jit_at(threshold)
     }
 
