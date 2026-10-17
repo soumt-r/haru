@@ -220,46 +220,57 @@ impl Worker {
     ) -> Option<Worker> {
         let (jobs, inbox) = std::sync::mpsc::channel::<Job>();
         let (outbox, done) = std::sync::mpsc::channel::<Compiled>();
-        std::thread::Builder::new()
-            .name("haru-jit".into())
-            .spawn(move || {
-                let mut fctx = FunctionBuilderContext::new();
-                for job in inbox {
-                    // The IR, reading the program: only while the Jit (and so
-                    // the program) is there.
-                    let built = {
-                        let alive = alive.lock().unwrap_or_else(|e| e.into_inner());
-                        if !*alive {
+        // Several threads take the functions in turn: a big one (tens of
+        // milliseconds, most of it register allocation, which runs outside
+        // the lock below) no longer keeps the small ones waiting.
+        let inbox = std::sync::Arc::new(std::sync::Mutex::new(inbox));
+        let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 4));
+        for n in 0..threads {
+            let (inbox, outbox, alive) = (inbox.clone(), outbox.clone(), alive.clone());
+            let (plain, optimized, setup) = (plain.clone(), optimized.clone(), setup.clone());
+            std::thread::Builder::new()
+                .name(format!("haru-jit-{n}"))
+                .spawn(move || {
+                    let mut fctx = FunctionBuilderContext::new();
+                    loop {
+                        let next = inbox.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok(job) = next else { break };
+                        // The IR, reading the program: only while the Jit (and so
+                        // the program) is there.
+                        let built = {
+                            let alive = alive.lock().unwrap_or_else(|e| e.into_inner());
+                            if !*alive {
+                                break;
+                            }
+                            let mut func = cranelift_codegen::ir::Function::new();
+                            let prog = unsafe { &*job.prog };
+                            build_function(&mut func, &mut fctx, job.proto, prog, &setup, job.ics).map(|o| (func, o))
+                        };
+                        let Some((func, optimized_code)) = built else {
+                            if outbox.send(Compiled { proto: job.proto, code: Err("not compiled".to_string()) }).is_err() {
+                                break;
+                            }
+                            continue;
+                        };
+                        let isa = if optimized_code { &*optimized } else { &*plain };
+                        let mut ctx = Context::for_function(func);
+                        let code = match ctx.compile(isa, &mut Default::default()) {
+                            // No relocations: helpers are called by address and
+                            // constants live in the code.
+                            Ok(c) if c.buffer.relocs().is_empty() => {
+                                let align = (c.buffer.alignment as u64).max(16);
+                                Ok((c.code_buffer().to_vec(), align))
+                            }
+                            Ok(_) => Err("relocations".to_string()),
+                            Err(e) => Err(format!("{:?}", e.inner)),
+                        };
+                        if outbox.send(Compiled { proto: job.proto, code }).is_err() {
                             break;
                         }
-                        let mut func = cranelift_codegen::ir::Function::new();
-                        let prog = unsafe { &*job.prog };
-                        build_function(&mut func, &mut fctx, job.proto, prog, &setup, job.ics).map(|o| (func, o))
-                    };
-                    let Some((func, optimized_code)) = built else {
-                        if outbox.send(Compiled { proto: job.proto, code: Err("not compiled".to_string()) }).is_err() {
-                            break;
-                        }
-                        continue;
-                    };
-                    let isa = if optimized_code { &*optimized } else { &*plain };
-                    let mut ctx = Context::for_function(func);
-                    let code = match ctx.compile(isa, &mut Default::default()) {
-                        // No relocations: helpers are called by address and
-                        // constants live in the code.
-                        Ok(c) if c.buffer.relocs().is_empty() => {
-                            let align = (c.buffer.alignment as u64).max(16);
-                            Ok((c.code_buffer().to_vec(), align))
-                        }
-                        Ok(_) => Err("relocations".to_string()),
-                        Err(e) => Err(format!("{:?}", e.inner)),
-                    };
-                    if outbox.send(Compiled { proto: job.proto, code }).is_err() {
-                        break;
                     }
-                }
-            })
-            .ok()?;
+                })
+                .ok()?;
+        }
         Some(Worker { jobs, done, sent: HashMap::new() })
     }
 }
