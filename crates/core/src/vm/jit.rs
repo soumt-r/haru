@@ -1469,6 +1469,13 @@ unsafe extern "C" fn h_meta_takes(env: *mut Env, meta: *const Value, v: *const V
     (!constant && (declared == 0 || vm.fits(declared, &*v))) as u32
 }
 
+/// Whether the value at `v` fits declared type `ty` (a class, a typed list:
+/// what compiled code does not check itself).
+unsafe extern "C" fn h_fits(env: *mut Env, ty: u32, v: *const Value) -> u32 {
+    let vm = &*(*env).vm;
+    vm.fits(ty, &*v) as u32
+}
+
 unsafe extern "C" fn h_str_len(dst: *mut Value, s: *const Value) {
     let n = (*s).as_str().unwrap().chars().count();
     *dst = Value::num(n as f64);
@@ -1551,6 +1558,7 @@ struct Sigs {
     bin: SigRef,
     print: SigRef,
     new_obj: SigRef,
+    fits: SigRef,
     init_field: SigRef,
 }
 
@@ -1633,6 +1641,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             bin: sig(&[ptr, ptr, ptr, ptr, types::I32], Some(types::I32)),
             print: sig(&[ptr, types::I32, types::I32], None),
             new_obj: sig(&[ptr, types::I32, types::I32], Some(types::I32)),
+            fits: sig(&[ptr, types::I32, ptr], Some(types::I32)),
             init_field: sig(&[ptr, types::I32, types::I32, types::I32, types::I32], Some(types::I32)),
         };
         let entry = b.create_block();
@@ -3503,12 +3512,26 @@ impl<'a, 'b> Gen<'a, 'b> {
             [Slot { loc: Loc::Global(g), meta: Some(Loc::Global(m)) }] => Some((*g, Some(*m))),
             _ => return None,
         };
-        // A register alone needs no `h_op`'s way: the compiler stores it.
-        (this.is_some() || global.is_some()).then_some((r, meta, this, global))
+        Some((r, meta, this, global))
     }
 
-    fn decl_local_fits(&self, var: u32, ty: u32) -> bool {
-        self.decl_places(var).is_some() && self.simple_type(ty).is_some()
+    fn decl_local_fits(&self, var: u32, _ty: u32) -> bool {
+        self.decl_places(var).is_some()
+    }
+
+    /// Goes to `slow` unless the value at `a` fits type `ty`: its tag when
+    /// that says it, else `h_fits` (a class, a typed list).
+    fn check_type(&mut self, a: V, ty: u32, slow: Block) {
+        match self.simple_type(ty) {
+            Some(tags) => self.check_tags(a, tags, slow),
+            None => {
+                let t = self.b.ins().iconst(types::I32, ty as i64);
+                let ok = self.call(self.sigs.fits, h_fits as usize, &[self.env, t, a]).unwrap();
+                let fast = self.b.create_block();
+                self.b.ins().brif(ok, fast, &[], slow, &[]);
+                self.switch(fast);
+            }
+        }
     }
 
     /// `정하자` of a variable of a scope (a method's, or a loop's body's): the
@@ -3521,8 +3544,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         let (r, meta, this, global) = self.decl_places(var).unwrap();
         let fallback = self.direct_block(i);
         let va = self.addr(At::Reg(src));
-        let tags = self.simple_type(ty).unwrap();
-        self.check_tags(va, tags, fallback);
+        self.check_type(va, ty, fallback);
         let ra = self.addr(At::Reg(r));
         let t = self.tag_of(ra);
         let undef = self.is_tag(t, TAG_UNDEF);
