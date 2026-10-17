@@ -2240,8 +2240,9 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         let ctor = self.c.class_ids.get(&name).and_then(|&id| self.c.prog.classes[id as usize].ctor);
         match ctor {
             Some(proto) => {
+                let ret = self.alloc();
                 let base = self.args(args);
-                self.emit(Op::CallCtor { obj: dst, proto, class: sym, base, argc: args.len() as u16 });
+                self.emit(Op::CallCtor { obj: dst, proto, class: sym, base, argc: args.len() as u16, ret });
             }
             None => {
                 self.emit(Op::Leave);

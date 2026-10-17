@@ -1793,7 +1793,7 @@ impl<'p> Vm<'p> {
                         }
                         reg!(obj).as_object().unwrap().props.borrow_mut().insert(name, v);
                     }
-                    Op::CallCtor { obj, proto, class, base: b, argc } => {
+                    Op::CallCtor { obj, proto, class, base: b, argc, .. } => {
                         let o = reg!(obj).clone();
                         enter!(pc, self.call_proto(proto, base + b as usize, argc, obj, o, class, Post::Discard, true));
                     }

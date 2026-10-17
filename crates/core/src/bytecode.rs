@@ -239,8 +239,9 @@ pub enum Op {
     NewObj { dst: Reg, class: u32 },
     /// A field initializer of the class being made.
     InitField { obj: Reg, name: u32, src: Reg, ty: u32 },
-    /// Runs a constructor on `obj` (its result is dropped).
-    CallCtor { obj: Reg, proto: u32, class: u32, base: Reg, argc: u16 },
+    /// Runs a constructor on `obj` (its result is dropped). `ret` is a
+    /// register of its own that compiled code may write the result to.
+    CallCtor { obj: Reg, proto: u32, class: u32, base: Reg, argc: u16, ret: Reg },
     /// Ends a `새로운` without a constructor (the call nesting count).
     Leave,
     /// `나`: the running method's object.

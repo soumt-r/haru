@@ -1308,7 +1308,7 @@ unsafe extern "C" fn h_ctor_start(env: *mut Env, pc: u32, callee: *mut Env) -> u
     let fi = env.fi;
     let frame = &vm.frames[fi];
     let base = frame.base;
-    let Op::CallCtor { obj, proto, class, base: b, argc } = vm.prog.protos[frame.proto as usize].code[pc as usize] else {
+    let Op::CallCtor { obj, proto, class, base: b, argc, .. } = vm.prog.protos[frame.proto as usize].code[pc as usize] else {
         unreachable!()
     };
     let Some(code) = vm.jit_code(proto) else {
@@ -2216,6 +2216,9 @@ impl<'a, 'b> Gen<'a, 'b> {
             Op::Member { dst, obj, name, skip } => self.member(i, dst, obj, name, skip),
             Op::SetMember { obj, val, name, skip } if name != NONE => self.set_member(i, obj, val, name, skip),
             Op::SetMember { .. } => self.direct(i),
+            Op::CallCtor { obj, proto, class, base, argc, ret } if self.inline_call(proto, argc) => {
+                self.fast_ctor_call(i, obj, proto, class, base, argc, ret)
+            }
             Op::CallCtor { .. } => self.call_via(i, h_ctor_start as usize, h_step as usize),
             Op::Print { src, newline } => {
                 let src_v = self.b.ins().iconst(types::I32, src as i64);
@@ -2534,6 +2537,29 @@ impl<'a, 'b> Gen<'a, 'b> {
 
         self.switch(slow);
         self.call_via(i, h_method_start as usize, h_step as usize);
+    }
+
+    /// A constructor of a class known here, on the object `새로운` just made:
+    /// `call_core` with that object as `나`, its result going to `ret` (a
+    /// register of the call's own, so dropped with it). Anything unusual
+    /// takes `h_ctor_start`'s way.
+    #[allow(clippy::too_many_arguments)]
+    fn fast_ctor_call(&mut self, i: usize, obj: Reg, proto: u32, class: u32, b: Reg, argc: u16, ret: Reg) {
+        let slow = self.b.create_block();
+        let class = self.b.ins().iconst(types::I64, class as i64);
+        let status = self.call_core(i + 1, ret, proto, b, argc, slow, Some((obj, class)));
+        let (ok, bad) = (self.b.create_block(), self.b.create_block());
+        self.b.ins().brif(status, bad, &[], ok, &[]);
+        self.switch(ok);
+        self.reload();
+        self.jump_next(i);
+        self.switch(bad);
+        let (pc, one) = (self.b.ins().iconst(types::I32, i as i64), self.b.ins().iconst(types::I32, 1));
+        let r = self.call(self.sigs.failed, h_call_failed as usize, &[self.env, pc, one]).unwrap();
+        self.go_on(i, r);
+
+        self.switch(slow);
+        self.call_via(i, h_ctor_start as usize, h_step as usize);
     }
 
     /// `돌려주자`: the frame of a call that only wants the value ends here
