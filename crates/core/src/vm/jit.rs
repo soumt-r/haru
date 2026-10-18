@@ -207,8 +207,18 @@ struct Compiled {
 struct Worker {
     jobs: std::sync::mpsc::Sender<Job>,
     done: std::sync::mpsc::Receiver<Compiled>,
-    /// When each function in flight was sent (for HARU_JIT_DEBUG).
+    /// When each function in flight was sent (also how many are in flight).
     sent: HashMap<u32, std::time::Instant>,
+    /// What a new compiling thread takes.
+    inbox: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<Job>>>,
+    outbox: std::sync::mpsc::Sender<Compiled>,
+    plain: cranelift_codegen::isa::OwnedTargetIsa,
+    optimized: cranelift_codegen::isa::OwnedTargetIsa,
+    setup: Setup,
+    alive: std::sync::Arc<std::sync::Mutex<bool>>,
+    /// The compiling threads there are, and at most.
+    threads: usize,
+    max_threads: usize,
 }
 
 impl Worker {
@@ -220,58 +230,74 @@ impl Worker {
     ) -> Option<Worker> {
         let (jobs, inbox) = std::sync::mpsc::channel::<Job>();
         let (outbox, done) = std::sync::mpsc::channel::<Compiled>();
-        // Several threads take the functions in turn: a big one (tens of
-        // milliseconds, most of it register allocation, which runs outside
-        // the lock below) no longer keeps the small ones waiting.
+        // Several threads take the functions in turn, so that a big one (tens
+        // of milliseconds, most of it register allocation, which runs outside
+        // the lock below) does not keep the small ones waiting. There is one
+        // at first; another starts when the functions in flight outnumber
+        // them (a short program does not pay for threads it never uses).
+        let max_threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 4));
         let inbox = std::sync::Arc::new(std::sync::Mutex::new(inbox));
-        let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 4));
-        for n in 0..threads {
-            let (inbox, outbox, alive) = (inbox.clone(), outbox.clone(), alive.clone());
-            let (plain, optimized, setup) = (plain.clone(), optimized.clone(), setup.clone());
-            std::thread::Builder::new()
-                .name(format!("haru-jit-{n}"))
-                .spawn(move || {
-                    let mut fctx = FunctionBuilderContext::new();
-                    loop {
-                        let next = inbox.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(job) = next else { break };
-                        // The IR, reading the program: only while the Jit (and so
-                        // the program) is there.
-                        let built = {
-                            let alive = alive.lock().unwrap_or_else(|e| e.into_inner());
-                            if !*alive {
-                                break;
-                            }
-                            let mut func = cranelift_codegen::ir::Function::new();
-                            let prog = unsafe { &*job.prog };
-                            build_function(&mut func, &mut fctx, job.proto, prog, &setup, job.ics).map(|o| (func, o))
-                        };
-                        let Some((func, optimized_code)) = built else {
-                            if outbox.send(Compiled { proto: job.proto, code: Err("not compiled".to_string()) }).is_err() {
-                                break;
-                            }
-                            continue;
-                        };
-                        let isa = if optimized_code { &*optimized } else { &*plain };
-                        let mut ctx = Context::for_function(func);
-                        let code = match ctx.compile(isa, &mut Default::default()) {
-                            // No relocations: helpers are called by address and
-                            // constants live in the code.
-                            Ok(c) if c.buffer.relocs().is_empty() => {
-                                let align = (c.buffer.alignment as u64).max(16);
-                                Ok((c.code_buffer().to_vec(), align))
-                            }
-                            Ok(_) => Err("relocations".to_string()),
-                            Err(e) => Err(format!("{:?}", e.inner)),
-                        };
-                        if outbox.send(Compiled { proto: job.proto, code }).is_err() {
+        let mut w = Worker { jobs, done, sent: HashMap::new(), inbox, outbox, plain, optimized, setup, alive, threads: 0, max_threads };
+        w.spawn().then_some(w)
+    }
+
+    /// Starts one more compiling thread.
+    fn spawn(&mut self) -> bool {
+        let (inbox, outbox, alive) = (self.inbox.clone(), self.outbox.clone(), self.alive.clone());
+        let (plain, optimized, setup) = (self.plain.clone(), self.optimized.clone(), self.setup.clone());
+        let started = std::thread::Builder::new()
+            .name(format!("haru-jit-{}", self.threads))
+            .spawn(move || {
+                let mut fctx = FunctionBuilderContext::new();
+                loop {
+                    let next = inbox.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    let Ok(job) = next else { break };
+                    // The IR, reading the program: only while the Jit (and so
+                    // the program) is there.
+                    let built = {
+                        let alive = alive.lock().unwrap_or_else(|e| e.into_inner());
+                        if !*alive {
                             break;
                         }
+                        let mut func = cranelift_codegen::ir::Function::new();
+                        let prog = unsafe { &*job.prog };
+                        build_function(&mut func, &mut fctx, job.proto, prog, &setup, job.ics).map(|o| (func, o))
+                    };
+                    let Some((func, optimized_code)) = built else {
+                        if outbox.send(Compiled { proto: job.proto, code: Err("not compiled".to_string()) }).is_err() {
+                            break;
+                        }
+                        continue;
+                    };
+                    let isa = if optimized_code { &*optimized } else { &*plain };
+                    let mut ctx = Context::for_function(func);
+                    let code = match ctx.compile(isa, &mut Default::default()) {
+                        // No relocations: helpers are called by address and
+                        // constants live in the code.
+                        Ok(c) if c.buffer.relocs().is_empty() => {
+                            let align = (c.buffer.alignment as u64).max(16);
+                            Ok((c.code_buffer().to_vec(), align))
+                        }
+                        Ok(_) => Err("relocations".to_string()),
+                        Err(e) => Err(format!("{:?}", e.inner)),
+                    };
+                    if outbox.send(Compiled { proto: job.proto, code }).is_err() {
+                        break;
                     }
-                })
-                .ok()?;
+                }
+            })
+            .is_ok();
+        self.threads += started as usize;
+        started
+    }
+
+    /// Hands a function to the compiling threads (it is in `sent` already),
+    /// starting another when all of them are busy.
+    fn send(&mut self, job: Job) -> Result<(), std::sync::mpsc::SendError<Job>> {
+        if self.sent.len() > self.threads && self.threads < self.max_threads {
+            self.spawn();
         }
-        Some(Worker { jobs, done, sent: HashMap::new() })
+        self.jobs.send(job)
     }
 }
 
@@ -470,7 +496,7 @@ impl Jit {
                     // on until the code is back.
                     w.sent.insert(id, started);
                     let ics = self.ics[id as usize].as_mut_ptr();
-                    self.states[id as usize] = match w.jobs.send(Job { proto: id, prog: prog as *const Program, ics }) {
+                    self.states[id as usize] = match w.send(Job { proto: id, prog: prog as *const Program, ics }) {
                         Ok(()) => State::Compiling,
                         Err(_) => State::Failed,
                     };
