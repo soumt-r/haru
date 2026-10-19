@@ -2307,8 +2307,33 @@ pub(crate) fn import_binding(name: &str) -> String {
     format!("\u{1}{name}")
 }
 
+/// The escapes of a string or template literal, read left to right once (Hana's
+/// `ast.Unescape`): `\n`, `\t`, `\\` and the closing marks `\"` (Hari) and `\「`
+/// `\」` (Kanade). Any other backslash is kept as written.
 pub fn unescape(s: &str) -> String {
-    s.replace("\\n", "\n").replace("\\\"", "\"").replace("\\t", "\t").replace("\\\\", "\\")
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let mut rest = chars.clone();
+        match rest.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(e @ ('"' | '\\' | '「' | '」')) => out.push(e),
+            _ => {
+                out.push('\\');
+                continue;
+            }
+        }
+        chars = rest;
+    }
+    out
 }
 
 enum TemplatePart {

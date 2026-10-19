@@ -232,7 +232,7 @@ static HARI_RULES: &[(Kind, Rule)] = &[
 static KANADE_RULES: &[(Kind, Rule)] = &[
     (TemplateString, Rule::Template { prefix: "枠「", close: '」' }),
     (Str, Rule::Str { open: "「", close: '」' }),
-    (Var, Rule::Var { open: "『", close: '』', first: Class::JaStart, rest: Class::JaRest }),
+    (Var, Rule::Var { open: "『", close: '』', first: Class::JaRest, rest: Class::JaRest }),
     (Function, Rule::Function { open: "〈", close: '〉' }),
     (Type, Rule::Type { open: "【", close: '】', first: Class::JaStart, rest: Class::JaRest }),
     (LBracket, Rule::Words(&["【"])),

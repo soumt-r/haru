@@ -1017,11 +1017,14 @@ impl<'a> Parser<'a> {
         let d = self.lang.delim_len;
         match tok.kind {
             Kind::Op if tok.lit == "-" => {
-                let next = self.consume();
-                if next.kind == Kind::Int {
+                if self.peek(0).is_some_and(|t| t.kind == Kind::Int) {
+                    let next = self.consume();
                     return Expr::Number(format!("-{}", next.lit).parse().unwrap_or(0.0));
                 }
-                Expr::Str("알수없음: -".to_string())
+                // -'x', -('a' + 1), -<함수>(): the operand with its member/call
+                // chain, read as 0 - operand.
+                let operand = self.parse_member_and_call();
+                Expr::Binary { left: Box::new(Expr::Number(0.0)), op: "-".to_string(), right: Box::new(operand) }
             }
             Kind::Str => Expr::Str(strip(tok.lit, d)),
             Kind::TemplateString => {
