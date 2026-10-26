@@ -48,6 +48,7 @@ pub static CATALOG: &[(&str, &str, &str, &str)] = &[
     ("InputConversionError.InputToNumberFailed", "Cannot convert '%s' to a number.", "'%s'을(를) 숫자로 바꿀 수 없어요.", "『%s』を数字に変換できません。"),
     ("InstantiationError.AbstractClass", "'%s' is an abstract class, so it cannot be instantiated.", "'%s'은(는) 추상 클래스라서 새로 만들 수 없어요.", "『%s』は抽象クラスなので、インスタンスを作れません。"),
     ("InstantiationError.Interface", "'%s' is an interface, so it cannot be instantiated.", "'%s'은(는) 인터페이스라서 새로 만들 수 없어요.", "『%s』はインターフェースなので、インスタンスを作れません。"),
+    ("InterfaceImplementationError.AbstractNotImplemented", "Class '%[1]s' must implement method '%[3]s' of abstract class '%[2]s'.", "클래스 '%s'은(는) 추상 클래스 '%s'의 '%s' 메서드를 구현해야 해요.", "クラス '%s' は抽象クラス '%s' の '%s' メソッドを実装しなければなりません。"),
     ("InterfaceImplementationError.InterfaceNotImplemented", "Class '%[1]s' must implement method '%[3]s' of interface '%[2]s'.", "클래스 '%s'은(는) 인터페이스 '%s'의 '%s' 메서드를 구현해야 해요.", "クラス '%s' はインターフェース '%s' の '%s' メソッドを実装しなければなりません。"),
     ("KeyError.DictKeyNotFound", "Key '%v' not found.", "사전에서 '%v' 이름을 찾을 수 없어요.", "辞書から '%v' という名前を見つけることができません。"),
     ("KeyError.StaticMemberNotFound", "Static member '%v' not found.", "'%v' 정적 멤버를 찾을 수 없어요.", "静的メンバー『%v』が見つかりません。"),

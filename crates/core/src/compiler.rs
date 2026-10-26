@@ -794,6 +794,43 @@ impl<'a> Compiler<'a> {
         None
     }
 
+    /// Hana checks, right after the interfaces, that each class that is not
+    /// abstract implements every abstract method (`<m>가 있어야 한다`) its
+    /// chain declares, in itself or a class below the declaring one: the class,
+    /// the declaring class and the method.
+    fn abstract_violation(&self, stmts: &[Stmt]) -> Option<(String, String, String)> {
+        for s in stmts {
+            let Stmt::Class { name: Some(n), is_abstract: false, .. } = s else { continue };
+            if !std::ptr::eq(self.class_defs.get(&n.name).copied().unwrap_or(s), s) {
+                continue;
+            }
+            let mut implemented: HashSet<&str> = HashSet::new();
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut cur = Some(s);
+            while let Some(Stmt::Class { name: Some(cn), base, body, .. }) = cur {
+                if !seen.insert(cn.name.as_str()) {
+                    break;
+                }
+                for b in body {
+                    if let Stmt::InterfaceMethod(m) = b {
+                        if !implemented.contains(m.as_str()) {
+                            return Some((n.name.clone(), cn.name.clone(), m.clone()));
+                        }
+                    }
+                }
+                for b in body {
+                    if let Stmt::Function(f) = b {
+                        if !f.is_static {
+                            implemented.insert(f.name.as_str());
+                        }
+                    }
+                }
+                cur = base.as_ref().and_then(|b| self.class_defs.get(&b.name).copied());
+            }
+        }
+        None
+    }
+
     fn type_id(&mut self, text: &str) -> u32 {
         let key = (text.to_string(), self.lang.name);
         if let Some(&i) = self.type_ids.get(&key) {
@@ -1030,6 +1067,11 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         if let Some((class, iface, method)) = self.c.interface_violation(stmts) {
             let k = self.c.str_const("InterfaceImplementationError.InterfaceNotImplemented");
             let args = [class, iface, method].map(|a| self.c.str_const(&a));
+            self.emit(Op::Fail { k, args });
+        }
+        if let Some((class, owner, method)) = self.c.abstract_violation(stmts) {
+            let k = self.c.str_const("InterfaceImplementationError.AbstractNotImplemented");
+            let args = [class, owner, method].map(|a| self.c.str_const(&a));
             self.emit(Op::Fail { k, args });
         }
         for s in stmts {
