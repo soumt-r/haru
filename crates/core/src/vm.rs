@@ -1417,10 +1417,17 @@ impl<'p> Vm<'p> {
                     Op::CallSuper { dst, name, base: b, argc } => {
                         let this = self.frames[fi].this.clone();
                         let class = this.as_object().unwrap().class;
-                        // Hana starts at the parent of the object's own class.
-                        let start = match self.class(class).map(|c| c.super_start) {
+                        // Hana starts at the parent of the class that declares the
+                        // running method, not of the object's own class: otherwise,
+                        // three or more classes deep, a middle class's 부모 call comes
+                        // back to that same middle class forever.
+                        let from = match self.prog.protos[self.frames[fi].proto as usize].class {
+                            c if c != NONE && self.has_class(c) => c,
+                            _ => class,
+                        };
+                        let start = match self.class(from).map(|c| c.super_start) {
                             Some(Some(parent)) => parent,
-                            _ => Some(class),
+                            _ => Some(from),
                         };
                         let proto = start.and_then(|s| {
                             if name == self.init_name {

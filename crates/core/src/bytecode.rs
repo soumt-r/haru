@@ -349,6 +349,9 @@ pub struct Proto {
     /// What printing the function as a value shows (Hana's `String()` of
     /// its declaration).
     pub text: std::rc::Rc<str>,
+    /// For a method, constructor, getter or setter: the class that declares
+    /// it, where a `부모` call in it starts looking above (NONE otherwise).
+    pub class: u32,
 }
 
 /// A parsed type annotation: `숫자`, `(숫자)목록`, `(문자열, 숫자)사전`,

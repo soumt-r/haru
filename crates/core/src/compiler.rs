@@ -332,6 +332,13 @@ impl<'a> Compiler<'a> {
             }
             self.prog.protos[base as usize + i + 1] = proto;
         }
+        for (name, cp) in &class_protos {
+            let class = symbol::intern(name);
+            let accessors = cp.fields.iter().flat_map(|f| [f.getter, f.setter]).flatten();
+            for p in cp.methods.iter().map(|m| m.1).chain(cp.ctor).chain(accessors) {
+                self.prog.protos[p as usize].class = class;
+            }
+        }
 
         let classes = self.class_ids.iter().map(|(n, id)| (symbol::intern(n), *id)).collect();
         self.prog.modules.push(ModuleInfo {
@@ -620,6 +627,7 @@ fn placeholder(name: &str, module: u32) -> Proto {
         loops: Vec::new(),
         handlers: Vec::new(),
         text: "".into(),
+        class: NONE,
     }
 }
 
@@ -1012,6 +1020,7 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
             loops: self.loop_ranges,
             handlers: self.handlers,
             text: "".into(),
+            class: NONE,
         }
     }
 
