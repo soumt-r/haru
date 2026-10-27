@@ -1072,7 +1072,8 @@ unsafe extern "C" fn h_op(env: *mut Env, pc: u32) -> u32 {
                         return skip;
                     }
                     let class = o.as_object().unwrap().class;
-                    if vm.member_of(class, name).setter.is_some() {
+                    let m = vm.member_of(class, name);
+                    if m.setter.is_some() || vm.check_access(fi, &o, m.field_access, false, name).is_err() {
                         return SLOW;
                     }
                     let v = reg(val).clone();
@@ -1097,7 +1098,12 @@ unsafe extern "C" fn h_op(env: *mut Env, pc: u32) -> u32 {
                         },
                     };
                     if let (Some(pos), Some(check), Some(ic)) = (at, check, vm.ic(fi, pc)) {
-                        *ic = Ic { class, pos: pos as u32, check, access: 0 };
+                        let access = match m.field_access {
+                            Access::Public => 0,
+                            Access::Protected => 1,
+                            Access::Private => 2,
+                        };
+                        *ic = Ic { class, pos: pos as u32, check, access };
                     }
                     skip
                 }
@@ -3723,6 +3729,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         // A list's `'x'번째`: the key is next (a string's is an error).
         let fallback = self.dict_goes_on(i, obj, fallback, &[tag::LIST as i64]);
         let v = self.cached_prop(i, obj, name, fallback);
+        self.check_ic_access(i, obj, fallback);
         let ic = self.b.ins().iconst(self.ptr, unsafe { self.ics.add(i) } as i64);
         let check = self.b.ins().load(types::I32, MemFlags::new(), ic, 8);
         let va = self.addr(At::Reg(val));

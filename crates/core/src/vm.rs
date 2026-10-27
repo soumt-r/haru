@@ -1622,10 +1622,11 @@ impl<'p> Vm<'p> {
                             tag::STR => fail!(err(STRING_INDEX_ASSIGN)),
                             tag::LIST | tag::DICT => {}
                             tag::OBJECT => {
-                                pc = skip as usize;
                                 if name != NONE {
                                     let class = o.as_object().unwrap().class;
                                     let m = self.member_of(class, name);
+                                    tri!(self.check_access(fi, &o, m.field_access, false, name));
+                                    pc = skip as usize;
                                     let v = reg!(val).clone();
                                     if let Some(s) = m.setter {
                                         // The setter gets the value as its only argument.
@@ -1638,6 +1639,8 @@ impl<'p> Vm<'p> {
                                         }
                                     }
                                     o.as_object().unwrap().props.borrow_mut().insert(name, v);
+                                } else {
+                                    pc = skip as usize;
                                 }
                             }
                             CLASS => {
