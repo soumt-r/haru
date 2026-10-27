@@ -259,7 +259,7 @@ impl<'a> Compiler<'a> {
         for name in &class_order {
             let Stmt::Class { body, .. } = defs[name] else { unreachable!() };
             let mut cp = ClassProtos::default();
-            jobs.push(Job::Init(body));
+            jobs.push(Job::Init(chain_bodies(&defs, name)));
             cp.init = base + jobs.len() as u32;
             for s in body {
                 match s {
@@ -325,7 +325,7 @@ impl<'a> Compiler<'a> {
                         st.param.iter().map(|n| ast::Param { name: n.clone(), type_annotation: None, default: None }).collect();
                     FnCompiler::new(self, true).compile_callable("", &params, &st.body, None, true)
                 }
-                Job::Init(body) => FnCompiler::new(self, true).compile_field_init(body),
+                Job::Init(ref bodies) => FnCompiler::new(self, true).compile_field_init(bodies),
             };
             if let Job::Function(f) | Job::Method(f) = *job {
                 proto.text = f.go_string().into();
@@ -549,8 +549,30 @@ enum Job<'a> {
     /// Binds only the new value (to the parameter, when it has one).
     Setter(&'a ast::Setter),
     /// A class's field initializers, for objects made where the class is not
-    /// known when compiling (an imported class).
-    Init(&'a [Stmt]),
+    /// known when compiling (an imported class): its ancestors' first, from
+    /// the top of the chain down.
+    Init(Vec<&'a [Stmt]>),
+}
+
+/// The bodies of the class `name` and of its ancestors that `defs` declares,
+/// from the top of the chain down: the order their field initializers run in
+/// (Runtime spec 3.5).
+fn chain_bodies<'a>(defs: &HashMap<String, &'a Stmt>, name: &str) -> Vec<&'a [Stmt]> {
+    let mut out: Vec<&'a [Stmt]> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut cur = name;
+    while let Some(Stmt::Class { name: Some(n), base, body, .. }) = defs.get(cur).copied() {
+        if !seen.insert(n.name.as_str()) {
+            break;
+        }
+        out.push(body);
+        match base {
+            Some(b) => cur = &b.name,
+            None => break,
+        }
+    }
+    out.reverse();
+    out
 }
 
 /// The compiled parts of one class, in declaration order.
@@ -1747,11 +1769,12 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         self.emit(Op::Import { import });
     }
 
-    /// A class's field initializers as a body of their own (run on `this`).
-    fn compile_field_init(mut self, body: &[Stmt]) -> Proto {
+    /// A class's field initializers (its ancestors' first) as a body of their
+    /// own (run on `this`).
+    fn compile_field_init(mut self, bodies: &[&[Stmt]]) -> Proto {
         let obj = self.alloc();
         self.emit(Op::GetThis { dst: obj });
-        for s in body {
+        for s in bodies.iter().flat_map(|b| b.iter()) {
             let mark = self.next_reg;
             match s {
                 Stmt::VarDecl(v) if !v.is_static => {
@@ -2238,17 +2261,17 @@ impl<'c, 'a> FnCompiler<'c, 'a> {
         self.open_calls -= 1;
     }
 
-    /// `새로운 [클래스](...)`: the object, its class's own field initializers
-    /// (evaluated here, in the caller's scope, as Hana does), then the
-    /// constructor with the arguments; without a constructor the arguments
-    /// are not evaluated.
+    /// `새로운 [클래스](...)`: the object, the field initializers of its class
+    /// and its ancestors, from the top of the chain down (evaluated here, in
+    /// the caller's scope, as Hana does), then the constructor with the
+    /// arguments; without a constructor the arguments are not evaluated.
     fn new_object(&mut self, class: Option<&ast::TypeRef>, args: &[Expr], dst: Reg) {
         self.emit(Op::Enter);
         self.open_calls += 1;
         let name = class.map_or("", |t| t.name.as_str()).to_string();
         let sym = self.c.name(&name);
         self.emit(Op::NewObj { dst, class: sym });
-        if let Some(Stmt::Class { body, .. }) = self.c.class_defs.get(&name).copied() {
+        for body in chain_bodies(&self.c.class_defs, &name) {
             for s in body {
                 let mark = self.next_reg;
                 match s {

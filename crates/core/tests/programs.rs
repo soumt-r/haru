@@ -103,9 +103,9 @@ fn kanade_prints_in_its_own_words() {
 }
 
 #[test]
-fn field_initializers_run_in_the_callers_scope_and_parents_fields_are_not_made() {
+fn field_initializers_run_in_the_callers_scope_and_parents_fields_are_made() {
     let src = "[부모]를 설계하자:\n    '부모필드'를 1로 정하자\n[자식]은 [부모]를 바탕으로 하고 설계하자:\n    '필드'를 '바깥값'으로 정하자\n    <보기>를 만들자 ():\n        '필드'를 출력하자\n        '부모필드'를 출력하자\n1부터 1까지 반복하자:\n    '바깥값'을 42로 정하자\n    '객체'를 새로운 [자식]()로 정하자\n    '객체'의 <보기>()를 실행하자\n";
-    assert_eq!(hari(src), "42\n런타임 오류: ReferenceError: '부모필드' 변수를 찾을 수 없어요.\n");
+    assert_eq!(hari(src), "42\n1\n");
 }
 
 #[test]
